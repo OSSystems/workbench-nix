@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestPairArgv(t *testing.T) {
@@ -46,6 +49,25 @@ func fakeGuest(t *testing.T, port int, gc guestConfig) string {
 		}
 	}()
 	return socket
+}
+
+func TestAskAgentOverVsock(t *testing.T) {
+	c := testConfig()
+	c.RuntimeDir = t.TempDir()
+	os.MkdirAll(c.vmDir(), 0700)
+	socket := fakeGuest(t, c.AgentPort, guestConfig{})
+	os.Rename(socket, c.vsock())
+	if _, err := askAgent(c, agentRequest{Op: "ping"}, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	_, err := askAgent(c, agentRequest{Op: "shell", Args: []string{"id"}}, 2*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "unknown op") {
+		t.Fatalf("unknown op answered: %v", err)
+	}
+	c.AgentPort = 9
+	if _, err := askAgent(c, agentRequest{Op: "ping"}, 2*time.Second); err == nil {
+		t.Fatal("a refused port was reached")
+	}
 }
 
 func TestServeAgentRejectsGarbage(t *testing.T) {
