@@ -21,6 +21,7 @@ const usage = `usage: workbench <command> [flags] [args]
 Internal:
   run <workspace>              become the workspace's VM (the unit's ExecStart)
   shutdown <workspace>         power the VM off cleanly (the unit's ExecStop)
+  guest-agent                  the agent inside the guest
 `
 
 type configDirs []string
@@ -57,6 +58,7 @@ func run(args []string) error {
 	var dirs configDirs
 	f.Var(&dirs, "config-dir", "directory of <workspace>.json configs; repeat to search several (default "+strings.Join(defaultConfigDirs, ", ")+")")
 	timeout := f.Duration("timeout", 90*time.Second, "shutdown: how long the guest may take to power off")
+	guestConfigPath := f.String("config", "/run/workspace/config/workspace.json", "guest-agent: workspace settings from the config share")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -86,6 +88,8 @@ func run(args []string) error {
 			return err
 		}
 		return shutdownWorkspace(dirs, name, *timeout)
+	case "guest-agent":
+		return runGuestAgent(*guestConfigPath)
 	}
 	return fmt.Errorf("unknown command %q\n%s", cmd, usage)
 }
