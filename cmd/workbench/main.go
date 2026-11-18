@@ -21,6 +21,7 @@ const usage = `usage: workbench <command> [flags] [args]
 Internal:
   run <workspace>              become the workspace's VM (the unit's ExecStart)
   shutdown <workspace>         power the VM off cleanly (the unit's ExecStop)
+  memory                       grow and shrink workspace memory
   guest-agent                  the agent inside the guest
 `
 
@@ -59,6 +60,11 @@ func run(args []string) error {
 	f.Var(&dirs, "config-dir", "directory of <workspace>.json configs; repeat to search several (default "+strings.Join(defaultConfigDirs, ", ")+")")
 	timeout := f.Duration("timeout", 90*time.Second, "shutdown: how long the guest may take to power off")
 	guestConfigPath := f.String("config", "/run/workspace/config/workspace.json", "guest-agent: workspace settings from the config share")
+	statusFile := f.String("memory-status", "", "memory: where to publish the memory workspaces hold")
+	var behind behindPools
+	f.Var(&behind, "behind", "memory: <status file>=<GiB> of a pool that yields to workspaces and the memory it keeps whatever they want; repeat for each")
+	reservePercent := f.Float64("mem-reserve-percent", 10, "memory: host memory reserve, percent of MemTotal")
+	reserveMinGiB := f.Float64("mem-reserve-min-gib", 2, "memory: minimum host memory reserve, GiB")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -88,6 +94,14 @@ func run(args []string) error {
 			return err
 		}
 		return shutdownWorkspace(dirs, name, *timeout)
+	case "memory":
+		return runMemory(memoryOptions{
+			dirs:           dirs,
+			statusFile:     *statusFile,
+			behind:         behind,
+			reservePercent: *reservePercent,
+			reserveMinGiB:  *reserveMinGiB,
+		})
 	case "guest-agent":
 		return runGuestAgent(*guestConfigPath)
 	}
