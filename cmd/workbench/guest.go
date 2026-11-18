@@ -152,7 +152,7 @@ func pairAsOwner(gc guestConfig, args []string) agentReply {
 		"USER=" + gc.Owner,
 		"LOGNAME=" + gc.Owner,
 		"T3CODE_HOME=" + filepath.Join(u.HomeDir, ".t3"),
-		"PATH=" + filepath.Join(guestApp, "sw", "bin") + ":/usr/local/bin:/usr/bin:/bin",
+		"PATH=" + filepath.Join(guestApp, "sw", "bin") + ":/run/wrappers/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin",
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 	var stdout, stderr bytes.Buffer

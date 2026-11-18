@@ -31,6 +31,7 @@ let
     bob = {
       ip = "10.232.0.11";
       owner = "bob";
+      os = "nixos";
     };
   };
   clientIP = "192.168.1.3";
@@ -45,7 +46,7 @@ pkgs.testers.runNixOSTest {
       virtualisation = {
         memorySize = 8192;
         cores = 4;
-        diskSize = 20480;
+        diskSize = 30720;
       };
       networking.firewall.allowedTCPPorts = [ 443 ];
       environment.systemPackages = [
@@ -71,7 +72,7 @@ pkgs.testers.runNixOSTest {
           name: ws:
           ws
           // {
-            diskGiB = 8;
+            diskGiB = if ws.os or "ubuntu" == "nixos" then 16 else 8;
             cpus = 2;
             environment.WORKSPACE_OWNER = ws.owner;
             sshAuthorizedKeys = [ (builtins.readFile "${sshKey}/id.pub") ];
@@ -152,37 +153,58 @@ pkgs.testers.runNixOSTest {
     def url(name):
         return f"https://{name}.{domain}"
 
+    def os_of(name):
+        return workspaces[name].get("os", "ubuntu")
+
     for name, ws in workspaces.items():
-        with subtest(f"{name} boots Ubuntu"):
+        with subtest(f"{name} boots {os_of(name)}"):
             host.wait_for_unit(f"workbench@{name}.service")
             host.wait_until_succeeds(f"ssh {ssh_opts} {ws['owner']}@{ws['ip']} true", timeout=900)
-            assert "Ubuntu" in guest(name, "cat /etc/os-release")
-            guest(name, "cloud-init status --wait >/dev/null; systemctl is-active t3code.service workspace-agent.service")
+            release = guest(name, "cat /etc/os-release")
+            assert ("Ubuntu" if os_of(name) == "ubuntu" else "NixOS") in release, release
+            if os_of(name) == "ubuntu":
+                guest(name, "cloud-init status --wait >/dev/null")
+            # A NixOS guest copies the app's closure first.
+            guest(name, "timeout 900 sh -c 'until systemctl is-active workspace-app.service workspace-agent.service; do sleep 5; done'")
 
-    with subtest("the T3 Code server runs as the owner with its environment"):
+    with subtest("the app runs as the owner with its environment"):
         for name, ws in workspaces.items():
-            pid = guest(name, "systemctl show -P MainPID t3code.service").strip()
+            pid = guest(name, "systemctl show -P MainPID workspace-app.service").strip()
             assert guest(name, f"stat -c %U /proc/{pid}").strip() == ws["owner"]
             env = guest(name, f"sudo cat /proc/{pid}/environ | tr '\\0' '\\n'")
             assert f"WORKSPACE_OWNER={ws['owner']}" in env, env
             assert "WORKSPACE_TEST=shared" in env, env
             guest(name, "sudo -n true")
 
-    with subtest("the guest sees only its closure in /nix/store"):
+    with subtest("the guest is shared only its closure"):
         for name in workspaces:
             config = json.loads(host.succeed(f"cat /etc/workbench/{name}.json"))
             closure = sorted(p.removeprefix("/nix/store/") for p in host.succeed(f"cat {config['closure']}").split())
-            seen = sorted(guest(name, "ls -A /nix/store").split())
+            shared = "/nix/store" if os_of(name) == "ubuntu" else "/run/workspace/host/nix/store"
+            seen = sorted(guest(name, f"ls -A {shared}").split())
             assert seen == closure, f"{name}: {set(seen) ^ set(closure)}"
             assert len(host.succeed("ls /nix/store").split()) > len(closure)
-            guest(name, "! touch /nix/store/probe")
+            guest(name, f"! sudo touch {shared}/probe")
         guest("alice", "timeout 60 bash -lc hello")
         guest("bob", "! bash -lc 'command -v hello'")
+
+    with subtest("a NixOS workspace is its owner's to rebuild"):
+        config = json.loads(host.succeed("cat /etc/workbench/bob.json"))
+        app = guest("bob", "readlink /run/workspace/config/app").strip()
+        assert app == config["app"], app
+        guest("bob", f"nix-store --verify-path {app}")
+        assert guest("bob", "readlink /nix/var/nix/gcroots/workspace-app").strip() == app
+        assert guest("bob", "hostname").strip() == "bob"
+        flake = guest("bob", "cat /etc/nixos/flake.nix")
+        assert 'nixosConfigurations."bob"' in flake and "workbench.nixosModules.guest" in flake, flake
+        assert 'users.users."bob"' in guest("bob", "cat /etc/nixos/configuration.nix")
+        guest("bob", "id -nG | grep -qw wheel")
+        guest("bob", "echo '# kept' | sudo tee -a /etc/nixos/configuration.nix >/dev/null")
 
     with subtest("secrets reach the guest but not the Nix store"):
         secret = host.succeed("sed -n 's/^WORKSPACE_SECRET=//p' /var/lib/workbench-secrets/alice/environment").strip()
         assert len(secret) == 48
-        pid = guest("alice", "systemctl show -P MainPID t3code.service").strip()
+        pid = guest("alice", "systemctl show -P MainPID workspace-app.service").strip()
         guest("alice", f"sudo cat /proc/{pid}/environ | tr '\\0' '\\n' | grep -qx WORKSPACE_SECRET={secret}")
         guest("bob", "! test -s /run/workspace/secrets/environment")
         config = json.loads(host.succeed("cat /etc/workbench/alice.json"))
@@ -259,6 +281,13 @@ pkgs.testers.runNixOSTest {
         print(out)
         for name in workspaces:
             assert name in out
+
+    with subtest("a NixOS workspace restarts with its store and configuration"):
+        host.succeed("systemctl restart workbench@bob.service")
+        host.wait_until_succeeds(f"ssh {ssh_opts} bob@10.232.0.11 systemctl is-active workspace-app.service", timeout=600)
+        guest("bob", "grep -qx '# kept' /etc/nixos/configuration.nix")
+        out = guest("bob", "journalctl -b -u workspace-store.service")
+        assert "copying" not in out, out
 
     with subtest("a stop powers the guest off and destroy deletes the disk"):
         host.succeed("systemctl stop workbench@bob.service")

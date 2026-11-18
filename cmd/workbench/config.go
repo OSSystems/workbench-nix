@@ -34,26 +34,34 @@ type config struct {
 	Virtiofsd       string `json:"virtiofsd"`
 	QemuImg         string `json:"qemuImg"`
 	Firmware        string `json:"firmware"`
-	// Image is the OS image a new disk is made from; Seed is the cloud-init
-	// NoCloud disk.
+	// OS is the guest's: "ubuntu", set up by cloud-init from Seed, its
+	// NoCloud disk, or "nixos", set up by workbench.nixosModules.guest
+	// from the config share. Image is the OS image a new disk is made from.
+	OS          string `json:"os"`
 	Image       string `json:"image"`
 	ImageFormat string `json:"imageFormat"`
-	Seed        string `json:"seed"`
+	Seed        string `json:"seed,omitempty"`
 	DiskGiB     int64  `json:"diskGiB"`
 
 	CPUs       int   `json:"cpus"`
 	BootMemMiB int64 `json:"bootMemMiB"`
 	MaxMemMiB  int64 `json:"maxMemMiB"`
 
-	Tap     string `json:"tap"`
-	MAC     string `json:"mac"`
-	IP      string `json:"ip"`
-	AppPort int    `json:"appPort"`
+	Tap         string   `json:"tap"`
+	MAC         string   `json:"mac"`
+	IP          string   `json:"ip"`
+	Gateway     string   `json:"gateway"`
+	Nameservers []string `json:"nameservers"`
+	AppPort     int      `json:"appPort"`
 
-	// Closure lists the store paths the guest sees at /nix/store; App is the
-	// one it starts from.
-	Closure string `json:"closure"`
-	App     string `json:"app"`
+	SSHAuthorizedKeys []string `json:"sshAuthorizedKeys"`
+
+	// Closure lists the store paths the guest is shared, Registration their
+	// validity for a guest that copies them into a store of its own; App is
+	// the one it starts from.
+	Closure      string `json:"closure"`
+	Registration string `json:"registration"`
+	App          string `json:"app"`
 
 	Environment      map[string]string `json:"environment"`
 	EnvironmentFiles []string          `json:"environmentFiles"`
@@ -83,11 +91,23 @@ func (c config) validate() error {
 	for name, path := range map[string]string{
 		"stateDir": c.StateDir, "runtimeDir": c.RuntimeDir, "cloudHypervisor": c.CloudHypervisor,
 		"virtiofsd": c.Virtiofsd, "qemuImg": c.QemuImg, "firmware": c.Firmware, "image": c.Image,
-		"seed": c.Seed, "closure": c.Closure, "app": c.App, "secretsDir": c.SecretsDir,
+		"closure": c.Closure, "registration": c.Registration, "app": c.App, "secretsDir": c.SecretsDir,
 	} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, ",\n") {
 			return fmt.Errorf("%s must be a clean absolute path without commas", name)
 		}
+	}
+	switch c.OS {
+	case "ubuntu":
+		if !filepath.IsAbs(c.Seed) || filepath.Clean(c.Seed) != c.Seed || strings.ContainsAny(c.Seed, ",\n") {
+			return errors.New("an Ubuntu guest needs a seed: a clean absolute path without commas")
+		}
+	case "nixos":
+		if c.Seed != "" {
+			return errors.New("a NixOS guest takes no cloud-init seed")
+		}
+	default:
+		return fmt.Errorf("unknown guest OS %q", c.OS)
 	}
 	for _, f := range c.EnvironmentFiles {
 		if !filepath.IsAbs(f) {
@@ -109,8 +129,15 @@ func (c config) validate() error {
 	if !macAddress.MatchString(c.MAC) {
 		return fmt.Errorf("invalid MAC %q", c.MAC)
 	}
-	if ip := net.ParseIP(c.IP); ip == nil || ip.To4() == nil {
-		return fmt.Errorf("invalid IPv4 address %q", c.IP)
+	for _, ip := range append([]string{c.IP, c.Gateway}, c.Nameservers...) {
+		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
+			return fmt.Errorf("invalid IPv4 address %q", ip)
+		}
+	}
+	for _, key := range c.SSHAuthorizedKeys {
+		if key == "" || strings.ContainsAny(key, "\n\r\x00") {
+			return errors.New("an SSH key must be one nonempty line")
+		}
 	}
 	for _, port := range []int{c.AppPort, c.ControlPort, c.AgentPort} {
 		if port <= 0 || port > 65535 {

@@ -56,6 +56,10 @@ func TestCloudHypervisorArgv(t *testing.T) {
 	if slices.Contains(argv, "--kernel") {
 		t.Error("a firmware guest got a kernel")
 	}
+	c.OS, c.Seed = "nixos", ""
+	if got := flagValues(cloudHypervisorArgv(c, 16), "--disk"); !slices.Equal(got, want["--disk"][:1]) {
+		t.Errorf("a NixOS guest's --disk = %q, want its disk alone", got)
+	}
 }
 
 func TestCloudHypervisorArgvSizing(t *testing.T) {
@@ -83,8 +87,12 @@ func TestEnvironmentFileQuotes(t *testing.T) {
 }
 
 func TestConfigShare(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "config")
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "config")
 	c := testConfig()
+	c.Closure, c.Registration = filepath.Join(tmp, "store-paths"), filepath.Join(tmp, "registration")
+	os.WriteFile(c.Closure, []byte("/nix/store/x-app\n"), 0444)
+	os.WriteFile(c.Registration, []byte("/nix/store/x-app\nsha256:0\n0\n\n0\n"), 0444)
 	if err := writeConfigShare(c, dir); err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +105,19 @@ func TestConfigShare(t *testing.T) {
 	}
 	var gc guestConfig
 	raw, _ := os.ReadFile(filepath.Join(dir, "workspace.json"))
-	if err := json.Unmarshal(raw, &gc); err != nil || gc.Owner != "alice" || gc.URL != c.URL || gc.AgentPort != 5002 {
+	if err := json.Unmarshal(raw, &gc); err != nil || gc.Owner != "alice" || gc.URL != c.URL || gc.AgentPort != 5002 ||
+		gc.IP != c.IP || gc.Gateway != c.Gateway || !slices.Equal(gc.Nameservers, c.Nameservers) {
 		t.Fatalf("workspace.json = %s", raw)
+	}
+	for name, src := range map[string]string{"store-paths": c.Closure, "registration": c.Registration} {
+		got, _ := os.ReadFile(filepath.Join(dir, name))
+		want, _ := os.ReadFile(src)
+		if len(want) == 0 || string(got) != string(want) {
+			t.Errorf("%s = %q, want a copy of %s", name, got, src)
+		}
+	}
+	if keys, _ := os.ReadFile(filepath.Join(dir, "authorized_keys", "alice")); string(keys) != "ssh-ed25519 AAAA alice@laptop\n" {
+		t.Errorf("authorized_keys/alice = %q", keys)
 	}
 }
 

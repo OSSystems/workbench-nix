@@ -98,16 +98,17 @@ let
       mkdir -p $out/bin
       ln -s ${sw} $out/sw
       ln -s ${t3} $out/bin/t3
-      cat > $out/bin/t3code-serve <<EOF
+      cat > $out/bin/serve <<EOF
       #!${pkgs.runtimeShell}
       export PATH=${sw}/bin:\$PATH
+      export T3CODE_HOME=\$HOME/.t3
       exec ${t3} serve --host 0.0.0.0 --port ${toString ws.appPort}
       EOF
       cat > $out/bin/workspace-agent <<EOF
       #!${pkgs.runtimeShell}
       exec ${exe} guest-agent --config=/run/workspace/config/workspace.json
       EOF
-      chmod +x $out/bin/t3code-serve $out/bin/workspace-agent
+      chmod +x $out/bin/serve $out/bin/workspace-agent
     '';
 
   mountUnit = what: where: ''
@@ -191,10 +192,10 @@ let
           '';
         }
         {
-          path = "/etc/systemd/system/t3code.service";
+          path = "/etc/systemd/system/workspace-app.service";
           content = ''
             [Unit]
-            Description=T3 Code server for ${ws.owner}
+            Description=Workspace app
             Requires=${shares}
             After=${shares} network-online.target
             Wants=network-online.target
@@ -202,10 +203,10 @@ let
             [Service]
             User=${ws.owner}
             WorkingDirectory=${home}
-            Environment=HOME=${home} T3CODE_HOME=${home}/.t3
+            Environment=HOME=${home}
             EnvironmentFile=/run/workspace/config/environment
             EnvironmentFile=-/run/workspace/secrets/environment
-            ExecStart=/run/workspace/config/app/bin/t3code-serve
+            ExecStart=/run/workspace/config/app/bin/serve
             Restart=always
             RestartSec=5
             KillMode=mixed
@@ -228,7 +229,7 @@ let
           "run-workspace-config.mount"
           "run-workspace-secrets.mount"
           "workspace-agent.service"
-          "t3code.service"
+          "workspace-app.service"
         ]
       ];
     };
@@ -279,6 +280,7 @@ let
     name: ws:
     let
       app = guestApp name ws;
+      closure = pkgs.closureInfo { rootPaths = [ app ]; };
       mem = memMiB ws;
     in
     {
@@ -292,16 +294,17 @@ let
       virtiofsd = lib.getExe pkgs.virtiofsd;
       qemuImg = lib.getExe' pkgs.qemu-utils "qemu-img";
       firmware = "${pkgs.OVMF-cloud-hypervisor.fd}/FV/CLOUDHV.fd";
-      image = cfg.image;
-      imageFormat = cfg.imageFormat;
-      seed = seed name ws;
-      inherit (ws) diskGiB cpus;
+      inherit (ws) os diskGiB cpus;
       bootMemMiB = mem.boot;
       maxMemMiB = mem.max;
       tap = tapOf ws;
       mac = macOf ws;
-      appPort = ws.appPort;
-      closure = "${pkgs.closureInfo { rootPaths = [ app ]; }}/store-paths";
+      gateway = hostAddress;
+      inherit (cfg.network) nameservers;
+      inherit (ws) appPort;
+      sshAuthorizedKeys = map lib.strings.trim ws.sshAuthorizedKeys;
+      closure = "${closure}/store-paths";
+      registration = "${closure}/registration";
       app = "${app}";
       environment = cfg.environment // ws.environment;
       environmentFiles = lib.filter (f: f != null) [
@@ -310,6 +313,41 @@ let
       ];
       secretsDir = secretsDirOf name ws;
       inherit controlPort agentPort;
+    }
+    // (
+      if ws.os == "ubuntu" then
+        {
+          inherit (cfg) image imageFormat;
+          seed = seed name ws;
+        }
+      else
+        {
+          inherit (cfg.nixos) image imageFormat;
+        }
+    );
+
+  # The system a new NixOS disk starts with: the guest module alone, until
+  # the owner rebuilds from the flake it writes to /etc/nixos.
+  nixosImage =
+    let
+      system = import "${pkgs.path}/nixos/lib/eval-config.nix" {
+        system = null;
+        modules = [
+          ../guest
+          {
+            nixpkgs.pkgs = pkgs;
+            system.stateVersion = lib.trivial.release;
+          }
+        ];
+      };
+    in
+    import "${pkgs.path}/nixos/lib/make-disk-image.nix" {
+      inherit pkgs lib;
+      inherit (system) config;
+      name = "workbench-nixos-image";
+      format = "qcow2-compressed";
+      partitionTableType = "efi";
+      copyChannel = false;
     };
 
   configFile =
@@ -325,9 +363,17 @@ let
           description = "The person the workspace is for: the guest user, named after their directory (LDAP) uid. The app runs as this user.";
         };
         os = mkOption {
-          type = types.enum [ "ubuntu" ];
+          type = types.enum [
+            "ubuntu"
+            "nixos"
+          ];
           default = "ubuntu";
-          description = "Guest operating system.";
+          description = ''
+            Guest operating system. `ubuntu` is set up by cloud-init and
+            runs the app from the host's store. `nixos` is a NixOS the owner
+            rebuilds from /etc/nixos, with its own store the app's closure is
+            copied into; it needs `sudo`.
+          '';
         };
         ip = mkOption {
           type = types.str;
@@ -450,7 +496,7 @@ in
         hash = "sha256-BOjyRhoWpE54o3AoRHHylhbN2brxiT3yWAe3H5hbbJQ=";
       };
       defaultText = lib.literalMD "the Ubuntu 24.04 cloud image of 2026-10-17";
-      description = "OS image a new workspace disk is made from.";
+      description = "OS image a new Ubuntu workspace disk is made from.";
     };
     imageFormat = mkOption {
       type = types.enum [
@@ -458,6 +504,24 @@ in
         "raw"
       ];
       default = "qcow2";
+    };
+    nixos = {
+      image = mkOption {
+        type = types.path;
+        default = "${nixosImage}/nixos.qcow2";
+        defaultText = lib.literalMD "a NixOS of the host's nixpkgs with `nixosModules.guest`";
+        description = ''
+          Image a new NixOS workspace disk is made from. It must boot
+          `nixosModules.guest`; the owner's flake replaces its system after.
+        '';
+      };
+      imageFormat = mkOption {
+        type = types.enum [
+          "qcow2"
+          "raw"
+        ];
+        default = "qcow2";
+      };
     };
     stateDir = mkOption {
       type = types.str;
@@ -565,6 +629,10 @@ in
           && ws.owner != "root"
           && inSubnet ws.ip;
         message = "services.workbench.workspaces.${name}: the name must be a DNS label of at most 28 characters, the owner a user name other than root, and ip an address in ${cfg.network.subnet}.2-254.";
+      }) cfg.workspaces
+      ++ lib.mapAttrsToList (name: ws: {
+        assertion = ws.os == "nixos" -> ws.sudo;
+        message = "services.workbench.workspaces.${name}: a NixOS workspace needs sudo; its owner rebuilds the system.";
       }) cfg.workspaces;
 
     environment.systemPackages = [ package ];

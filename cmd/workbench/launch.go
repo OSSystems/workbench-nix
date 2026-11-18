@@ -178,18 +178,23 @@ func growFile(path string, size int64) error {
 	return f.Sync()
 }
 
-// guestConfig is what the guest agent reads from the config share.
+// guestConfig is workspace.json in the config share: what the guest agent
+// and a NixOS guest set themselves up from at each boot.
 type guestConfig struct {
-	Name        string `json:"name"`
-	Owner       string `json:"owner"`
-	URL         string `json:"url"`
-	AppPort     int    `json:"appPort"`
-	ControlPort int    `json:"controlPort"`
-	AgentPort   int    `json:"agentPort"`
+	Name        string   `json:"name"`
+	Owner       string   `json:"owner"`
+	URL         string   `json:"url"`
+	IP          string   `json:"ip"`
+	Gateway     string   `json:"gateway"`
+	Nameservers []string `json:"nameservers"`
+	AppPort     int      `json:"appPort"`
+	ControlPort int      `json:"controlPort"`
+	AgentPort   int      `json:"agentPort"`
 }
 
 // writeConfigShare writes what the guest starts its services from: the app
-// in the closure, the non-secret environment and the agent's settings.
+// in the closure, the closure's paths and their registration, the owner's
+// SSH keys, the non-secret environment and workspace.json.
 func writeConfigShare(c config, dir string) error {
 	if err := makeDir(dir, 0755); err != nil {
 		return err
@@ -197,14 +202,42 @@ func writeConfigShare(c config, dir string) error {
 	if err := os.Symlink(c.App, filepath.Join(dir, "app")); err != nil {
 		return err
 	}
+	for name, src := range map[string]string{"store-paths": c.Closure, "registration": c.Registration} {
+		raw, err := hostutil.ReadBounded(src, 64<<20)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0444); err != nil {
+			return err
+		}
+	}
+	keys := filepath.Join(dir, "authorized_keys")
+	if err := makeDir(keys, 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(keys, c.Owner), []byte(lines(c.SSHAuthorizedKeys)), 0444); err != nil {
+		return err
+	}
 	if err := os.WriteFile(filepath.Join(dir, "environment"), []byte(environmentFile(c.Environment)), 0444); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(guestConfig{Name: c.Name, Owner: c.Owner, URL: c.URL, AppPort: c.AppPort, ControlPort: c.ControlPort, AgentPort: c.AgentPort}, "", "  ")
+	raw, err := json.MarshalIndent(guestConfig{
+		Name: c.Name, Owner: c.Owner, URL: c.URL,
+		IP: c.IP, Gateway: c.Gateway, Nameservers: c.Nameservers,
+		AppPort: c.AppPort, ControlPort: c.ControlPort, AgentPort: c.AgentPort,
+	}, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "workspace.json"), raw, 0444)
+}
+
+func lines(items []string) string {
+	var b strings.Builder
+	for _, item := range items {
+		b.WriteString(item + "\n")
+	}
+	return b.String()
 }
 
 // environmentFile renders variables for systemd's EnvironmentFile=, quoted
@@ -225,7 +258,7 @@ func environmentFile(env map[string]string) string {
 
 // writeSecretsShare copies the workspace's secrets directory into this
 // run's share and appends the environment files to its environment file,
-// which the guest's T3 Code service reads. Nothing of it is in the store.
+// which the guest's app service reads. Nothing of it is in the store.
 func writeSecretsShare(c config, dir string) error {
 	if err := makeDir(dir, 0755); err != nil {
 		return err
@@ -284,28 +317,29 @@ func virtiofsdArgs(socket, dir string) []string {
 }
 
 // cloudHypervisorArgv boots the workspace from firmware with its disk, the
-// cloud-init seed, its tap, vsock, the shares and a serial console socket.
-// Memory starts at the boot size and grows through virtio-mem.
+// cloud-init seed of an Ubuntu guest, its tap, vsock, the shares and a
+// serial console socket. Memory starts at the boot size and grows through
+// virtio-mem.
 func cloudHypervisorArgv(c config, hostCPUs int) []string {
 	cpus := c.CPUs
 	if cpus == 0 || cpus > hostCPUs {
 		cpus = hostCPUs
 	}
 	vm := ch.VM{
-		Binary:     c.CloudHypervisor,
-		APISocket:  c.apiSocket(),
-		Firmware:   c.Firmware,
-		CPUs:       cpus,
-		MemoryMiB:  c.BootMemMiB,
-		HotplugMiB: max(0, c.MaxMemMiB-c.BootMemMiB),
-		Disks: []ch.Disk{
-			{Path: c.disk()},
-			{Path: c.Seed, ReadOnly: true},
-		},
+		Binary:      c.CloudHypervisor,
+		APISocket:   c.apiSocket(),
+		Firmware:    c.Firmware,
+		CPUs:        cpus,
+		MemoryMiB:   c.BootMemMiB,
+		HotplugMiB:  max(0, c.MaxMemMiB-c.BootMemMiB),
+		Disks:       []ch.Disk{{Path: c.disk()}},
 		Nets:        []ch.Net{{Tap: c.Tap, MAC: c.MAC}},
 		VsockCID:    3,
 		VsockSocket: c.vsock(),
 		Serial:      "socket=" + c.serial(),
+	}
+	if c.Seed != "" {
+		vm.Disks = append(vm.Disks, ch.Disk{Path: c.Seed, ReadOnly: true})
 	}
 	for _, s := range c.shares() {
 		vm.Shares = append(vm.Shares, ch.Share{Tag: s.Tag, Socket: filepath.Join(c.vmDir(), "fs-"+s.Tag+".sock")})
