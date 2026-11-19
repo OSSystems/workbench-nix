@@ -1,0 +1,35 @@
+[package]
+name = "workbench"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Persistent per-person workspaces: long-lived cloud-hypervisor VMs on NixOS"
+license = "MIT"
+repository = "https://github.com/OSSystems/workbench-nix"
+publish = false
+
+[workspace]
+# vmkit is the flake's input, linked here by the dev shell and the build.
+exclude = ["vmkit"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.8", features = ["derive"] }
+jiff = { version = "1.0.1", features = ["serde"] }
+nix = { version = "0.32.0", features = ["fs", "term", "user"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+vmkit = { path = "vmkit" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+similar_names = "allow"
