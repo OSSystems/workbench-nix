@@ -52,6 +52,8 @@ kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; 
 .btn.q { background: transparent; border-color: transparent; color: var(--t2); }
 .btn.danger { background: var(--bad); border-color: var(--bad); color: var(--bad-t); }
 .btn.q:hover { background: var(--g2); }
+.btn.q.bad { color: var(--bad); }
+.btn.q.bad:hover { background: var(--bad-soft); }
 .btn kbd { height: 16px; min-width: 16px; font-size: 11px; }
 .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .dot.on { background: var(--ok-line); } .dot.go { background: var(--go-line); box-shadow: 0 0 0 3px var(--go-soft); } .dot.bad { background: var(--bad-line); }
@@ -110,6 +112,7 @@ kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; 
 .empty > div { max-width: 380px; }
 .empty h2 { font-size: 18px; letter-spacing: -.01em; margin-bottom: 8px; }
 .empty p { color: var(--t2); }
+.empty .go { margin-top: 18px; }
 
 .peek { border-left: 1px solid var(--line); background: var(--g1); padding: 20px; display: none; flex-direction: column; gap: 16px; min-height: 0; overflow-y: auto; }
 .peek.sel { display: flex; }
@@ -131,6 +134,8 @@ kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; 
 .foot { margin-top: auto; display: flex; align-items: center; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
 .foot .btn { height: 34px; }
 .foot .btn span { display: inline-flex; align-items: center; gap: 8px; }
+.foot .bad { margin-left: auto; }
+.bar .new { margin-left: 10px; }
 .back { display: inline-flex; align-items: center; gap: 6px; color: var(--t2); }
 
 dialog.dlg { width: min(440px, calc(100vw - 32px)); border-radius: 12px; background: var(--g1); color: var(--t); border: 1px solid var(--line2); box-shadow: var(--shadow); padding: 20px; }
@@ -147,6 +152,27 @@ dialog.dlg::backdrop { background: var(--scrim); }
 .card > p { color: var(--t2); }
 .card .acts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 18px; }
 .card .btn.p { height: 36px; padding: 0 16px; }
+/* Forms: the New workspace page, Destroy, quotas. */
+.form { display: grid; gap: 14px; }
+.card.form { width: 520px; }
+.form label { display: grid; gap: 6px; font-weight: 600; font-size: 13px; }
+.form small { font-weight: 400; color: var(--t3); font-size: 12px; }
+.form .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.form input, .form select, .form textarea, .quotas input {
+  width: 100%; min-width: 0; padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line2);
+  background: var(--g1); color: var(--t); font: 400 13.5px var(--sans);
+}
+.form .mono, .form textarea { font-family: var(--mono); font-size: 12.5px; }
+.form textarea { resize: vertical; }
+.form input:focus, .form select:focus, .form textarea:focus, .quotas input:focus { outline: 2px solid var(--ok-edge); border-color: var(--ok-line); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.tbl.quotas > form { display: grid; grid-template-columns: minmax(0, 1fr) 56px minmax(0, 1.4fr); gap: 16px; padding: 8px 16px; border-top: 1px solid var(--line); align-items: center; }
+.tbl.quotas > .hd { grid-template-columns: minmax(0, 1fr) 56px minmax(0, 1.4fr); }
+.quotas .set { display: flex; align-items: center; gap: 8px; }
+.quotas .set input, .quotas .set .btn { height: 32px; }
+.quotas .set input { padding-block: 0; }
+.quotas input[type=number] { width: 72px; }
+@media (max-width: 760px) { .form .pair { grid-template-columns: 1fr; } }
 .err { padding: 12px; border-radius: 9px; border: 1px solid var(--bad-edge); background: var(--bad-soft); color: var(--t2); }
 .err b { display: block; color: var(--bad); margin-bottom: 2px; }
 .err details { margin-top: 8px; font-size: 12.5px; }

@@ -20,6 +20,7 @@ pub fn row(ws: Workspace) -> Row {
 fn note(ws: &Workspace, since: &str) -> String {
     match ws.state {
         _ if !ws.configured => "removed from the configuration · disk kept".into(),
+        State::Stopped if ws.owner_left => "owner left · disk kept".into(),
         State::Running => ws.host().to_owned(),
         State::Starting => "booting".into(),
         State::Restarting => "restarting · shutting down the guest".into(),
@@ -132,6 +133,8 @@ mod tests {
         assert_eq!(note(&ws, ""), "restarted 6 times");
         ws.state = State::Stopped;
         assert_eq!(note(&ws, "Nov 3"), "since Nov 3");
+        ws.owner_left = true;
+        assert_eq!(note(&ws, "Nov 3"), "owner left · disk kept");
         ws.configured = false;
         assert_eq!(note(&ws, ""), "removed from the configuration · disk kept");
     }

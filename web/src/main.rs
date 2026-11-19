@@ -9,7 +9,8 @@ use anyhow::Context;
 use clap::Parser;
 use leptos::config::LeptosOptions;
 use workbench::config::DEFAULT_CONFIG_DIRS;
-use workbench_web::server::{AppState, HostBackend, Options, asset_version, authz_router, ui_router};
+use workbench::self_service::Template;
+use workbench_web::server::{AppState, HostBackend, Options, SelfService, asset_version, authz_router, ui_router};
 
 /// Serves workbench's web UI.
 // The comments are the help text, written for people, not rustdoc.
@@ -29,6 +30,15 @@ struct Args {
     /// A user who sees and controls every workspace; repeat for each
     #[arg(long = "admin", value_name = "USER")]
     admins: Vec<String>,
+    /// A group whose members are admins; repeat for each
+    #[arg(long = "admin-group", value_name = "GROUP")]
+    admin_groups: Vec<String>,
+    /// Lets people make workspaces, from the host's template for them
+    #[arg(long = "self-service", value_name = "TEMPLATE")]
+    self_service: Option<PathBuf>,
+    /// A group whose members make workspaces of their own; repeat for each
+    #[arg(long = "creator-group", value_name = "GROUP")]
+    creator_groups: Vec<String>,
     /// oauth2-proxy, which the access check asks who a cookie belongs to
     #[arg(long, default_value = "http://127.0.0.1:4180")]
     oauth2_proxy: String,
@@ -84,6 +94,15 @@ async fn main() -> anyhow::Result<()> {
         state_root: args.state_root,
         origin: args.origin,
         admins: args.admins,
+        admin_groups: args.admin_groups,
+        creator_groups: args.creator_groups,
+        self_service: match &args.self_service {
+            Some(path) => {
+                let t = Template::load(path)?;
+                Some(SelfService { paths: t.paths(), limits: t.limits })
+            }
+            None => None,
+        },
         oauth2_proxy: args.oauth2_proxy,
         cookie_name: args.cookie_name,
         reserve_percent: args.reserve_percent,
