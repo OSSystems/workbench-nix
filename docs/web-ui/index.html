@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>workbench web UI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Tokens. Light is the base; dark follows the system or data-theme. A frame
+   can force one theme with .t-light or .t-dark. */
+:root, .t-light {
+  color-scheme: light;
+  --g0: #f4f5f3; --g1: #fafbf9; --g2: #eef0ed; --g3: #e4e8e4;
+  --line: rgb(22 32 27 / .09); --line2: rgb(22 32 27 / .16);
+  --t: #141816; --t2: #46504b; --t3: #5f6964;
+  --pri: #1b211e; --pri-t: #f4f1ea; --pri-k: rgb(255 255 255 / .14);
+  --ok: #2b7a57; --ok-line: #3d9a70; --ok-soft: rgb(43 122 87 / .08); --ok-edge: rgb(43 122 87 / .28);
+  --go: #9a5f06; --go-line: #c98a1e; --go-soft: rgb(154 95 6 / .08); --go-edge: rgb(154 95 6 / .3);
+  --bad: #b8392a; --bad-t: #fff; --bad-line: #d4553f; --bad-soft: rgb(184 57 42 / .07); --bad-edge: rgb(184 57 42 / .3);
+  --off: #858e89;
+  --scrim: rgb(20 24 22 / .38);
+  --shadow: 0 18px 48px -14px rgb(20 30 25 / .28), 0 2px 8px -2px rgb(20 30 25 / .1);
+  --page: #e9ebe8; --page-t: #2a302d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --g0: #0c0e0d; --g1: #111413; --g2: #161a18; --g3: #1d2220;
+    --line: rgb(232 240 236 / .07); --line2: rgb(232 240 236 / .13);
+    --t: #e9ece9; --t2: #a3aca7; --t3: #858e89;
+    --pri: #f2eee5; --pri-t: #141614; --pri-k: rgb(0 0 0 / .08);
+    --ok: #8fd3b6; --ok-line: #8fd3b6; --ok-soft: rgb(143 211 182 / .08); --ok-edge: rgb(143 211 182 / .22);
+    --go: #e8b65a; --go-line: #e8b65a; --go-soft: rgb(232 182 90 / .08); --go-edge: rgb(232 182 90 / .25);
+    --bad: #f07a6e; --bad-t: #1f0e0b; --bad-line: #f07a6e; --bad-soft: rgb(240 122 110 / .08); --bad-edge: rgb(240 122 110 / .28);
+    --off: #6c7570;
+    --scrim: rgb(0 0 0 / .55);
+    --shadow: 0 24px 60px -12px rgb(0 0 0 / .7), 0 0 0 1px rgb(232 240 236 / .06);
+    --page: #070908; --page-t: #c9cfcb;
+  }
+}
+:root[data-theme="dark"], .t-dark {
+  color-scheme: dark;
+  --g0: #0c0e0d; --g1: #111413; --g2: #161a18; --g3: #1d2220;
+  --line: rgb(232 240 236 / .07); --line2: rgb(232 240 236 / .13);
+  --t: #e9ece9; --t2: #a3aca7; --t3: #858e89;
+  --pri: #f2eee5; --pri-t: #141614; --pri-k: rgb(0 0 0 / .08);
+  --ok: #8fd3b6; --ok-line: #8fd3b6; --ok-soft: rgb(143 211 182 / .08); --ok-edge: rgb(143 211 182 / .22);
+  --go: #e8b65a; --go-line: #e8b65a; --go-soft: rgb(232 182 90 / .08); --go-edge: rgb(232 182 90 / .25);
+  --bad: #f07a6e; --bad-t: #1f0e0b; --bad-line: #f07a6e; --bad-soft: rgb(240 122 110 / .08); --bad-edge: rgb(240 122 110 / .28);
+  --off: #6c7570;
+  --scrim: rgb(0 0 0 / .55);
+  --shadow: 0 24px 60px -12px rgb(0 0 0 / .7), 0 0 0 1px rgb(232 240 236 / .06);
+  --page: #070908; --page-t: #c9cfcb;
+}
+:root { --term: #0a0c0b; --term-t: #d5dbd7; --term-d: #7f8984; --term-hi: #f2eee5; }
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--page); color: var(--page-t); font: 15px/1.55 "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+code, .mono { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .92em; }
+
+/* The document around the screens. */
+.doc { max-width: 1300px; margin: 0 auto; padding: 48px 16px 96px; }
+.doc > header { max-width: 70ch; margin-bottom: 40px; }
+.doc > header h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -.02em; color: var(--t); }
+.doc > header p { margin: 0; }
+.doc nav { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 18px; font-size: 14px; }
+.doc a { color: var(--ok); }
+.doc nav a { color: inherit; }
+.fig { margin: 0 0 56px; }
+.fig > h2 { margin: 0 0 4px; font-size: 17px; color: var(--t); letter-spacing: -.01em; }
+.fig > p { margin: 0 0 14px; max-width: 80ch; font-size: 14px; }
+.scroll { overflow-x: auto; padding-bottom: 6px; }
+.pair { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+.pair > figure { margin: 0; max-width: 100%; }
+.pair figcaption { margin-top: 8px; font-size: 13px; }
+
+/* The app. */
+.app { position: relative; display: flex; flex-direction: column; width: 1260px; height: 640px; border-radius: 12px; overflow: hidden; background: var(--g0); color: var(--t); font: 13.5px/1.45 "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums; border: 1px solid var(--line2); }
+.app.short { height: 420px; }
+.app.mid { height: 520px; }
+.app.half { width: 620px; }
+.app h1, .app h2, .app h3, .app p { margin: 0; }
+kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 4px; border: 1px solid var(--line2); background: var(--g2); font: 500 11px "JetBrains Mono", monospace; color: var(--t2); }
+.i { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.btn { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--line2); background: var(--g2); color: var(--t); font: 600 13px "Hanken Grotesk", sans-serif; white-space: nowrap; }
+.btn.p { background: var(--pri); border-color: var(--pri); color: var(--pri-t); }
+.btn.p kbd { background: var(--pri-k); border-color: transparent; color: inherit; opacity: .75; }
+.btn.q { background: transparent; border-color: transparent; color: var(--t2); }
+.btn.danger { background: var(--bad); border-color: var(--bad); color: var(--bad-t); }
+.btn.stop { background: transparent; color: var(--bad); border-color: var(--bad-edge); }
+.btn[aria-disabled="true"] { opacity: .45; }
+.btn kbd { height: 16px; min-width: 16px; font-size: 11px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.on { background: var(--ok-line); } .go { background: var(--go-line); } .bad { background: var(--bad-line); }
+.off { box-shadow: inset 0 0 0 1.5px var(--off); }
+.pulse { box-shadow: 0 0 0 3px var(--go-soft); }
+.st { display: inline-flex; align-items: center; gap: 7px; color: var(--t2); font-weight: 500; }
+
+.top { display: flex; align-items: center; gap: 16px; height: 48px; padding: 0 20px; border-bottom: 1px solid var(--line); background: var(--g1); flex: none; }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 700; letter-spacing: -.01em; }
+.brand svg { width: 17px; height: 17px; color: var(--ok); fill: none; stroke: currentColor; stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; }
+.cmd { display: flex; align-items: center; gap: 10px; width: 340px; height: 30px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--line2); background: var(--g0); color: var(--t3); }
+.cmd kbd { margin-left: auto; }
+.me { margin-left: auto; display: flex; align-items: center; gap: 10px; color: var(--t2); }
+.av { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; background: var(--g3); border: 1px solid var(--line2); font-size: 11px; font-weight: 700; color: var(--t); }
+.role { padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line2); font-size: 11.5px; color: var(--t2); }
+
+.lay { flex: 1; min-height: 0; display: grid; grid-template-columns: 216px minmax(0, 1fr) 340px; }
+.lay.np { grid-template-columns: 216px minmax(0, 1fr); }
+.side { border-right: 1px solid var(--line); background: var(--g1); padding: 14px 10px; }
+.ni { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 7px; color: var(--t2); }
+.ni.a { background: var(--g3); color: var(--t); }
+.ni .x { margin-left: auto; color: var(--t3); }
+.side .h { padding: 16px 10px 6px; color: var(--t3); font-size: 12px; font-weight: 600; }
+.main { min-width: 0; overflow: hidden; }
+.bar { display: flex; align-items: center; gap: 10px; height: 46px; padding: 0 20px; border-bottom: 1px solid var(--line); flex: none; }
+.bar b { font-weight: 600; } .bar .x { color: var(--t3); }
+.chips { margin-left: auto; display: flex; gap: 6px; }
+.chip { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line2); color: var(--t2); font-size: 12px; }
+.chip.a { background: var(--g3); color: var(--t); }
+.gh { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 20px; background: var(--g1); color: var(--t2); font-size: 12.5px; font-weight: 600; border-bottom: 1px solid var(--line); flex: none; }
+.gh .x { color: var(--t3); font-weight: 500; }
+.r { position: relative; display: grid; grid-template-columns: 16px minmax(0, 1fr) 72px 120px 150px; gap: 12px; align-items: center; height: 46px; padding: 0 20px; }
+.adm .r { grid-template-columns: 16px minmax(0, 1fr) 72px 72px 120px 150px; }
+.r::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 1px; background: var(--line); }
+.r .m { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--ok-line); opacity: .7; z-index: 1; }
+.r .m.go { background: var(--go-line); } .r .m.bad { background: var(--bad-line); }
+.r.sel { background: var(--g2); } .r.sel .m { opacity: 1; }
+.r > .btn, .r > .wait { justify-self: end; }
+.r > span:nth-child(2) { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.n { font-weight: 600; } .u { color: var(--t3); margin-left: 10px; font-weight: 400; }
+.c { color: var(--t2); } .mem { color: var(--t2); } .mem b { color: var(--t); font-weight: 600; }
+.wait { color: var(--t3); font-size: 12.5px; }
+.hint { display: flex; flex-wrap: wrap; gap: 14px; padding: 14px 20px; color: var(--t3); font-size: 12px; }
+.hint span { display: inline-flex; gap: 6px; align-items: center; }
+.banner { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 20px; border-bottom: 1px solid var(--go-edge); background: var(--go-soft); color: var(--t2); font-size: 12.5px; }
+.banner b { color: var(--go); font-weight: 600; }
+
+.peek { border-left: 1px solid var(--line); background: var(--g1); padding: 20px; display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+.peek h2 { font-size: 21px; font-weight: 700; letter-spacing: -.02em; }
+.kv { display: grid; grid-template-columns: 100px 1fr; gap: 9px 12px; font-size: 13px; }
+.kv > span:nth-child(odd) { color: var(--t3); }
+.meter { position: relative; display: block; height: 6px; border-radius: 3px; background: var(--g3); margin-top: 6px; }
+.meter i { position: absolute; inset: 0 auto 0 0; border-radius: 3px; background: var(--ok-line); }
+.meter b { position: absolute; top: -3px; bottom: -3px; width: 1.5px; background: var(--t2); }
+.note { padding: 10px 12px; border-radius: 9px; border: 1px solid var(--ok-edge); background: var(--ok-soft); color: var(--t2); }
+.note b { color: var(--ok); font-weight: 600; }
+.note.bad { border-color: var(--bad-edge); background: var(--bad-soft); } .note.bad b { color: var(--bad); }
+.note .acts { display: flex; gap: 8px; margin-top: 10px; }
+.stack { display: grid; gap: 8px; }
+.stack .btn { justify-content: space-between; height: 34px; }
+.stack .btn span { display: inline-flex; align-items: center; gap: 8px; }
+.foot { margin-top: auto; }
+.foot .btn { width: 100%; justify-content: space-between; height: 34px; }
+
+/* Skeleton and empty. */
+.sk { height: 10px; border-radius: 5px; background: var(--g3); }
+.empty { flex: 1; display: grid; place-items: center; text-align: center; padding: 24px; }
+.empty > div { max-width: 380px; }
+.empty h2 { font-size: 18px; letter-spacing: -.01em; margin-bottom: 8px; }
+.empty p { color: var(--t2); }
+
+/* Dialogs. */
+.scrim { position: absolute; inset: 0; background: var(--scrim); display: grid; place-items: center; z-index: 5; }
+.dlg { width: 440px; border-radius: 12px; background: var(--g1); border: 1px solid var(--line2); box-shadow: var(--shadow); padding: 20px; }
+.dlg h2 { font-size: 17px; letter-spacing: -.01em; margin-bottom: 14px; }
+.dlg dl { display: grid; grid-template-columns: 64px 1fr; gap: 8px 12px; margin: 0 0 18px; font-size: 13px; }
+.dlg dt { color: var(--t3); } .dlg dd { margin: 0; color: var(--t2); }
+.dlg .acts { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Single pages: sign-in, 403, confirmations. */
+.solo { flex: 1; display: grid; place-items: center; padding: 24px; }
+.card { width: 420px; max-width: 100%; }
+.card h1 { font-size: 22px; letter-spacing: -.02em; margin-bottom: 8px; }
+.card > p { color: var(--t2); }
+.card .acts { display: flex; gap: 8px; margin-top: 18px; }
+.card .btn.p { height: 36px; padding: 0 16px; }
+.err { padding: 12px; border-radius: 9px; border: 1px solid var(--bad-edge); background: var(--bad-soft); color: var(--t2); }
+.err b { display: block; color: var(--bad); margin-bottom: 2px; }
+.err details { margin-top: 8px; font-size: 12.5px; }
+.err summary { color: var(--t3); }
+.err pre { margin: 6px 0 0; padding: 8px 10px; border-radius: 6px; background: var(--g2); font: 11.5px/1.5 "JetBrains Mono", monospace; white-space: pre-wrap; color: var(--t2); }
+.small { font-size: 12.5px; color: var(--t3); }
+
+/* Console. */
+.cbar { display: flex; align-items: center; gap: 12px; height: 46px; padding: 0 20px; border-bottom: 1px solid var(--line); flex: none; }
+.cbar .x { color: var(--t3); }
+.cbar .r2 { margin-left: auto; display: flex; gap: 12px; align-items: center; }
+.term { flex: 1; min-height: 0; background: var(--term); color: var(--term-t); padding: 14px 18px; font: 12.5px/1.55 "JetBrains Mono", monospace; white-space: pre; overflow: hidden; }
+.term .d { color: var(--term-d); } .term .h { background: var(--term-hi); color: var(--term); } .term .k { color: #8fd3b6; }
+.cur { display: inline-block; width: 8px; height: 15px; background: var(--term-t); vertical-align: -3px; }
+
+/* Host. */
+.hostw { padding: 20px; display: grid; gap: 18px; }
+.panel { border: 1px solid var(--line); border-radius: 10px; background: var(--g1); }
+.panel > header { display: flex; align-items: baseline; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.panel > header h2 { font-size: 14px; } .panel > header span { color: var(--t3); font-size: 12.5px; }
+.panel > header .rt { margin-left: auto; }
+.hbar { display: flex; height: 14px; margin: 16px; border-radius: 4px; overflow: hidden; background: var(--g3); }
+.hbar i { display: block; height: 100%; }
+.sw1 { background: var(--ok-line); }
+.sw2 { background: color-mix(in srgb, var(--ok-line) 45%, var(--g3)); }
+.sw3 { background: var(--go-line); }
+.sw4 { background: color-mix(in srgb, var(--off) 55%, var(--g3)); }
+.sw5 { background: var(--g3); box-shadow: inset 0 0 0 1px var(--line2); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 0 16px 14px; font-size: 12.5px; color: var(--t2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; }
+.tbl { display: grid; font-size: 13px; }
+.tbl > div { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1fr 1.4fr; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--line); align-items: center; }
+.tbl > div.hd { color: var(--t3); font-size: 12px; font-weight: 600; }
+.tbl.ws > div { grid-template-columns: 16px 1.2fr 1fr .8fr 1fr .8fr .8fr; }
+.tbl .num { text-align: right; }
+
+/* Phone. */
+.phone { position: relative; width: 360px; max-width: 100%; height: 720px; border-radius: 26px; overflow: hidden; border: 1px solid var(--line2); background: var(--g0); color: var(--t); font: 14px/1.45 "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums; display: flex; flex-direction: column; }
+.phone .top { padding: 0 16px; gap: 12px; height: 52px; }
+.phone .bar, .phone .gh { padding: 0 16px; }
+.pr { position: relative; display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 16px; }
+.pr::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 1px; background: var(--line); }
+.pr .m { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--ok-line); opacity: .75; z-index: 1; }
+.pr .m.go { background: var(--go-line); }
+.pr .sub { display: block; color: var(--t3); font-size: 12.5px; margin-top: 1px; }
+.pr .btn { height: 34px; }
+.back { display: flex; align-items: center; gap: 6px; color: var(--t2); }
+.phone .peek { border: 0; background: var(--g0); flex: 1; padding: 18px 16px; }
+.phone .stack .btn, .phone .foot .btn { height: 42px; }
+.phone .scrim { align-items: end; }
+.phone .dlg { width: 100%; border-radius: 16px 16px 0 0; padding: 20px 16px 24px; }
+.phone .dlg .acts { flex-direction: column-reverse; }
+.phone .dlg .acts .btn { height: 42px; justify-content: center; }
+</style>
+</head>
+<body>
+<div class="doc">
+<header>
+  <h1>workbench web UI</h1>
+  <p>Every screen of the UI specified in <a href="../web-ui.md">web-ui.md</a>, with made-up data. The workspaces list groups by state and keeps the selected workspace in a side panel; the 2 px line under each row is its memory out of its limit. The UI follows the system's light or dark setting; the frames below show both.</p>
+  <nav>
+    <a href="#list">Workspaces</a><a href="#light">Light</a><a href="#admin">Admin</a><a href="#changing">Changing state</a><a href="#dialogs">Dialogs</a><a href="#loading">Loading and empty</a><a href="#sign-in">Sign in to app</a><a href="#console">Console</a><a href="#host">Host</a><a href="#errors">Errors</a><a href="#phone">Phone</a>
+  </nav>
+</header>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="mark" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="4" rx="1.5"/><path d="M6 10v9M18 10v9M6 15h12"/></symbol>
+  <symbol id="open" viewBox="0 0 24 24"><path d="M7 17 17 7M9 7h8v8"/></symbol>
+  <symbol id="key" viewBox="0 0 24 24"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l4-4-4-4M14 12H4"/></symbol>
+  <symbol id="term" viewBox="0 0 24 24"><path d="m5 8 4 4-4 4M12 16h7"/></symbol>
+  <symbol id="restart" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></symbol>
+  <symbol id="power" viewBox="0 0 24 24"><path d="M12 3v8M6.6 6.6a8 8 0 1 0 10.8 0"/></symbol>
+  <symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></symbol>
+  <symbol id="left" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6"/></symbol>
+</svg>
+
+<section class="fig" id="list">
+  <h2>Workspaces</h2>
+  <p>alice's view, dark. <code>alice</code> is selected and has an app update. <code>alice-nix</code> was never opened from this browser, so its primary action signs in first. A row has one action for its state; the rest is in the panel.</p>
+  <div class="scroll"><div class="app t-dark">
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="cmd"><svg class="i"><use href="#search"/></svg>Open, sign in or restart a workspace…<kbd>Ctrl K</kbd></span><span class="me">alice<span class="av">AL</span></span></div>
+    <div class="lay">
+      <aside class="side"><div class="ni a"><span>Workspaces</span><span class="x">4</span></div><div class="ni"><span>Help</span></div><div class="h">Yours</div><div class="ni"><span class="dot on"></span><span class="mono">alice</span></div><div class="ni"><span class="dot on"></span><span class="mono">alice-nix</span></div><div class="ni"><span class="dot go"></span><span class="mono">alice-scratch</span></div><div class="ni"><span class="dot off"></span><span class="mono">alice-old</span></div></aside>
+      <section class="main">
+        <div class="bar"><b>Workspaces</b><span class="x">4</span><div class="chips"><span class="chip a">All</span><span class="chip">Running</span><span class="chip">Stopped</span></div></div>
+        <div class="gh"><span class="dot on"></span>Running<span class="x">2</span></div>
+        <div class="r sel"><span class="dot on"></span><span><span class="n mono">alice</span><span class="u">alice.ws.example.com</span></span><span class="c">Ubuntu</span><span class="mem"><b>3.2</b> / 16 GiB</span><span class="btn p">Open<svg class="i"><use href="#open"/></svg><kbd>↵</kbd></span><i class="m" style="width:20%"></i></div>
+        <div class="r"><span class="dot on"></span><span><span class="n mono">alice-nix</span><span class="u">alice-nix.ws.example.com</span></span><span class="c">NixOS</span><span class="mem"><b>5.8</b> / 16 GiB</span><span class="btn">Open and sign in</span><i class="m" style="width:36%"></i></div>
+        <div class="gh"><span class="dot go"></span>Starting<span class="x">1</span></div>
+        <div class="r"><span class="dot go pulse"></span><span><span class="n mono">alice-scratch</span><span class="u">booting</span></span><span class="c">Ubuntu</span><span class="mem"><b>2.0</b> / 8 GiB</span><span class="btn">Open</span><i class="m go" style="width:25%"></i></div>
+        <div class="gh"><span class="dot off"></span>Stopped<span class="x">1</span></div>
+        <div class="r"><span class="dot off"></span><span><span class="n mono">alice-old</span><span class="u">since Nov 3</span></span><span class="c">Ubuntu</span><span class="mem">— / 16 GiB</span><span class="btn">Start</span></div>
+        <div class="hint"><span><kbd>J</kbd><kbd>K</kbd> move</span><span><kbd>↵</kbd> open</span><span><kbd>S</kbd> sign in</span><span><kbd>C</kbd> console</span><span><kbd>R</kbd> restart</span></div>
+      </section>
+      <aside class="peek">
+        <div><h2 class="mono">alice</h2><div class="st" style="margin-top:4px"><span class="dot on"></span>Running since Mon 09:12</div></div>
+        <div class="note"><b>Update</b> A new app version is on the host. Restart to use it.</div>
+        <div class="kv"><span>Address</span><span class="mono">alice.ws.example.com</span><span>System</span><span>Ubuntu 24.04</span><span>Memory</span><span>3.2 of 16 GiB<span class="meter"><i style="width:20%"></i><b style="left:12.5%"></b></span></span><span>Disk on host</span><span>41 of 64 GiB</span></div>
+        <div class="stack">
+          <span class="btn p"><span>Open alice<svg class="i"><use href="#open"/></svg></span><kbd>↵</kbd></span>
+          <span class="btn"><span><svg class="i"><use href="#key"/></svg>Sign in to app</span><kbd>S</kbd></span>
+          <span class="btn"><span><svg class="i"><use href="#term"/></svg>Console</span><kbd>C</kbd></span>
+          <span class="btn"><span><svg class="i"><use href="#restart"/></svg>Restart…</span><kbd>R</kbd></span>
+        </div>
+        <div class="foot"><span class="btn stop"><span>Stop alice…</span><svg class="i"><use href="#power"/></svg></span></div>
+      </aside>
+    </div>
+  </div></div>
+</section>
+
+<section class="fig" id="light">
+  <h2>Light</h2>
+  <p>The same page with the system in light mode, <code>alice-nix</code> selected. The primary button turns to ink; the state colors darken to keep their contrast on the pale ground.</p>
+  <div class="scroll"><div class="app mid t-light">
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="cmd"><svg class="i"><use href="#search"/></svg>Open, sign in or restart a workspace…<kbd>Ctrl K</kbd></span><span class="me">alice<span class="av">AL</span></span></div>
+    <div class="lay">
+      <aside class="side"><div class="ni a"><span>Workspaces</span><span class="x">4</span></div><div class="ni"><span>Help</span></div><div class="h">Yours</div><div class="ni"><span class="dot on"></span><span class="mono">alice</span></div><div class="ni"><span class="dot on"></span><span class="mono">alice-nix</span></div><div class="ni"><span class="dot go"></span><span class="mono">alice-scratch</span></div><div class="ni"><span class="dot off"></span><span class="mono">alice-old</span></div></aside>
+      <section class="main">
+        <div class="bar"><b>Workspaces</b><span class="x">4</span><div class="chips"><span class="chip a">All</span><span class="chip">Running</span><span class="chip">Stopped</span></div></div>
+        <div class="gh"><span class="dot on"></span>Running<span class="x">2</span></div>
+        <div class="r"><span class="dot on"></span><span><span class="n mono">alice</span><span class="u">alice.ws.example.com</span></span><span class="c">Ubuntu</span><span class="mem"><b>3.2</b> / 16 GiB</span><span class="btn">Open</span><i class="m" style="width:20%"></i></div>
+        <div class="r sel"><span class="dot on"></span><span><span class="n mono">alice-nix</span><span class="u">alice-nix.ws.example.com</span></span><span class="c">NixOS</span><span class="mem"><b>5.8</b> / 16 GiB</span><span class="btn p">Open and sign in<kbd>↵</kbd></span><i class="m" style="width:36%"></i></div>
+        <div class="gh"><span class="dot go"></span>Starting<span class="x">1</span></div>
+        <div class="r"><span class="dot go pulse"></span><span><span class="n mono">alice-scratch</span><span class="u">booting</span></span><span class="c">Ubuntu</span><span class="mem"><b>2.0</b> / 8 GiB</span><span class="btn">Open</span><i class="m go" style="width:25%"></i></div>
+        <div class="gh"><span class="dot off"></span>Stopped<span class="x">1</span></div>
+        <div class="r"><span class="dot off"></span><span><span class="n mono">alice-old</span><span class="u">since Nov 3</span></span><span class="c">Ubuntu</span><span class="mem">— / 16 GiB</span><span class="btn">Start</span></div>
+      </section>
+      <aside class="peek">
+        <div><h2 class="mono">alice-nix</h2><div class="st" style="margin-top:4px"><span class="dot on"></span>Running since Tue 14:30</div></div>
+        <div class="kv"><span>Address</span><span class="mono">alice-nix.ws.example.com</span><span>System</span><span>NixOS 26.05</span><span>Memory</span><span>5.8 of 16 GiB<span class="meter"><i style="width:36%"></i><b style="left:12.5%"></b></span></span><span>Disk on host</span><span>23 of 128 GiB</span></div>
+        <div class="stack">
+          <span class="btn p"><span>Open and sign in<svg class="i"><use href="#open"/></svg></span><kbd>↵</kbd></span>
+          <span class="btn"><span><svg class="i"><use href="#term"/></svg>Console</span><kbd>C</kbd></span>
+          <span class="btn"><span><svg class="i"><use href="#restart"/></svg>Restart…</span><kbd>R</kbd></span>
+        </div>
+        <div class="foot"><span class="btn stop"><span>Stop alice-nix…</span><svg class="i"><use href="#power"/></svg></span></div>
+      </aside>
+    </div>
+  </div></div>
+</section>
+
+<section class="fig" id="admin">
+  <h2>Admin</h2>
+  <p>carol is an admin: she sees every workspace with its owner, a <b>Mine</b> chip, and <b>Host</b> in the sidebar. <code>bob-ml</code> keeps crashing, so it is Failing, with a red memory line and the console as its action. A workspace removed from the configuration still shows while its disk is kept.</p>
+  <div class="scroll"><div class="app t-dark">
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="cmd"><svg class="i"><use href="#search"/></svg>Open, sign in or restart a workspace…<kbd>Ctrl K</kbd></span><span class="me"><span class="role">admin</span>carol<span class="av">CA</span></span></div>
+    <div class="lay adm">
+      <aside class="side"><div class="ni a"><span>Workspaces</span><span class="x">7</span></div><div class="ni"><span>Host</span></div><div class="ni"><span>Help</span></div><div class="h">Yours</div><div class="ni"><span class="dot on"></span><span class="mono">carol</span></div></aside>
+      <section class="main">
+        <div class="bar"><b>Workspaces</b><span class="x">7</span><div class="chips"><span class="chip a">All</span><span class="chip">Mine</span><span class="chip">Running</span><span class="chip">Stopped</span></div></div>
+        <div class="gh"><span class="dot bad"></span>Failing<span class="x">1</span></div>
+        <div class="r sel"><span class="dot bad"></span><span><span class="n mono">bob-ml</span><span class="u">restarted 6 times in 5 min</span></span><span class="c">bob</span><span class="c">Ubuntu</span><span class="mem">— / 32 GiB</span><span class="btn p"><svg class="i"><use href="#term"/></svg>Console<kbd>↵</kbd></span><i class="m bad" style="width:6%"></i></div>
+        <div class="gh"><span class="dot on"></span>Running<span class="x">4</span></div>
+        <div class="r"><span class="dot on"></span><span><span class="n mono">alice</span><span class="u">alice.ws.example.com</span></span><span class="c">alice</span><span class="c">Ubuntu</span><span class="mem"><b>3.2</b> / 16 GiB</span><span class="btn">Open</span><i class="m" style="width:20%"></i></div>
+        <div class="r"><span class="dot on"></span><span><span class="n mono">alice-nix</span><span class="u">alice-nix.ws.example.com</span></span><span class="c">alice</span><span class="c">NixOS</span><span class="mem"><b>5.8</b> / 16 GiB</span><span class="btn">Open</span><i class="m" style="width:36%"></i></div>
+        <div class="r"><span class="dot on"></span><span><span class="n mono">bob</span><span class="u">bob.ws.example.com</span></span><span class="c">bob</span><span class="c">Ubuntu</span><span class="mem"><b>11.4</b> / 16 GiB</span><span class="btn">Open</span><i class="m" style="width:71%"></i></div>
+        <div class="r"><span class="dot on"></span><span><span class="n mono">carol</span><span class="u">carol.ws.example.com</span></span><span class="c">carol</span><span class="c">NixOS</span><span class="mem"><b>2.4</b> / 16 GiB</span><span class="btn">Open</span><i class="m" style="width:15%"></i></div>
+        <div class="gh"><span class="dot off"></span>Stopped<span class="x">2</span></div>
+        <div class="r"><span class="dot off"></span><span><span class="n mono">alice-old</span><span class="u">since Nov 3</span></span><span class="c">alice</span><span class="c">Ubuntu</span><span class="mem">— / 16 GiB</span><span class="btn">Start</span></div>
+        <div class="r"><span class="dot off"></span><span><span class="n mono">dave</span><span class="u">removed from the configuration · disk kept</span></span><span class="c">—</span><span class="c">—</span><span class="mem">—</span><span class="wait">workbench destroy</span></div>
+      </section>
+      <aside class="peek">
+        <div><h2 class="mono">bob-ml</h2><div class="st" style="margin-top:4px"><span class="dot bad"></span>Failing since 10:31</div></div>
+        <div class="note bad"><b>Won't stay up.</b> The VM stopped 6 times in 5 minutes. Its console shows why.<div class="acts"><span class="btn"><svg class="i"><use href="#term"/></svg>Console</span><span class="btn">Restart…</span></div></div>
+        <div class="kv"><span>Owner</span><span>bob</span><span>Address</span><span class="mono">bob-ml.ws.example.com</span><span>IP</span><span class="mono">10.232.0.14</span><span>System</span><span>Ubuntu 24.04</span><span>Memory</span><span>— of 32 GiB</span><span>Disk on host</span><span>188 of 256 GiB</span></div>
+        <div class="stack">
+          <span class="btn" aria-disabled="true"><span>Open bob-ml<svg class="i"><use href="#open"/></svg></span><kbd>↵</kbd></span>
+          <span class="btn"><span><svg class="i"><use href="#restart"/></svg>Restart…</span><kbd>R</kbd></span>
+        </div>
+        <div class="foot"><span class="btn stop"><span>Stop bob-ml…</span><svg class="i"><use href="#power"/></svg></span></div>
+      </aside>
+    </div>
+  </div></div>
+</section>
+
+<section class="fig" id="changing">
+  <h2>Changing state, and a lost connection</h2>
+  <p>Right after a restart and a stop: the rows say what they wait for and have no action until it's done. The live updates dropped, so a bar says how old the page is; its forms still work.</p>
+  <div class="scroll"><div class="app short t-dark">
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="cmd"><svg class="i"><use href="#search"/></svg>Open, sign in or restart a workspace…<kbd>Ctrl K</kbd></span><span class="me">alice<span class="av">AL</span></span></div>
+    <div class="lay np">
+      <aside class="side"><div class="ni a"><span>Workspaces</span><span class="x">4</span></div><div class="ni"><span>Help</span></div></aside>
+      <section class="main">
+        <div class="banner"><b>Reconnecting…</b> Showing the state at 10:42:05.</div>
+        <div class="bar"><b>Workspaces</b><span class="x">4</span><div class="chips"><span class="chip a">All</span><span class="chip">Running</span><span class="chip">Stopped</span></div></div>
+        <div class="gh"><span class="dot go"></span>Changing<span class="x">2</span></div>
+        <div class="r"><span class="dot go pulse"></span><span><span class="n mono">alice</span><span class="u">restarting · shutting down the guest</span></span><span class="c">Ubuntu</span><span class="mem"><b>3.2</b> / 16 GiB</span><span class="wait">up to 2 min</span><i class="m go" style="width:20%"></i></div>
+        <div class="r"><span class="dot go pulse"></span><span><span class="n mono">alice-scratch</span><span class="u">stopping · shutting down the guest</span></span><span class="c">Ubuntu</span><span class="mem"><b>2.0</b> / 8 GiB</span><span class="wait">up to 2 min</span><i class="m go" style="width:25%"></i></div>
+        <div class="gh"><span class="dot on"></span>Running<span class="x">1</span></div>
+        <div class="r"><span class="dot on"></span><span><span class="n mono">alice-nix</span><span class="u">alice-nix.ws.example.com</span></span><span class="c">NixOS</span><span class="mem"><b>5.8</b> / 16 GiB</span><span class="btn">Open</span><i class="m" style="width:36%"></i></div>
+      </section>
+    </div>
+  </div></div>
+</section>
+
+<section class="fig" id="dialogs">
+  <h2>Restart and Stop</h2>
+  <p>Start has no confirmation. Restart says what stops, what stays and what it brings. Stop has the only red button in the UI and says it lasts across host reboots. Deleting isn't in the UI.</p>
+  <div class="pair">
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="scrim"><div class="dlg" role="dialog" aria-labelledby="d1">
+        <h2 id="d1">Restart <span class="mono">alice</span>?</h2>
+        <dl><dt>Stops</dt><dd>Everything running in the VM. Open app tabs lose their connection for about a minute.</dd><dt>Keeps</dt><dd>Everything on its disk.</dd><dt>Brings</dt><dd>The app and system now on the host.</dd></dl>
+        <div class="acts"><span class="btn q">Cancel</span><span class="btn p">Restart alice</span></div>
+      </div></div>
+    </div></div></figure>
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="scrim"><div class="dlg" role="dialog" aria-labelledby="d2">
+        <h2 id="d2">Stop <span class="mono">alice</span>?</h2>
+        <dl><dt>Stops</dt><dd>The VM and the app.</dd><dt>Keeps</dt><dd>Everything on its disk.</dd><dt>Lasts</dt><dd>It stays stopped, also when the host reboots, until someone starts it.</dd></dl>
+        <div class="acts"><span class="btn q">Cancel</span><span class="btn danger">Stop alice</span></div>
+      </div></div>
+    </div></div></figure>
+  </div>
+</section>
+
+<section class="fig" id="loading">
+  <h2>Loading and empty</h2>
+  <p>Skeleton rows only on the very first load; after that rows update in place. Someone without a workspace learns what one is and who makes it.</p>
+  <div class="pair">
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="bar"><b>Workspaces</b></div>
+      <div class="r"><span class="dot off"></span><span class="sk" style="width:46%"></span><span class="sk"></span><span class="sk"></span><span class="sk" style="width:60px;justify-self:end"></span></div>
+      <div class="r"><span class="dot off"></span><span class="sk" style="width:38%"></span><span class="sk"></span><span class="sk"></span><span class="sk" style="width:60px;justify-self:end"></span></div>
+      <div class="r"><span class="dot off"></span><span class="sk" style="width:52%"></span><span class="sk"></span><span class="sk"></span><span class="sk" style="width:60px;justify-self:end"></span></div>
+    </div></div><figcaption>Loading</figcaption></figure>
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">erin<span class="av">ER</span></span></div>
+      <div class="empty"><div><h2>You don't have a workspace yet</h2><p>A workspace is a VM of your own on this host, with the app in it and a disk that stays. An administrator creates it; ask one to add you.</p></div></div>
+    </div></div><figcaption>Empty</figcaption></figure>
+  </div>
+</section>
+
+<section class="fig" id="sign-in">
+  <h2>Sign in to app</h2>
+  <p>The address an admin can send a newcomer. Its <code>GET</code> is this page and signs in nothing; the button posts, and the browser goes straight to the app with a one-time link it never shows. Then the errors.</p>
+  <div class="pair">
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="solo"><div class="card">
+        <h1>Sign in to <span class="mono">alice-nix</span></h1>
+        <p>The app in <span class="mono">alice-nix</span> has a sign-in of its own. This makes a one-time link for this browser and opens the app with it.</p>
+        <div class="acts"><span class="btn p">Open and sign in<svg class="i"><use href="#open"/></svg></span><span class="btn q">Back to workspaces</span></div>
+      </div></div>
+    </div></div><figcaption>The page</figcaption></figure>
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="solo"><div class="card">
+        <h1>Sign in to <span class="mono">alice-old</span></h1>
+        <div class="err"><b><span class="mono">alice-old</span> is stopped.</b>Start it, then sign in.</div>
+        <div class="acts"><span class="btn p"><svg class="i"><use href="#power"/></svg>Start alice-old</span><span class="btn q">Back to workspaces</span></div>
+      </div></div>
+    </div></div><figcaption>Stopped</figcaption></figure>
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="solo"><div class="card">
+        <h1>Sign in to <span class="mono">alice</span></h1>
+        <div class="err"><b>The app couldn't make a sign-in link.</b>It exited with status 1.
+          <details open><summary>Details</summary><pre>error: state database is locked
+  at ~/.t3/state.db</pre></details></div>
+        <div class="acts"><span class="btn p">Try again</span><span class="btn"><svg class="i"><use href="#term"/></svg>Console</span></div>
+      </div></div>
+    </div></div><figcaption>The hook failed</figcaption></figure>
+    <figure><div class="scroll"><div class="app short half t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="solo"><div class="card">
+        <h1>Sign in to <span class="mono">alice-scratch</span></h1>
+        <div class="err"><b><span class="mono">alice-scratch</span> is still starting.</b>Its agent isn't answering yet. A NixOS workspace takes longer on its first boot after an update.</div>
+        <div class="acts"><span class="btn p">Try again</span><span class="btn q">Back to workspaces</span></div>
+      </div></div>
+    </div></div><figcaption>Still starting</figcaption></figure>
+  </div>
+</section>
+
+<section class="fig" id="console">
+  <h2>Console</h2>
+  <p>The serial console, shared: one connection per VM on the host, fanned out to everyone watching, with the last output kept for whoever opens it next. Here alice restarted with the console open to pick the previous NixOS generation.</p>
+  <div class="scroll"><div class="app t-dark">
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="cmd"><svg class="i"><use href="#search"/></svg>Open, sign in or restart a workspace…<kbd>Ctrl K</kbd></span><span class="me">alice<span class="av">AL</span></span></div>
+    <div class="cbar"><span class="back"><svg class="i"><use href="#left"/></svg>Workspaces</span><span class="x">/</span><b class="mono">alice-nix</b><span class="st"><span class="dot go pulse"></span>Starting</span><div class="r2"><span class="small">2 connected · you and carol</span><span class="btn"><svg class="i"><use href="#restart"/></svg>Restart with console…</span></div></div>
+    <div class="term"><span class="d">[  OK  ] Reached target Power-Off.
+[  284.112] reboot: Power down</span>
+
+<span class="k">systemd-boot</span>  <span class="d">(timeout 1 s, stopped)</span>
+
+   <span class="h"> NixOS (Generation 42 2026-11-18, Linux 6.18.60)                  </span>
+     NixOS (Generation 41 2026-11-12, Linux 6.18.58)
+     NixOS (Generation 40 2026-11-05, Linux 6.18.58)
+     Reboot Into Firmware Interface
+
+   <span class="d">↑↓ choose · Enter boots · e edits</span>
+
+<span class="cur"></span></div>
+  </div></div>
+</section>
+
+<section class="fig" id="host">
+  <h2>Host</h2>
+  <p>Admins only. The host's memory as one bar: what each pool holds, what workspaces are waiting for, the reserve no workspace grows into, and what's free. A pool whose daemon stopped writing says since when.</p>
+  <div class="scroll"><div class="app t-dark">
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="cmd"><svg class="i"><use href="#search"/></svg>Open, sign in or restart a workspace…<kbd>Ctrl K</kbd></span><span class="me"><span class="role">admin</span>carol<span class="av">CA</span></span></div>
+    <div class="lay np">
+      <aside class="side"><div class="ni"><span>Workspaces</span><span class="x">7</span></div><div class="ni a"><span>Host</span></div><div class="ni"><span>Help</span></div></aside>
+      <section class="main">
+        <div class="bar"><b>Host</b><span class="x">ws.example.com</span><span class="chips small">updated 10:42:05</span></div>
+        <div class="hostw">
+          <div class="panel">
+            <header><h2>Memory</h2><span>125.6 GiB total</span><span class="rt">46.2 GiB free</span></header>
+            <div class="hbar"><i class="sw1" style="width:24%"></i><i class="sw2" style="width:28%"></i><i class="sw3" style="width:2.5%"></i><i class="sw4" style="width:10%"></i></div>
+            <div class="legend"><span><i class="sw1"></i>workbench 30.1 GiB</span><span><i class="sw2"></i>builders 35.2 GiB</span><span><i class="sw3"></i>waiting 3.1 GiB</span><span><i class="sw4"></i>reserve 12.6 GiB</span><span><i class="sw5"></i>free 46.2 GiB</span></div>
+            <div class="tbl">
+              <div class="hd"><span>Pool</span><span class="num">Holds</span><span class="num">Waiting</span><span>Last denied</span><span>Report</span></div>
+              <div><span class="mono">workbench</span><span class="num">30.1 GiB</span><span class="num">3.1 GiB</span><span>4 min ago</span><span class="small">2 s ago</span></div>
+              <div><span class="mono">builders</span><span class="num">35.2 GiB</span><span class="num">—</span><span>—</span><span style="color:var(--go)">no data since 10:12</span></div>
+            </div>
+          </div>
+          <div class="panel">
+            <header><h2>Workspaces</h2><span>memory now, at boot and at most</span></header>
+            <div class="tbl ws">
+              <div class="hd"><span></span><span>Workspace</span><span>Owner</span><span class="num">Now</span><span class="num">Boot</span><span class="num">Most</span><span class="num">Disk</span></div>
+              <div><span class="dot on"></span><span class="mono">bob</span><span>bob</span><span class="num">11.4 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">96 GiB</span></div>
+              <div><span class="dot on"></span><span class="mono">alice-nix</span><span>alice</span><span class="num">5.8 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">23 GiB</span></div>
+              <div><span class="dot on"></span><span class="mono">alice</span><span>alice</span><span class="num">3.2 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">41 GiB</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div></div>
+</section>
+
+<section class="fig" id="errors">
+  <h2>Errors</h2>
+  <p>First, bob at <code>alice.ws.example.com</code>: the host's check stops him before the app, whatever the app does about accounts. Then the UI when systemd can't be read.</p>
+  <div class="pair">
+    <figure><div class="scroll"><div class="app short half t-light">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">bob<span class="av">BO</span></span></div>
+      <div class="solo"><div class="card">
+        <h1>This workspace isn't yours</h1>
+        <p><span class="mono">alice.ws.example.com</span> belongs to someone else. You're signed in as <b>bob</b>.</p>
+        <div class="acts"><span class="btn p">Your workspaces</span><span class="btn q">Sign out</span></div>
+      </div></div>
+    </div></div><figcaption>403 at a workspace</figcaption></figure>
+    <figure><div class="scroll"><div class="app short half t-light">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me">alice<span class="av">AL</span></span></div>
+      <div class="solo"><div class="card">
+        <h1>Couldn't read the workspaces</h1>
+        <div class="err"><b>The host didn't answer.</b>systemd couldn't be reached.
+          <details open><summary>Details</summary><pre>systemctl show workbench@alice.service: Failed to connect to bus: Connection refused</pre></details></div>
+        <div class="acts"><span class="btn p">Try again</span></div>
+      </div></div>
+    </div></div><figcaption>502</figcaption></figure>
+  </div>
+</section>
+
+<section class="fig" id="phone">
+  <h2>Phone</h2>
+  <p>At phone width the list is the page and a row opens the panel as a page of its own. Dialogs rise from the bottom, buttons at thumb height.</p>
+  <div class="pair">
+    <figure><div class="phone t-dark">
+      <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me"><span class="av">AL</span></span></div>
+      <div class="bar"><b>Workspaces</b><span class="x">4</span><div class="chips"><span class="chip a">All</span><span class="chip">Running</span></div></div>
+      <div class="gh"><span class="dot on"></span>Running<span class="x">2</span></div>
+      <div class="pr"><span class="dot on"></span><span><span class="n mono">alice</span><span class="sub">Ubuntu · 3.2 / 16 GiB</span></span><span class="btn p">Open</span><i class="m" style="width:20%"></i></div>
+      <div class="pr"><span class="dot on"></span><span><span class="n mono">alice-nix</span><span class="sub">NixOS · 5.8 / 16 GiB</span></span><span class="btn">Open and sign in</span><i class="m" style="width:36%"></i></div>
+      <div class="gh"><span class="dot go"></span>Starting<span class="x">1</span></div>
+      <div class="pr"><span class="dot go pulse"></span><span><span class="n mono">alice-scratch</span><span class="sub">booting</span></span><span class="btn">Open</span><i class="m go" style="width:25%"></i></div>
+      <div class="gh"><span class="dot off"></span>Stopped<span class="x">1</span></div>
+      <div class="pr"><span class="dot off"></span><span><span class="n mono">alice-old</span><span class="sub">since Nov 3</span></span><span class="btn">Start</span></div>
+    </div><figcaption>The list</figcaption></figure>
+    <figure><div class="phone t-dark">
+      <div class="top"><span class="back"><svg class="i"><use href="#left"/></svg>Workspaces</span><span class="me"><span class="av">AL</span></span></div>
+      <div class="peek">
+        <div><h2 class="mono">alice</h2><div class="st" style="margin-top:4px"><span class="dot on"></span>Running since Mon 09:12</div></div>
+        <div class="note"><b>Update</b> A new app version is on the host. Restart to use it.</div>
+        <div class="kv"><span>Address</span><span class="mono">alice.ws.example.com</span><span>System</span><span>Ubuntu 24.04</span><span>Memory</span><span>3.2 of 16 GiB<span class="meter"><i style="width:20%"></i><b style="left:12.5%"></b></span></span><span>Disk</span><span>41 of 64 GiB</span></div>
+        <div class="stack">
+          <span class="btn p"><span>Open alice<svg class="i"><use href="#open"/></svg></span></span>
+          <span class="btn"><span><svg class="i"><use href="#key"/></svg>Sign in to app</span></span>
+          <span class="btn"><span><svg class="i"><use href="#term"/></svg>Console</span></span>
+          <span class="btn"><span><svg class="i"><use href="#restart"/></svg>Restart…</span></span>
+        </div>
+        <div class="foot"><span class="btn stop"><span>Stop alice…</span><svg class="i"><use href="#power"/></svg></span></div>
+      </div>
+    </div><figcaption>The panel</figcaption></figure>
+    <figure><div class="phone t-light">
+      <div class="top"><span class="back"><svg class="i"><use href="#left"/></svg>Workspaces</span><span class="me"><span class="av">AL</span></span></div>
+      <div class="peek"><div><h2 class="mono">alice</h2><div class="st" style="margin-top:4px"><span class="dot on"></span>Running since Mon 09:12</div></div></div>
+      <div class="scrim"><div class="dlg" role="dialog" aria-labelledby="d3">
+        <h2 id="d3">Restart <span class="mono">alice</span>?</h2>
+        <dl><dt>Stops</dt><dd>Everything running in the VM, for about a minute.</dd><dt>Keeps</dt><dd>Everything on its disk.</dd><dt>Brings</dt><dd>The app and system now on the host.</dd></dl>
+        <div class="acts"><span class="btn q">Cancel</span><span class="btn p">Restart alice</span></div>
+      </div></div>
+    </div><figcaption>A dialog, light</figcaption></figure>
+  </div>
+</section>
+</div>
+</body>
+</html>
