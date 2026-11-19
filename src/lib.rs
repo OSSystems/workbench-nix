@@ -9,3 +9,4 @@
 pub mod agent;
 pub mod config;
 pub mod launch;
+pub mod memoryd;
