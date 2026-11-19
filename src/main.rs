@@ -67,6 +67,8 @@ enum Command {
     },
     /// Become the workspace's VM (internal: the unit's ExecStart)
     Run { workspace: String },
+    /// Let the web UI use the VM's sockets (internal: the unit's ExecStartPost)
+    ShareSockets { workspace: String },
     /// Power the VM off cleanly (internal: the unit's ExecStop)
     Shutdown {
         workspace: String,
@@ -124,6 +126,11 @@ fn run(args: Args) -> anyhow::Result<()> {
         // Becomes cloud-hypervisor: no runtime threads left behind.
         Command::Run { workspace } => launch::run(&dirs, &workspace),
         Command::Console { workspace } => cli::console(&dirs, &workspace),
+        Command::ShareSockets { workspace } => {
+            // The sockets come once the disk is made, which the unit's
+            // TimeoutStartSec bounds.
+            rt()?.block_on(launch::share_sockets(&dirs, &workspace, Duration::from_secs(24 * 3600)))
+        }
         Command::Shutdown { workspace, timeout } => {
             rt()?.block_on(launch::shutdown(&dirs, &workspace, Duration::from_secs(timeout)))
         }

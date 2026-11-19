@@ -321,6 +321,7 @@ let
       secretsDir = secretsDirOf name ws;
       inherit controlPort agentPort;
     }
+    // lib.optionalAttrs cfg.web.enable { socketGroup = "workbench"; }
     // (
       if ws.os == "ubuntu" then
         {
@@ -658,7 +659,8 @@ in
 
     systemd = {
       tmpfiles.rules = [
-        "d ${cfg.stateDir} 0711 root root -"
+        # The web UI's group lists it, for the disks of removed workspaces.
+        "d ${cfg.stateDir} ${if cfg.web.enable then "0751 root workbench" else "0711 root root"} -"
         "d /var/lib/workbench-secrets 0700 root root -"
       ]
       ++ lib.mapAttrsToList (name: ws: "d ${secretsDirOf name ws} 0700 root root -") cfg.workspaces;
@@ -673,6 +675,10 @@ in
           unitConfig.ConditionPathExists = "!${cfg.stateDir}/.stopped/%i";
           serviceConfig = {
             ExecStart = "${exe} run %i";
+            ExecStartPost = "${exe} share-sockets %i";
+            # A first start makes the disk from the image, which may take
+            # minutes; one cut short starts it over.
+            TimeoutStartSec = "15min";
             ExecStop = "${exe} shutdown %i";
             RuntimeDirectory = "workbench/%i";
             RuntimeDirectoryMode = "0711";
