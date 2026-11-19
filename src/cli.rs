@@ -1,28 +1,19 @@
-//! The ops commands on the host: `status`, `pair`, `console` and `destroy`.
-//! They only talk to running VMs through their sockets, so they never stop
-//! one by accident.
+//! The ops commands on the host: `status`, `start`, `stop`, `restart`,
+//! `sign-in`, `console` and `destroy`. Only start, stop, restart and
+//! destroy change a VM; the others talk to it through its sockets.
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
-use serde::Serialize;
-use vmkit::ch::Client;
 use vmkit::hostutil;
-use vmkit::memory::{GIB, MIB};
+use vmkit::memory::GIB;
+use workbench_model::Verb;
 
-use crate::agent::{self, Request};
 use crate::config::{self, is_workspace_name};
-
-/// The unit of a workspace.
-#[must_use]
-pub fn unit_name(name: &str) -> String {
-    format!("workbench@{name}.service")
-}
+use crate::state::{self, unit_name};
 
 /// How a command that reported an exit code ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,120 +27,35 @@ impl std::fmt::Display for ExitCode {
 
 impl std::error::Error for ExitCode {}
 
-/// Runs `t3 auth pairing create --base-url <url>` as the owner inside the
-/// guest and prints what it prints.
-pub async fn pair(dirs: &[PathBuf], name: &str, args: Vec<String>) -> anyhow::Result<()> {
+/// Prints a link that signs a browser in to the workspace's app.
+pub async fn sign_in(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
-    let reply = agent::ask(&c, &Request { op: "pair".into(), args }, Duration::from_secs(90)).await?;
-    print!("{}", reply.stdout);
-    eprint!("{}", reply.stderr);
-    if reply.exit_code != 0 {
-        return Err(ExitCode(reply.exit_code).into());
-    }
+    let link = state::sign_in_link(&c).await?;
+    println!("{link}");
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceStatus {
-    pub name: String,
-    pub configured: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub owner: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub url: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub ip: String,
-    pub unit: String,
-    pub vm: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub memory_bytes: i64,
-    #[serde(rename = "maxMemoryBytes", skip_serializing_if = "is_zero")]
-    pub max_mem_bytes: i64,
-    pub disk_bytes: u64,
-    #[serde(rename = "diskUsedBytes")]
-    pub disk_used: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub agent: String,
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(n: &i64) -> bool {
-    *n == 0
-}
-
-/// A unit's `ActiveState`, or `unknown`.
-pub async fn unit_state(unit: &str) -> String {
-    let out = tokio::process::Command::new("systemctl")
-        .args(["show", "--property=ActiveState", "--value", unit])
-        .output()
-        .await;
-    match out {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-        _ => "unknown".into(),
+/// Starts, stops or restarts a workspace and waits for systemd to finish.
+pub async fn control(dirs: &[PathBuf], state_root: &Path, verb: Verb, name: &str) -> anyhow::Result<()> {
+    // A workspace removed from the configuration may still be stopped.
+    if verb != Verb::Stop {
+        config::load(dirs, name)?;
     }
-}
-
-/// The configured workspaces and the disks left by removed ones.
-pub async fn statuses(dirs: &[PathBuf], state_root: &Path) -> Vec<WorkspaceStatus> {
-    let mut names = config::configured(dirs);
-    if let Ok(entries) = std::fs::read_dir(state_root) {
-        for e in entries.flatten() {
-            let Some(name) = e.file_name().to_str().map(str::to_owned) else { continue };
-            if is_workspace_name(&name) && !names.contains(&name) && e.path().join("disk.raw").is_file() {
-                names.push(name);
-            }
-        }
-    }
-    names.sort();
-    // Each VM may take seconds to answer: ask them all at once.
-    let mut probes = tokio::task::JoinSet::new();
-    for (i, name) in names.into_iter().enumerate() {
-        let (dirs, state_root) = (dirs.to_vec(), state_root.to_owned());
-        probes.spawn(async move { (i, probe(&dirs, &state_root, name).await) });
-    }
-    let mut all = probes.join_all().await;
-    all.sort_by_key(|(i, _)| *i);
-    all.into_iter().map(|(_, s)| s).collect()
-}
-
-/// One workspace, from its config, its unit, its VM's API and its agent.
-async fn probe(dirs: &[PathBuf], state_root: &Path, name: String) -> WorkspaceStatus {
-    let mut s = WorkspaceStatus { unit: unit_state(&unit_name(&name)).await, vm: "-".into(), ..Default::default() };
-    let mut disk = state_root.join(&name).join("disk.raw");
-    if let Ok(c) = config::load(dirs, &name) {
-        s.configured = true;
-        s.owner.clone_from(&c.owner);
-        s.url.clone_from(&c.url);
-        s.ip.clone_from(&c.ip);
-        disk = c.disk();
-        s.max_mem_bytes = c.max_mem_mib * MIB;
-        let info = tokio::time::timeout(Duration::from_secs(2), Client::new(c.api_socket()).info()).await;
-        if let Ok(Ok(info)) = info {
-            s.vm = info.state;
-            s.memory_bytes = info.memory_actual_size;
-            let ping = agent::ask(&c, &Request { op: "ping".into(), args: vec![] }, Duration::from_secs(2)).await;
-            s.agent = if ping.is_ok() { "up" } else { "down" }.into();
-        }
-    }
-    if let Ok(m) = std::fs::metadata(&disk) {
-        s.disk_bytes = m.len();
-        s.disk_used = m.blocks() * 512;
-    }
-    s.name = name;
-    s
+    state::control(state_root, verb, name, true).await
 }
 
 /// Prints the workspaces, as a table or as JSON.
 pub async fn status(w: &mut impl Write, dirs: &[PathBuf], state_root: &Path, json: bool) -> anyhow::Result<()> {
-    let all = statuses(dirs, state_root).await;
+    let all = state::collect(dirs, state_root).await?;
     if json {
         serde_json::to_writer_pretty(&mut *w, &all)?;
         writeln!(w)?;
         return Ok(());
     }
-    let mut rows =
-        vec![["WORKSPACE", "OWNER", "IP", "UNIT", "VM", "MEMORY", "DISK USED/SIZE", "AGENT", "URL"].map(String::from)];
+    let mut rows = vec![
+        ["WORKSPACE", "OWNER", "IP", "STATE", "UNIT", "VM", "MEMORY", "DISK USED/SIZE", "AGENT", "URL"]
+            .map(String::from),
+    ];
     for s in &all {
         let (owner, url) = if s.configured {
             (s.owner.clone(), s.url.clone())
@@ -157,16 +63,17 @@ pub async fn status(w: &mut impl Write, dirs: &[PathBuf], state_root: &Path, jso
             ("-".into(), "(removed from the configuration; disk kept)".into())
         };
         let mem = if s.memory_bytes > 0 {
-            format!("{:.1}/{:.0} GiB", gibs(s.memory_bytes), gibs(s.max_mem_bytes))
+            format!("{:.1}/{:.0} GiB", gibs(s.memory_bytes), gibs(s.max_memory_bytes))
         } else {
             "-".into()
         };
         #[allow(clippy::cast_possible_wrap)]
-        let disk = format!("{:.1}/{:.0} GiB", gibs(s.disk_used as i64), gibs(s.disk_bytes as i64));
+        let disk = format!("{:.1}/{:.0} GiB", gibs(s.disk_used_bytes as i64), gibs(s.disk_bytes as i64));
         rows.push([
             s.name.clone(),
             owner,
             or_dash(&s.ip),
+            s.state.to_string(),
             s.unit.clone(),
             s.vm.clone(),
             mem,
@@ -321,6 +228,12 @@ pub async fn destroy(
         bail!("{unit} is still running or about to start; nothing deleted");
     }
     std::fs::remove_dir_all(&state_dir)?;
+    // A stop marker would keep the fresh disk of a workspace still
+    // declared from being made at the next boot.
+    match std::fs::remove_file(state::stop_marker(state_root, name)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     writeln!(out, "Deleted {}.", state_dir.display())?;
     if declared.is_some() {
         writeln!(

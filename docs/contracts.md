@@ -55,7 +55,7 @@ describes), so it trusts what it is asked.
   1 MiB, and closes the connection.
 
 ```json
-{"op":"pair","args":["--json"]}
+{"op":"sign-in"}
 ```
 
 | Field | Meaning |
@@ -64,27 +64,32 @@ describes), so it trusts what it is asked.
 | `args` | The operation's arguments; absent for none. |
 
 ```json
-{"stdout":"{\"credential\":\"…\"}\n","stderr":"","exitCode":0}
+{"stdout":"https://alice.ws.example.com/pair#token=…\n","exitCode":0}
 ```
 
 | Field | Meaning |
 |---|---|
-| `stdout`, `stderr` | What the operation's command printed; absent when empty. |
+| `signIn` | In the answer to `ping`: the app has a sign-in hook. Absent when false. |
+| `stdout`, `stderr` | What the operation's command printed, each cut at 64 KiB; absent when empty. |
 | `exitCode` | How it exited; always present, `0` for an operation without a command. |
 | `error` | Why the request failed; absent on success. When present, the other fields say nothing. |
 
 Failures the agent reports in `error`: `no request` (nothing within 10 s),
 `invalid JSON`, `unknown op`, and an operation's own reasons, such as an
-unknown owner or a command that did not finish in time.
+unknown owner, an app without a sign-in hook or a command that did not
+finish in time.
 
 ### `ping`
 
-No arguments; the reply is `{"exitCode":0}`. The host's `workbench status`
-uses it to show whether the agent is up.
+No arguments; the reply is `{"exitCode":0}`, with `signIn` when the app
+bundle has `bin/sign-in-link`. The host's `workbench status` and the web UI
+use it to show whether the agent is up and whether the app signs browsers
+in.
 
-### `pair`
+### `sign-in`
 
-Runs `t3 auth pairing create --base-url <url> --label workbench <args…>` as
-the owner, in their home, with `T3CODE_HOME=~/.t3`, for at most 60 s, and
-replies with what it printed and its exit code. `workbench pair <workspace>
-<args…>` passes its arguments through.
+Runs the app bundle's `bin/sign-in-link` as the owner, in their home, with
+`HOME`, `USER`, `LOGNAME`, `WORKSPACE_URL` (the workspace's `url`) and a
+`PATH` with the bundle's `sw/bin` first, for at most 60 s, and replies with
+what it printed and its exit code. The hook prints one URL on the
+workspace's own origin; the host checks that before it uses it.

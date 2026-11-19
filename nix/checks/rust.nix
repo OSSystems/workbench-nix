@@ -9,6 +9,7 @@ flake.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
       ../../Cargo.lock
       ../../rustfmt.toml
       ../../src
+      ../../model
     ];
   };
   nativeBuildInputs = old.nativeBuildInputs ++ [
@@ -16,9 +17,10 @@ flake.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
     pkgs.rustfmt
   ];
   doCheck = true;
+  cargoTestFlags = [ "--workspace" ];
   preCheck = ''
-    cargo fmt --check
-    cargo clippy --all-targets --offline -- -D warnings
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets --offline -- -D warnings
   '';
   installPhase = "touch $out";
 })

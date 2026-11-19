@@ -108,7 +108,14 @@ let
       #!${pkgs.runtimeShell}
       exec ${exe} guest-agent --config=/run/workspace/config/workspace.json
       EOF
-      chmod +x $out/bin/serve $out/bin/workspace-agent
+      # The sign-in hook: one link that signs a browser in to T3 Code.
+      cat > $out/bin/sign-in-link <<EOF
+      #!${pkgs.runtimeShell}
+      set -eo pipefail
+      export T3CODE_HOME=\$HOME/.t3
+      ${t3} auth pairing create --base-url "\$WORKSPACE_URL" --label workbench --json | ${lib.getExe pkgs.jq} -er .pairUrl
+      EOF
+      chmod +x $out/bin/serve $out/bin/workspace-agent $out/bin/sign-in-link
     '';
 
   mountUnit = what: where: ''
@@ -661,6 +668,9 @@ in
           description = "Workspace VM %i";
           after = [ "systemd-networkd.service" ];
           restartIfChanged = false;
+          # `workbench stop` leaves this marker so a stopped workspace stays
+          # stopped across reboots; `workbench start` removes it.
+          unitConfig.ConditionPathExists = "!${cfg.stateDir}/.stopped/%i";
           serviceConfig = {
             ExecStart = "${exe} run %i";
             ExecStop = "${exe} shutdown %i";

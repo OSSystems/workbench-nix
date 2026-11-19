@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use vmkit::hostutil;
+pub use workbench_model::{is_user_name, is_workspace_name};
 
 /// Searched in order for `<workspace>.json`: the declarative configs Nix
 /// renders, then configs made at run time.
@@ -83,26 +84,6 @@ pub struct Config {
 
     pub control_port: i64,
     pub agent_port: i64,
-}
-
-/// Whether `name` is a workspace name: a DNS label of at most 28
-/// characters, lowercase.
-#[must_use]
-pub fn is_workspace_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    (1..=28).contains(&b.len())
-        && b[0].is_ascii_lowercase()
-        && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        && b[b.len() - 1] != b'-'
-}
-
-/// Whether `name` is a user name the guest and host accept.
-#[must_use]
-pub fn is_user_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    (1..=32).contains(&b.len())
-        && (b[0].is_ascii_lowercase() || b[0] == b'_')
-        && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-'))
 }
 
 fn is_mac(mac: &str) -> bool {
@@ -233,6 +214,13 @@ impl Config {
     #[must_use]
     pub fn serial(&self) -> PathBuf {
         self.vm_dir().join("serial.sock")
+    }
+
+    /// Records the app the running VM started with, to tell when the host
+    /// has a newer one.
+    #[must_use]
+    pub fn started_app(&self) -> PathBuf {
+        Path::new(&self.runtime_dir).join("app")
     }
 
     /// The host side of the guest's control port.
@@ -403,16 +391,6 @@ pub(crate) mod tests {
             let mut c = test_config();
             change(&mut c);
             assert!(c.validate().is_err(), "{name}: accepted");
-        }
-    }
-
-    #[test]
-    fn names() {
-        for ok in ["a", "ab", "a-b", "alice-dev", &"a".repeat(28)] {
-            assert!(is_workspace_name(ok), "{ok}");
-        }
-        for bad in ["", "-a", "a-", "1a", "A", "a_b", "a.b", &"a".repeat(29)] {
-            assert!(!is_workspace_name(bad), "{bad}");
         }
     }
 
