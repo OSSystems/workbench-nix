@@ -281,9 +281,19 @@ sudo workbench pair alice           # flags after the name go to t3
 ## Development
 
 ```sh
-nix flake check   # go test, an evaluation next to another vmkit controller, and the VM test
+nix develop       # cargo, clippy, rustfmt, rust-analyzer; links ./vmkit
+cargo test
+nix flake check   # rustfmt, clippy and the tests, the module evaluations, and the VM test
 nix fmt -- $(git ls-files '*.nix')
 ```
+
+workbench is a Rust crate built against the vmkit crate of the flake's
+`vmkit` input, the same revision whose NixOS module the host imports: a
+host whose `vmkit` input follows its own builds workbench against that one.
+`Cargo.toml` takes vmkit from `./vmkit`, which `nix develop` links to the
+locked input and the package copies in; its dependencies are locked in
+`Cargo.lock` with workbench's. To work on both at once, link `./vmkit` to
+a vmkit checkout of your own; `nix develop` leaves such a link alone.
 
 `checks.guest` evaluates the system a new NixOS workspace writes and
 rebuilds. `checks.workspaces` boots two workspaces in a NixOS VM test, one

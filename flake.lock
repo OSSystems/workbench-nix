@@ -104,11 +104,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795029729,
-        "narHash": "sha256-PC9TumG4844UdPZgr80+ckBYOyoBhZB1tR+2FnE7d34=",
+        "lastModified": 1795283927,
+        "narHash": "sha256-kKIkd12VFogyvKhefm/hNrmsdBaNeNNFAVql8mqiUSU=",
         "owner": "OSSystems",
         "repo": "vmkit-nix",
-        "rev": "fa0854c596db726bc166ac05d03418229cf91453",
+        "rev": "91c2cb19abba54c8c79a5e2da5475ab4feec5ee2",
         "type": "github"
       },
       "original": {
