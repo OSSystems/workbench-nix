@@ -6,5 +6,6 @@
 //! never stops a VM.
 #![cfg(target_os = "linux")]
 
+pub mod agent;
 pub mod config;
 pub mod launch;

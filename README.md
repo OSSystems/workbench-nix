@@ -295,6 +295,9 @@ locked input and the package copies in; its dependencies are locked in
 `Cargo.lock` with workbench's. To work on both at once, link `./vmkit` to
 a vmkit checkout of your own; `nix develop` leaves such a link alone.
 
+What the host and its guests exchange, `workspace.json` and the agent's
+requests, is described in [docs/contracts.md](docs/contracts.md).
+
 `checks.guest` evaluates the system a new NixOS workspace writes and
 rebuilds. `checks.workspaces` boots two workspaces in a NixOS VM test, one
 Ubuntu and one NixOS; it needs nested virtualization on the machine that
