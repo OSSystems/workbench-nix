@@ -10,6 +10,7 @@ flake.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
       ../../rustfmt.toml
       ../../src
       ../../model
+      ../../web
     ];
   };
   nativeBuildInputs = old.nativeBuildInputs ++ [
@@ -17,10 +18,16 @@ flake.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
     pkgs.rustfmt
   ];
   doCheck = true;
-  cargoTestFlags = [ "--workspace" ];
-  preCheck = ''
+  # The web UI builds twice: its server, and its WebAssembly.
+  checkPhase = ''
+    runHook preCheck
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets --offline -- -D warnings
+    cargo clippy --offline --workspace --all-targets -- -D warnings
+    cargo clippy --offline -p workbench-web --features ssr --all-targets -- -D warnings
+    cargo clippy --offline -p workbench-web --lib --target wasm32-unknown-unknown --features hydrate -- -D warnings
+    cargo test --offline --workspace
+    cargo test --offline -p workbench-web --features ssr
+    runHook postCheck
   '';
   installPhase = "touch $out";
 })

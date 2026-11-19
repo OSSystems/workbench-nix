@@ -15,6 +15,8 @@ pkgs.rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../src
       ../model
+      # A member of the workspace, though not built here.
+      ../web
     ];
   };
   # The vmkit crate is the one the flake locks, the same revision as its

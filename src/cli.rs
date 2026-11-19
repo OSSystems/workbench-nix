@@ -117,15 +117,42 @@ fn or_dash(s: &str) -> String {
     if s.is_empty() { "-".into() } else { s.into() }
 }
 
-/// Attaches the terminal to the VM's serial port until Ctrl-] is typed.
+/// Where the web UI shares the consoles, when it runs.
+pub const SHARED_CONSOLES: &str = "/run/workbench-web/console.sock";
+
+/// Attaches the terminal to the VM's serial console until Ctrl-] is typed:
+/// the web UI's shared one when it runs, the serial socket otherwise.
 pub fn console(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
-    let conn = UnixStream::connect(c.serial()).with_context(|| format!("serial console of {name}"))?;
+    let (conn, shared) = match shared_console(Path::new(SHARED_CONSOLES), name)? {
+        Some(conn) => (conn, " (shared with the web UI)"),
+        None => (UnixStream::connect(c.serial()).with_context(|| format!("serial console of {name}"))?, ""),
+    };
     let raw = RawTerminal::new();
-    eprint!("Connected to {name}; Ctrl-] quits.\r\n");
+    eprint!("Connected to {name}{shared}; Ctrl-] quits.\r\n");
     attach(conn);
     drop(raw);
     Ok(())
+}
+
+/// Asks the web UI's shared consoles for one: the workspace's name and a
+/// newline, then `OK` or `ERR <why>`. `None` when the UI does not run.
+pub(crate) fn shared_console(socket: &Path, name: &str) -> anyhow::Result<Option<UnixStream>> {
+    let Ok(mut conn) = UnixStream::connect(socket) else { return Ok(None) };
+    conn.write_all(format!("{name}\n").as_bytes())?;
+    // Byte by byte, so nothing the console sends after the answer is
+    // buffered away.
+    let mut answer = Vec::new();
+    let mut byte = [0];
+    while answer.len() < 4096 && conn.read(&mut byte)? == 1 && byte[0] != b'\n' {
+        answer.push(byte[0]);
+    }
+    let answer = String::from_utf8_lossy(&answer);
+    match answer.strip_prefix("ERR ") {
+        _ if answer == "OK" => Ok(Some(conn)),
+        Some(why) => bail!("the web UI's console of {name}: {why}"),
+        None => bail!("the web UI's console of {name} answered {answer:?}"),
+    }
 }
 
 /// Copies the console both ways until either side ends or Ctrl-] is typed.
@@ -270,6 +297,30 @@ mod tests {
         );
         let err = destroy(&[], root.path(), "carol", true, &mut &b""[..], &mut out).await.unwrap_err();
         assert!(err.to_string().contains("no data"), "destroying an unknown workspace: {err}");
+    }
+
+    #[test]
+    fn shared_console_handshake() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("console.sock");
+        assert!(shared_console(&socket, "alice").unwrap().is_none(), "no UI, no shared console");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for answer in ["OK\nboot log", "ERR no workspace \"bob\"\n"] {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut name = String::new();
+                io::BufReader::new(&mut conn).read_line(&mut name).unwrap();
+                conn.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        let mut conn = shared_console(&socket, "alice").unwrap().unwrap();
+        let mut rest = String::new();
+        conn.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "boot log", "the console starts right after the answer");
+        let err = shared_console(&socket, "bob").unwrap_err();
+        assert!(err.to_string().contains("no workspace"), "{err}");
+        server.join().unwrap();
     }
 
     #[test]
