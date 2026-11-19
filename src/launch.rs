@@ -67,6 +67,7 @@ pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
         chown(&socket, Some(vm_user.uid), Some(vm_user.gid))?;
     }
     drop(runtime);
+    fs::write(c.started_app(), format!("{}\n", c.app))?;
     let host_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let argv = cloud_hypervisor_argv(&c, u32::try_from(host_cpus).unwrap_or(u32::MAX));
     eprintln!("starting workspace {} for {} at {}", c.name, c.owner, c.ip);
