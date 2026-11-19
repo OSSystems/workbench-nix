@@ -7,6 +7,7 @@
 pub mod authz;
 pub mod console;
 mod routes;
+mod self_service;
 mod view;
 
 use std::collections::HashMap;
@@ -20,10 +21,14 @@ use std::time::{Duration, Instant};
 use leptos::config::LeptosOptions;
 use leptos::prelude::*;
 use workbench::config::{self, Config};
+use workbench::self_service::Paths;
 use workbench::state::{self, SignInError};
+use workbench_model::self_service::Limits;
 use workbench_model::{HostView, Snapshot, State, Verb, Viewer, Workspace, is_user_name};
 
 pub use routes::{authz_router, ui_router};
+pub use self_service::CreateForm;
+pub use workbench::self_service::Paths as SelfServicePaths;
 
 /// A future a [`Backend`] returns.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -38,8 +43,27 @@ pub trait Backend: Send + Sync + 'static {
     fn config(&self, name: &str) -> anyhow::Result<Config>;
     /// The app's sign-in link.
     fn sign_in(&self, c: Config) -> BoxFuture<'_, Result<String, SignInError>>;
-    /// Who a browser's cookies are signed in as; empty for nobody.
-    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
+    /// Who a browser's cookies are signed in as, and their groups; no one
+    /// has an empty name.
+    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>>;
+    /// Starts a unit and waits for it to finish: the units that make and
+    /// destroy workspaces.
+    fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
+}
+
+/// Who single sign-on says someone is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub user: String,
+    pub groups: Vec<String>,
+}
+
+/// What lets people make their own workspaces.
+#[derive(Debug, Clone)]
+pub struct SelfService {
+    pub limits: Limits,
+    /// Where requests, outcomes and quotas go.
+    pub paths: Paths,
 }
 
 /// How `workbench-web` is set up.
@@ -51,6 +75,12 @@ pub struct Options {
     /// it.
     pub origin: String,
     pub admins: Vec<String>,
+    /// Groups whose members are admins.
+    pub admin_groups: Vec<String>,
+    /// Groups whose members make workspaces of their own.
+    pub creator_groups: Vec<String>,
+    /// Set when the host lets people make workspaces.
+    pub self_service: Option<SelfService>,
     /// Where the access check asks who a cookie belongs to.
     pub oauth2_proxy: String,
     /// The single sign-on cookie, which no workspace's app ever gets.
@@ -91,10 +121,29 @@ impl Backend for HostBackend {
         Box::pin(async move { state::sign_in_link(&c).await })
     }
 
-    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>> {
         Box::pin(authz::ask_oauth2_proxy(&self.opts.oauth2_proxy, cookie))
     }
+
+    fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let run = tokio::process::Command::new("systemctl")
+                .args(["--no-ask-password", "start", unit])
+                .kill_on_drop(true)
+                .output();
+            let out = tokio::time::timeout(UNIT_TIMEOUT, run)
+                .await
+                .map_err(|_| anyhow::anyhow!("{unit} took too long"))??;
+            anyhow::ensure!(out.status.success(), "{unit}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            Ok(())
+        })
+    }
 }
+
+/// How long the UI waits for making or destroying a workspace: a new disk
+/// is a copy of the image. Longer than the units' own 10 minutes, so their
+/// outcome is there to read.
+const UNIT_TIMEOUT: Duration = Duration::from_secs(660);
 
 /// How long a collected state is reused, whoever asks.
 const SNAPSHOT_FOR: Duration = Duration::from_secs(1);
@@ -113,7 +162,10 @@ pub struct Inner {
     pub leptos: LeptosOptions,
     pub consoles: console::Consoles,
     cache: tokio::sync::Mutex<Cache>,
-    pub(crate) authz: Mutex<HashMap<String, (String, Instant)>>,
+    pub(crate) authz: Mutex<HashMap<String, (Identity, Instant)>>,
+    /// The names being made now, so two requests for one never overwrite
+    /// each other's.
+    pub(crate) making: Mutex<std::collections::HashSet<String>>,
 }
 
 struct Cache {
@@ -197,14 +249,18 @@ impl AppState {
             consoles,
             cache: tokio::sync::Mutex::default(),
             authz: Mutex::default(),
+            making: Mutex::default(),
         }))
     }
 
-    /// Who `name` is here.
+    /// Who `name`, a member of `groups`, is here.
     #[must_use]
-    pub fn viewer(&self, name: &str) -> Option<Viewer> {
-        let admin = self.opts.admins.iter().any(|a| a == name);
-        is_user_name(name).then(|| Viewer { name: name.to_owned(), admin, creates: admin })
+    pub fn viewer(&self, name: &str, groups: &[String]) -> Option<Viewer> {
+        let o = &self.opts;
+        let in_any = |of: &[String]| groups.iter().any(|g| of.contains(g));
+        let admin = o.admins.iter().any(|a| a == name) || in_any(&o.admin_groups);
+        let creates = o.self_service.is_some() && (admin || in_any(&o.creator_groups));
+        is_user_name(name).then(|| Viewer { name: name.to_owned(), admin, creates })
     }
 
     /// Every workspace, collected at most once a second whoever asks.
@@ -249,7 +305,9 @@ impl AppState {
     /// The host page.
     pub async fn host_view(&self) -> anyhow::Result<HostView> {
         let all = self.all().await?;
-        view::host(&self.opts, &all)
+        let mut host = view::host(&self.opts, &all)?;
+        host.quotas = self.quotas(&all)?;
+        Ok(host)
     }
 
     /// A workspace `viewer` may control, or a 403 alike for one that is

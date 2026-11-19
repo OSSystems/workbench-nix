@@ -9,7 +9,10 @@ use leptos_meta::{MetaTags, Title, provide_meta_context};
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::{SsrMode, path};
-use workbench_model::{Filter, HostView, List, Row, SignInBlocker, Snapshot, State, Verb, Viewer, Workspace, gib, pct};
+use workbench_model::self_service::{MIN_DISK_GIB, NewView};
+use workbench_model::{
+    Filter, HostView, List, Quotas, Row, SignInBlocker, Snapshot, State, Verb, Viewer, Workspace, gib, pct,
+};
 
 use crate::api::{self, Control};
 
@@ -56,6 +59,7 @@ pub fn App() -> impl IntoView {
             <Routes fallback=|| view! { <Forbidden viewer=None /> }>
                 <Route path=path!("/") view=ListPage ssr=SsrMode::Async />
                 <Route path=path!("/host") view=HostPage ssr=SsrMode::Async />
+                <Route path=path!("/new") view=NewPage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/console") view=ConsolePage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/:action") view=ActionPage ssr=SsrMode::Async />
             </Routes>
@@ -353,8 +357,18 @@ fn Live(initial: Snapshot) -> impl IntoView {
                             <div>
                                 <h2>"You don't have a workspace yet"</h2>
                                 <p>
-                                    "A workspace is a VM of your own on this host, with the app in it and a disk that stays. An administrator creates it; ask one to add you."
+                                    "A workspace is a VM of your own on this host, with the app in it and a disk that stays."
+                                    {move || {
+                                        if snap.with(|s| s.viewer.creates) {
+                                            " You can make one yourself."
+                                        } else {
+                                            " An administrator creates it; ask one to add you."
+                                        }
+                                    }}
                                 </p>
+                                <Show when=move || snap.with(|s| s.viewer.creates)>
+                                    <a class="btn p go" href="/new" rel="external">"New workspace"</a>
+                                </Show>
                             </div>
                         </div>
                     </Show>
@@ -444,6 +458,9 @@ fn Bar(snap: RwSignal<Snapshot>, list: Memo<List>) -> impl IntoView {
                 {chip(Filter::Running, "Running", "/?f=running")}
                 {chip(Filter::Stopped, "Stopped", "/?f=stopped")}
             </nav>
+            <Show when=move || snap.with(|s| s.viewer.creates)>
+                <a class="btn new" href="/new" rel="external">"New workspace"</a>
+            </Show>
         </div>
     }
 }
@@ -861,22 +878,29 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
             let id = format!("stop-{name}");
             let click = id.clone();
             view! {
-                <div class="foot">
-                    <a
-                        class="btn"
-                        href=format!("/w/{name}/stop")
-                        data-dialog=id
-                        aria-label=format!("Stop {name}…")
-                        on:click=move |ev| open_dialog(&ev, &click)
-                    >
-                        <span><Icon d=ICON_STOP /> "Stop…"</span>
-                    </a>
-                </div>
+                <a
+                    class="btn"
+                    href=format!("/w/{name}/stop")
+                    data-dialog=id
+                    aria-label=format!("Stop {name}…")
+                    on:click=move |ev| open_dialog(&ev, &click)
+                >
+                    <span><Icon d=ICON_STOP /> "Stop…"</span>
+                </a>
             }
         });
+        // Only one made at run time may go from here.
+        let destroy = (ws.self_service && !st.changing()).then(|| {
+            view! {
+                <a class="btn q bad" href=format!("/w/{name}/destroy") rel="external" aria-label=format!("Destroy {name}…")>
+                    "Destroy…"
+                </a>
+            }
+        });
+        let foot = (stop.is_some() || destroy.is_some()).then(|| view! { <div class="foot">{stop} {destroy}</div> });
         Some(view! {
             <div class="stack">{open} {start} {sign_in} {console} {restart}</div>
-            {stop}
+            {foot}
         })
     };
     // The dialogs stay put while the panel changes, so live updates never
@@ -1174,6 +1198,7 @@ fn Host(snap: Snapshot, host: HostView) -> impl IntoView {
                                 {ws_rows}
                             </div>
                         </section>
+                        {host.quotas.map(|q| view! { <QuotasPanel q /> })}
                     </div>
                 </section>
             </div>
@@ -1198,6 +1223,8 @@ fn ActionPage() -> impl IntoView {
         };
         let body = if action == "sign-in" {
             view! { <SignInPage ws error detail /> }.into_any()
+        } else if action == "destroy" && ws.self_service {
+            view! { <DestroyPage ws error detail /> }.into_any()
         } else if let Ok(verb) = action.parse::<Verb>() {
             view! { <ConfirmPage ws verb error detail /> }.into_any()
         } else {
@@ -1205,6 +1232,8 @@ fn ActionPage() -> impl IntoView {
         };
         let title = if action == "sign-in" {
             format!("Sign in to {name} · workbench")
+        } else if action == "destroy" {
+            format!("Destroy {name} · workbench")
         } else {
             format!("{} {name} · workbench", action.parse::<Verb>().map_or("", Verb::label))
         };
@@ -1414,4 +1443,216 @@ fn ConsolePage() -> impl IntoView {
         }
         .into_any()
     })
+}
+
+/// The New workspace page, for whoever may make one.
+#[component]
+fn NewPage() -> impl IntoView {
+    let data = Resource::new_blocking(|| (), |()| api::get_new());
+    let query = use_query_map();
+    view! {
+        <Title text="New workspace · workbench" />
+        <Suspense>
+            {move || Suspend::new(async move {
+                match data.await {
+                    Ok((snap, new)) => {
+                        let get = |k: &str| query.with_untracked(|q| q.get(k).unwrap_or_default());
+                        let filled = Filled {
+                            error: get("error"),
+                            name: get("name"),
+                            os: get("os"),
+                            memory: get("memory"),
+                            disk: get("disk"),
+                            keys: get("keys"),
+                        };
+                        view! { <NewForm viewer=snap.viewer new filled /> }.into_any()
+                    }
+                    Err(e) if e.to_string().contains("may not") => view! { <Forbidden viewer=None /> }.into_any(),
+                    Err(e) => view! { <Unreachable detail=e.to_string() /> }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+/// What a refused form had, to fill it again.
+#[derive(Clone, Default)]
+struct Filled {
+    error: String,
+    name: String,
+    os: String,
+    memory: String,
+    disk: String,
+    keys: String,
+}
+
+#[component]
+fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
+    let l = &new.limits;
+    let left = new.quota.saturating_sub(new.owned);
+    let or = |v: &str, d: String| if v.is_empty() { d } else { v.to_owned() };
+    let name = or(&filled.name, if new.owned == 0 { new.slug.clone() } else { format!("{}-", new.slug) });
+    let memory = or(&filled.memory, l.max_memory_gib.min(8).max(l.min_memory_gib()).to_string());
+    let disk = or(&filled.disk, 64.min(l.max_disk_gib).to_string());
+    let chosen = if filled.os.is_empty() { l.os.first().cloned().unwrap_or_default() } else { filled.os.clone() };
+    let systems =
+        l.os.iter()
+            .map(|os| view! { <option value=os.clone() selected=*os == chosen>{os_name(os)}</option> })
+            .collect_view();
+    if !filled.error.is_empty() {
+        set_status(422);
+    }
+    let quota = if left == 0 {
+        view! {
+            <div class="err">
+                <b>"You have all the workspaces your quota allows."</b>
+                {format!("Your quota is {}. Ask an admin for more, or destroy one.", new.quota)}
+            </div>
+        }
+        .into_any()
+    } else {
+        view! { <p class="small">{format!("You may make {left} more of your quota of {}.", new.quota)}</p> }.into_any()
+    };
+    view! {
+        <div class="app">
+            <Top viewer />
+            <main class="solo">
+                <form class="card form" method="post" action="/api/create">
+                    <h1>"New workspace"</h1>
+                    <p>"A VM of your own, with the app in it and a disk that stays. It boots once it's made."</p>
+                    {quota}
+                    {(!filled.error.is_empty()).then(|| view! { <div class="err"><b>{filled.error.clone()}</b></div> })}
+                    <label>
+                        <span>"Name"</span>
+                        <input name="name" class="mono" value=name required autocomplete="off" spellcheck="false" />
+                        <small>{format!("{0} or {0}-something: lowercase letters, digits and dashes.", new.slug)}</small>
+                    </label>
+                    <label>
+                        <span>"System"</span>
+                        <select name="os">{systems}</select>
+                    </label>
+                    <label>
+                        <span>"SSH keys"</span>
+                        <textarea name="ssh_keys" class="mono" rows="3" spellcheck="false" placeholder="ssh-ed25519 AAAA… you@laptop">
+                            {filled.keys.clone()}
+                        </textarea>
+                        <small>"One per line, to reach it over SSH from the host. Optional."</small>
+                    </label>
+                    <div class="pair">
+                        <label>
+                            <span>"Memory, at most"</span>
+                            <input name="memory_gib" type="number" min=l.min_memory_gib() max=l.max_memory_gib value=memory />
+                            <small>{format!("GiB, {} to {}; it boots with {}", l.min_memory_gib(), l.max_memory_gib, gib(l.boot_mem_mib << 20))}</small>
+                        </label>
+                        <label>
+                            <span>"Disk"</span>
+                            <input name="disk_gib" type="number" min=MIN_DISK_GIB max=l.max_disk_gib value=disk />
+                            <small>{format!("GiB, {MIN_DISK_GIB} to {}", l.max_disk_gib)}</small>
+                        </label>
+                    </div>
+                    <div class="acts">
+                        <button class="btn p" disabled=left == 0>"Create"</button>
+                        <a class="btn q" href="/">"Cancel"</a>
+                    </div>
+                </form>
+            </main>
+        </div>
+    }
+}
+
+/// The Destroy page of a workspace made at run time: its name is typed
+/// again.
+#[component]
+fn DestroyPage(ws: Workspace, error: String, detail: String) -> impl IntoView {
+    let name = ws.name.clone();
+    let err = match error.as_str() {
+        "confirm" => {
+            set_status(422);
+            Some(
+                view! { <div class="err"><b>{format!("That isn't {name}.")}</b>"Type its name exactly."</div> }
+                    .into_any(),
+            )
+        }
+        "failed" => {
+            set_status(502);
+            Some(
+                view! {
+                    <div class="err">
+                        <b>"The host couldn't destroy it."</b>
+                        <details open><summary>"Details"</summary><pre>{detail}</pre></details>
+                    </div>
+                }
+                .into_any(),
+            )
+        }
+        _ => None,
+    };
+    view! {
+        <h1>"Destroy " <span class="mono">{name.clone()}</span> "?"</h1>
+        <dl>
+            <dt>"Deletes"</dt>
+            <dd>"The VM, its disk and everything on it, for good."</dd>
+            <dt>"Keeps"</dt>
+            <dd>"Nothing. There is no undo."</dd>
+        </dl>
+        {err}
+        <form class="form" method="post" action="/api/destroy">
+            <input type="hidden" name="ws" value=name.clone() />
+            <label>
+                <span>"Type " <b class="mono">{name.clone()}</b> " to confirm"</span>
+                <input name="confirm" class="mono" required autocomplete="off" spellcheck="false" />
+            </label>
+            <div class="acts">
+                <button class="btn danger">{format!("Destroy {name}")}</button>
+                <a class="btn q" href=format!("/?w={name}")>"Cancel"</a>
+            </div>
+        </form>
+    }
+}
+
+/// The host page's quotas: each person's, which an admin changes in place.
+#[component]
+fn QuotasPanel(q: Quotas) -> impl IntoView {
+    let rows = q
+        .people
+        .iter()
+        .map(|p| {
+            view! {
+                <form role="row" method="post" action="/api/quota">
+                    <input type="hidden" name="user" value=p.user.clone() />
+                    <span>{p.user.clone()}</span>
+                    <span class="num">{p.owned}</span>
+                    <span class="set">
+                        <input name="quota" type="number" min="0" max="100" value=p.quota aria-label=format!("Quota of {}", p.user) />
+                        <button class="btn">"Save"</button>
+                        {(!p.own).then(|| view! { <span class="small">"default"</span> })}
+                    </span>
+                </form>
+            }
+        })
+        .collect_view();
+    view! {
+        <section class="panel">
+            <header>
+                <h2>"Quotas"</h2>
+                <span>{format!("workspaces people make themselves; {} each unless set here", q.default)}</span>
+            </header>
+            <div class="tbl quotas" role="table">
+                <div class="hd" role="row">
+                    <span>"Person"</span>
+                    <span class="num">"Has"</span>
+                    <span>"Quota"</span>
+                </div>
+                {rows}
+                <form role="row" method="post" action="/api/quota">
+                    <span><input name="user" placeholder="uid" aria-label="uid" autocomplete="off" spellcheck="false" /></span>
+                    <span></span>
+                    <span class="set">
+                        <input name="quota" type="number" min="0" max="100" value=q.default aria-label="Quota" />
+                        <button class="btn">"Set"</button>
+                    </span>
+                </form>
+            </div>
+        </section>
+    }
 }

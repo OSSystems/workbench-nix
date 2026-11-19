@@ -4,6 +4,7 @@
 
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
+use workbench_model::self_service::NewView;
 use workbench_model::{HostView, Snapshot};
 
 /// What the viewer sees of the host's workspaces.
@@ -41,4 +42,44 @@ pub async fn control(ws: String, action: String, #[server(default)] stay: bool) 
 pub async fn sign_in(ws: String) -> Result<(), ServerFnError> {
     let (state, viewer) = crate::server::request()?;
     state.sign_in_action(&viewer, &ws).await
+}
+
+/// What the New workspace page offers the viewer.
+#[server(prefix = "/api", endpoint = "new", input = GetUrl)]
+pub async fn get_new() -> Result<(Snapshot, NewView), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    let new = state.new_view(&viewer).await?;
+    let snap = state.snapshot_for(&viewer).await.map_err(crate::server::failed)?;
+    Ok((snap, new))
+}
+
+/// Makes a workspace of the viewer's own. A form comes back to the list
+/// with it selected, or to the New workspace page with why not.
+#[server(prefix = "/api", endpoint = "create")]
+pub async fn create(
+    name: String,
+    os: String,
+    #[server(default)] ssh_keys: String,
+    memory_gib: String,
+    disk_gib: String,
+) -> Result<(), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    let form = crate::server::CreateForm { name, os, ssh_keys, memory_gib, disk_gib };
+    state.create_action(&viewer, form).await
+}
+
+/// Destroys a workspace made at run time, once its name is typed again.
+#[server(prefix = "/api", endpoint = "destroy")]
+pub async fn destroy(ws: String, #[server(default)] confirm: String) -> Result<(), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    state.destroy_action(&viewer, &ws, &confirm).await
+}
+
+/// Sets a person's quota, for admins.
+// A server function is async, whether it waits or not.
+#[allow(clippy::unused_async)]
+#[server(prefix = "/api", endpoint = "quota")]
+pub async fn quota(user: String, quota: String) -> Result<(), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    state.quota_action(&viewer, &user, &quota)
 }
