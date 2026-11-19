@@ -5,3 +5,6 @@
 //! to running VMs through their API and vsock sockets, so restarting them
 //! never stops a VM.
 #![cfg(target_os = "linux")]
+
+pub mod config;
+pub mod launch;
