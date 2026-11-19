@@ -37,7 +37,8 @@ pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let vm_user = hostutil::lookup_account(&c.user).context("VM user")?;
     virtiofs::require_private_mounts()?;
     fs::metadata(Path::new("/sys/class/net").join(&c.tap)).with_context(|| format!("tap {}", c.tap))?;
-    ensure_dir(Path::new(&c.state_dir), 0o700, &vm_user)?;
+    // Others may stat the disk, for its size, but not list or read it.
+    ensure_dir(Path::new(&c.state_dir), 0o711, &vm_user)?;
     prepare_disk(&c, &vm_user).context("preparing disk")?;
     for dir in [c.vm_dir(), c.shares_dir()] {
         match fs::remove_dir_all(&dir) {
@@ -47,7 +48,16 @@ pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     }
     let root = Account { uid: 0, gid: 0, groups: vec![] };
     ensure_dir(Path::new(&c.runtime_dir), 0o711, &root)?;
-    ensure_dir(&c.vm_dir(), 0o700, &vm_user)?;
+    if c.socket_group.is_empty() {
+        ensure_dir(&c.vm_dir(), 0o700, &vm_user)?;
+    } else {
+        // Setgid, so the sockets cloud-hypervisor makes are the group's;
+        // `share-sockets` then lets the group use them.
+        let group = nix::unistd::Group::from_name(&c.socket_group)?
+            .with_context(|| format!("socket group {:?}", c.socket_group))?;
+        let owner = Account { uid: vm_user.uid, gid: group.gid.as_raw(), groups: vec![] };
+        ensure_dir(&c.vm_dir(), 0o2750, &owner)?;
+    }
     ensure_dir(&c.shares_dir(), 0o700, &root)?;
     let [store, config_share, secrets] = c.shares();
     virtiofs::store_view(&c.closure, &store.dir).context("sharing the closure")?;
@@ -299,6 +309,21 @@ pub(crate) fn cloud_hypervisor_argv(c: &Config, host_cpus: u32) -> Vec<String> {
         ..Vm::default()
     }
     .args()
+}
+
+/// The unit's `ExecStartPost`: lets the socket group use the VM's API,
+/// vsock and serial sockets once cloud-hypervisor has made them,
+/// owner-only. Without a socket group it does nothing.
+pub async fn share_sockets(dirs: &[PathBuf], name: &str, timeout: Duration) -> anyhow::Result<()> {
+    let c = config::load(dirs, name)?;
+    if c.socket_group.is_empty() {
+        return Ok(());
+    }
+    for socket in [c.api_socket(), c.vsock(), c.serial()] {
+        hostutil::wait_for_socket(&socket, timeout).await?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
+    }
+    Ok(())
 }
 
 /// The unit's `ExecStop`: presses the VM's power button and waits for the

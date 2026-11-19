@@ -265,6 +265,38 @@ keeps working.
 | the `store` share | The app's closure, at `/nix/store` (Ubuntu) or `/run/workspace/host/nix/store` (NixOS) |
 | vsock | The agent reports memory to the host on `controlPort` and answers it on `agentPort` |
 
+## Web UI
+
+`services.workbench.web` serves a web UI at `https://<domain>` and puts
+single sign-on in front of every workspace: whatever the app does about
+accounts, only the workspace's owner and the admins reach it. People see
+and control their own workspaces: start, stop, restart, sign in to the app
+and the serial console. Admins see all of them and the host's memory.
+
+```nix
+services.workbench.web = {
+  enable = true;
+  admins = [ "alice" ];
+  oidc = {
+    issuerUrl = "https://sso.example.com/realms/example";
+    clientId = "workbench";
+    clientSecretFile = "/run/secrets/workbench-oidc";
+    cookieSecretFile = "/run/secrets/workbench-cookie"; # openssl rand -hex 16
+  };
+};
+```
+
+The identity provider, Keycloak by default, needs a confidential OIDC
+client with the redirect URI `https://<domain>/oauth2/callback`, and its
+`preferred_username` claim must be the LDAP uid workspaces have as
+`owner`. The certificate must cover `<domain>` as well as `*.<domain>`.
+
+The UI is `workbench-web`, a Leptos app in Rust: the server renders the
+pages and the browser hydrates them with the same components compiled to
+WebAssembly. It runs as its own user, reaches the VMs through sockets its
+group may use and starts, stops and restarts workspaces through polkit.
+[docs/web-ui.md](docs/web-ui.md) has the whole design.
+
 ## Apps
 
 Each workspace runs one app: the web UI its owner opens at

@@ -84,6 +84,10 @@ pub struct Config {
 
     pub control_port: i64,
     pub agent_port: i64,
+
+    /// When set, may use the VM's sockets: the web UI's group.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub socket_group: String,
 }
 
 fn is_mac(mac: &str) -> bool {
@@ -172,6 +176,11 @@ impl Config {
         }
         ensure!(port(self.app_port) && port(self.control_port) && port(self.agent_port), "invalid port");
         ensure!(self.control_port != self.agent_port, "controlPort and agentPort must differ");
+        ensure!(
+            self.socket_group.is_empty() || is_user_name(&self.socket_group),
+            "invalid socket group {:?}",
+            self.socket_group
+        );
         for (k, v) in &self.environment {
             ensure!(is_env_name(k) && !v.contains(['\n', '\0']), "invalid environment variable {k:?}");
         }
@@ -343,6 +352,7 @@ pub(crate) mod tests {
             secrets_dir: "/var/lib/workbench-secrets/alice-dev".into(),
             control_port: 5001,
             agent_port: 5002,
+            socket_group: String::new(),
         }
     }
 
@@ -381,6 +391,7 @@ pub(crate) mod tests {
             ("ubuntu without seed", |c| c.seed = String::new()),
             ("nixos with seed", |c| c.os = "nixos".into()),
             ("same vsock ports", |c| c.agent_port = c.control_port),
+            ("bad socket group", |c| c.socket_group = "wheel users".into()),
             ("port out of range", |c| c.app_port = 70000),
             ("env newline", |c| c.environment = [("A".into(), "x\nB=y".into())].into()),
             ("env name", |c| c.environment = [("A-B".into(), "x".into())].into()),
