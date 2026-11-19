@@ -85,6 +85,7 @@ pub fn host(opts: &Options, all: &[Workspace]) -> anyhow::Result<HostView> {
         pools,
         workspaces: all.iter().filter(|ws| ws.memory_bytes > 0).cloned().collect(),
         at: local(now).strftime("%H:%M:%S").to_string(),
+        quotas: None,
     })
 }
 
