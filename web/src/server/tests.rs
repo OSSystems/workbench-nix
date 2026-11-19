@@ -7,7 +7,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
 use workbench::config::Config;
+use workbench::self_service::Paths;
 use workbench::state::SignInError;
+use workbench_model::self_service::{Limits, Outcome, Request as Asked};
 use workbench_model::{State, Verb, Workspace};
 
 use super::*;
@@ -18,6 +20,16 @@ const ORIGIN: &str = "https://ws.test";
 struct Fake {
     controlled: Arc<Mutex<Vec<(Verb, String)>>>,
     sign_in: Mutex<Option<Result<String, SignInError>>>,
+    /// Workspaces made at run time, besides the declared ones.
+    made: Vec<Workspace>,
+    /// Where the units write how they went, and what they say.
+    paths: Option<Paths>,
+    outcome: Arc<Mutex<Option<Outcome>>>,
+    units: Arc<Mutex<Vec<String>>>,
+}
+
+fn made(name: &str, owner: &str) -> Workspace {
+    Workspace { self_service: true, ip: "10.232.0.20".into(), ..ws(name, owner, State::Running) }
 }
 
 fn ws(name: &str, owner: &str, state: State) -> Workspace {
@@ -38,13 +50,13 @@ fn ws(name: &str, owner: &str, state: State) -> Workspace {
 
 impl Backend for Fake {
     fn list(&self) -> BoxFuture<'_, anyhow::Result<Vec<Workspace>>> {
-        Box::pin(async {
-            Ok(vec![
-                ws("alice", "alice", State::Running),
-                ws("bob", "bob", State::Stopped),
-                ws("bobby", "bob", State::Stopping),
-            ])
-        })
+        let mut all = vec![
+            ws("alice", "alice", State::Running),
+            ws("bob", "bob", State::Stopped),
+            ws("bobby", "bob", State::Stopping),
+        ];
+        all.extend(self.made.iter().cloned());
+        Box::pin(async move { Ok(all) })
     }
 
     fn control<'a>(&'a self, verb: Verb, name: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
@@ -53,6 +65,17 @@ impl Backend for Fake {
     }
 
     fn config(&self, name: &str) -> anyhow::Result<Config> {
+        if let Some(w) = self.made.iter().find(|w| w.name == name) {
+            return Ok(Config {
+                name: name.into(),
+                owner: w.owner.clone(),
+                url: w.url.clone(),
+                ip: w.ip.clone(),
+                app_port: 3773,
+                self_service: true,
+                ..Config::default()
+            });
+        }
         let owner = match name {
             "alice" => "alice",
             "bob" | "bobby" => "bob",
@@ -71,21 +94,48 @@ impl Backend for Fake {
         Box::pin(async move { answer })
     }
 
-    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
-        let user = cookie
-            .split(';')
-            .map(str::trim)
-            .find_map(|c| c.strip_prefix("_workbench_auth="))
-            .map(str::to_owned)
-            .unwrap_or_default();
-        Box::pin(async move { Ok(user) })
+    /// The cookie is `<user>` or `<user>:<group>,<group>`.
+    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>> {
+        let value =
+            cookie.split(';').map(str::trim).find_map(|c| c.strip_prefix("_workbench_auth=")).unwrap_or_default();
+        let (user, groups) = value.split_once(':').unwrap_or((value, ""));
+        let who = Identity { user: user.to_owned(), groups: authz::groups(groups) };
+        Box::pin(async move { Ok(who) })
+    }
+
+    fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.units.lock().unwrap().push(unit.to_owned());
+        let name = unit.split_once('@').map(|(_, r)| r.trim_end_matches(".service")).unwrap_or_default();
+        let outcome = self.outcome.lock().unwrap().clone();
+        if let (Some(paths), Some(o)) = (&self.paths, &outcome) {
+            let out = paths.outcome(name);
+            std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+            std::fs::write(out, serde_json::to_vec(o).unwrap()).unwrap();
+        }
+        Box::pin(async move {
+            anyhow::ensure!(outcome.is_none_or(|o| o.ok), "the unit failed");
+            Ok(())
+        })
     }
 }
 
 fn state(fake: Fake) -> AppState {
+    let self_service = fake.paths.clone().map(|paths| SelfService {
+        paths,
+        limits: Limits {
+            os: vec!["ubuntu".into()],
+            boot_mem_mib: 2048,
+            max_memory_gib: 16,
+            max_disk_gib: 128,
+            quota: 1,
+        },
+    });
     let opts = Options {
         origin: ORIGIN.into(),
         admins: vec!["carol".into()],
+        admin_groups: vec!["workbench-admins".into()],
+        creator_groups: vec!["workbench".into()],
+        self_service,
         cookie_name: "_workbench_auth".into(),
         ..Options::default()
     };
@@ -113,6 +163,12 @@ async fn send(router: axum::Router, req: Request<Body>) -> (StatusCode, axum::ht
 
 fn get(path: &str, user: &str) -> Request<Body> {
     Request::get(path).header("x-workbench-user", user).body(Body::empty()).unwrap()
+}
+
+/// `user` in `groups`, as nginx names them.
+fn with_groups(mut req: Request<Body>, groups: &str) -> Request<Body> {
+    req.headers_mut().insert("x-workbench-groups", groups.parse().unwrap());
+    req
 }
 
 fn post(path: &str, user: &str, origin: &str, form: &str) -> Request<Body> {
@@ -284,6 +340,138 @@ async fn the_access_check() {
     assert_eq!(code, StatusCode::OK, "admins reach every workspace");
     let (code, _, _) = send(authz_router(s), check("nobody", "_workbench_auth=carol")).await;
     assert_eq!(code, StatusCode::FORBIDDEN, "a workspace that doesn't exist");
+
+    let (_dir, fake) = self_serve(vec![made("alice-dev", "alice")], None);
+    let s = state(fake);
+    let (code, h, _) = send(authz_router(s.clone()), check("alice-dev", "_workbench_auth=alice:workbench")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(h["x-workbench-upstream"], "10.232.0.20:3773", "nginx proxies to what the config says");
+    let (code, _, _) = send(authz_router(s.clone()), check("alice-dev", "_workbench_auth=alice")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "a workspace made at run time needs its owner in the group");
+    let (code, _, _) = send(authz_router(s), check("alice", "_workbench_auth=alice")).await;
+    assert_eq!(code, StatusCode::OK, "a declared one doesn't");
+}
+
+/// A host that lets people make workspaces, its files in a directory of
+/// the test's.
+fn self_serve(made: Vec<Workspace>, outcome: Option<Outcome>) -> (tempfile::TempDir, Fake) {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake {
+        made,
+        paths: Some(Paths(dir.path().to_owned())),
+        outcome: Arc::new(Mutex::new(outcome)),
+        ..Fake::default()
+    };
+    (dir, fake)
+}
+
+const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbJhk5H0h7O alice@laptop";
+
+#[tokio::test]
+async fn people_in_the_group_make_their_own() {
+    let _turn = TURN.lock().await;
+    let (dir, fake) = self_serve(vec![], Some(Outcome { ok: true, error: String::new() }));
+    let units = fake.units.clone();
+    let s = state(fake);
+    let paths = Paths(dir.path().to_owned());
+
+    let (code, _, _) = send(ui(&s), get("/new", "bob")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "bob is in no group");
+    let (code, _, body) = send(ui(&s), with_groups(get("/new", "alice"), "staff, workbench")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert!(body.contains("New workspace") && body.contains("alice or alice-something"), "{body}");
+    let (_, _, body) = send(ui(&s), with_groups(get("/", "alice"), "workbench")).await;
+    assert!(body.contains(r#"href="/new""#), "the list offers it");
+
+    let form = format!("name=alice-dev&os=ubuntu&memory_gib=8&disk_gib=64&ssh_keys={}", super::encode(KEY));
+    let (code, _, _) = send(ui(&s), post("/api/create", "bob", ORIGIN, &form)).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let (code, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, &form), "workbench")).await;
+    assert_eq!((code, h[header::LOCATION].to_str().unwrap()), (StatusCode::SEE_OTHER, "/?w=alice-dev"));
+    assert_eq!(*units.lock().unwrap(), ["workbench-create@alice-dev.service"]);
+    let asked: Asked = serde_json::from_slice(&std::fs::read(paths.request("alice-dev")).unwrap()).unwrap();
+    assert_eq!((asked.owner.as_str(), asked.ssh_authorized_keys.as_slice()), ("alice", [KEY.to_owned()].as_slice()));
+
+    for (bad, says) in [
+        ("name=bob-dev&os=ubuntu&memory_gib=8&disk_gib=64", "start%20with%20alice-"),
+        ("name=alice-x&os=nixos&memory_gib=8&disk_gib=64", "isn%27t%20a%20system"),
+        ("name=alice-x&os=ubuntu&memory_gib=99&disk_gib=64", "Memory%20must%20be"),
+        ("name=alice&os=ubuntu&memory_gib=8&disk_gib=64", "is%20taken"),
+    ] {
+        let (code, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, bad), "workbench")).await;
+        let to = h[header::LOCATION].to_str().unwrap();
+        assert!(code == StatusCode::SEE_OTHER && to.starts_with("/new?error=") && to.contains(says), "{bad}: {to}");
+    }
+    assert_eq!(units.lock().unwrap().len(), 1, "nothing refused reaches the host");
+}
+
+#[tokio::test]
+async fn the_quota_and_the_hosts_refusals() {
+    let _turn = TURN.lock().await;
+    let (dir, fake) = self_serve(vec![made("alice-dev", "alice")], Some(Outcome { ok: true, error: String::new() }));
+    let outcome = fake.outcome.clone();
+    let s = state(fake);
+    let form = "name=alice-two&os=ubuntu&memory_gib=8&disk_gib=64";
+    let (_, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, form), "workbench")).await;
+    assert!(h[header::LOCATION].to_str().unwrap().contains("quota%20allows%20%281%29"), "{h:?}");
+
+    // An admin raises it; only an admin may.
+    let (code, _, _) =
+        send(ui(&s), with_groups(post("/api/quota", "alice", ORIGIN, "user=alice&quota=3"), "workbench")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let (code, h, _) =
+        send(ui(&s), with_groups(post("/api/quota", "dave", ORIGIN, "user=alice&quota=3"), "workbench-admins")).await;
+    assert_eq!((code, h[header::LOCATION].to_str().unwrap()), (StatusCode::SEE_OTHER, "/host"), "an admin by group");
+    let quotas: std::collections::BTreeMap<String, u32> =
+        serde_json::from_slice(&std::fs::read(Paths(dir.path().to_owned()).quotas()).unwrap()).unwrap();
+    assert_eq!(quotas["alice"], 3);
+    let (_, _, body) = send(ui(&s), get("/host", "carol")).await;
+    assert!(body.contains("Quotas") && body.contains(r#"value="3""#), "{body}");
+    let (_, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, form), "workbench")).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-two");
+
+    // What the host refuses, such as a missing credential, is said too.
+    let refusal = "Your workspace has no credential for its app yet. Ask an admin.";
+    *outcome.lock().unwrap() = Some(Outcome { ok: false, error: refusal.into() });
+    let (_, h, _) = send(
+        ui(&s),
+        with_groups(post("/api/create", "alice", ORIGIN, form.replace("two", "three").as_str()), "workbench"),
+    )
+    .await;
+    let to = h[header::LOCATION].to_str().unwrap().to_owned();
+    assert!(to.contains("no%20credential"), "{to}");
+    let (_, _, body) = send(ui(&s), with_groups(get(&to, "alice"), "workbench")).await;
+    assert!(body.contains(refusal), "{body}");
+
+    // A name being made for one request isn't written over by another.
+    s.making.lock().unwrap().insert("alice-four".into());
+    let four = form.replace("two", "four");
+    let (_, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, &four), "workbench")).await;
+    assert!(h[header::LOCATION].to_str().unwrap().contains("being%20made"), "{h:?}");
+}
+
+#[tokio::test]
+async fn only_workspaces_made_at_run_time_are_destroyed_here() {
+    let _turn = TURN.lock().await;
+    let (_dir, fake) = self_serve(vec![made("alice-dev", "alice")], None);
+    let units = fake.units.clone();
+    let s = state(fake);
+    let as_alice = |form: &str| with_groups(post("/api/destroy", "alice", ORIGIN, form), "workbench");
+    let (_, _, body) = send(ui(&s), with_groups(get("/w/alice-dev/destroy", "alice"), "workbench")).await;
+    assert!(body.contains("Type") && body.contains("to confirm"), "{body}");
+    let (code, _, _) = send(ui(&s), with_groups(get("/w/alice/destroy", "alice"), "workbench")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "a declared workspace has no Destroy page");
+    let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev&confirm=alice")).await;
+    assert_eq!(h[header::LOCATION], "/w/alice-dev/destroy?error=confirm");
+    let (code, _, _) = send(ui(&s), as_alice("ws=alice&confirm=alice")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let (code, _, _) =
+        send(ui(&s), with_groups(post("/api/destroy", "bob", ORIGIN, "ws=alice-dev&confirm=alice-dev"), "workbench"))
+            .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "not bob's");
+    let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev&confirm=alice-dev")).await;
+    assert_eq!(h[header::LOCATION], "/");
+    assert_eq!(*units.lock().unwrap(), ["workbench-destroy@alice-dev.service"]);
 }
 
 #[tokio::test]

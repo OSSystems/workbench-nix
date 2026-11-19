@@ -71,8 +71,11 @@ pub fn authz_router(state: AppState) -> Router {
 /// the UI's own origin: workspaces are sibling subdomains, the same site,
 /// so `SameSite` cookies don't stop them; this does.
 async fn guard(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let user = req.headers().get("x-workbench-user").and_then(|v| v.to_str().ok()).unwrap_or_default();
-    let Some(viewer) = state.viewer(user) else {
+    let (user, groups) = {
+        let header = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+        (header("x-workbench-user"), authz::groups(&header("x-workbench-groups")))
+    };
+    let Some(viewer) = state.viewer(&user, &groups) else {
         return (StatusCode::UNAUTHORIZED, "not signed in").into_response();
     };
     if req.method() == Method::POST {
