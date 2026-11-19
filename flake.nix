@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     vmkit = {
-      url = "github:OSSystems/vmkit-nix";
+      url = "github:OSSystems/vmkit-nix/rust";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.blueprint.follows = "blueprint";
     };
