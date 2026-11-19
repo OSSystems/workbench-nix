@@ -41,6 +41,66 @@ let
     "bob"
     "carol"
   ];
+  baseDN = "dc=ws,dc=test";
+
+  # The directory, as in production: posix accounts, and groups listing
+  # their members' uids. alice makes workspaces of her own; carol is an
+  # admin; bob is in neither group.
+  directory = ''
+    dn: ${baseDN}
+    objectClass: dcObject
+    objectClass: organization
+    dc: ws
+    o: workspaces test
+
+    dn: ou=users,${baseDN}
+    objectClass: organizationalUnit
+    ou: users
+
+    dn: ou=groups,${baseDN}
+    objectClass: organizationalUnit
+    ou: groups
+  ''
+  + lib.concatImapStrings (i: user: ''
+
+    dn: uid=${user},ou=users,${baseDN}
+    objectClass: inetOrgPerson
+    objectClass: posixAccount
+    uid: ${user}
+    cn: ${user}
+    sn: ${user}
+    mail: ${user}@${domain}
+    uidNumber: ${toString (10500 + i)}
+    gidNumber: 100
+    homeDirectory: /home/${user}
+    userPassword: password
+  '') users
+  + ''
+
+    dn: cn=workbench,ou=groups,${baseDN}
+    objectClass: posixGroup
+    cn: workbench
+    gidNumber: 20001
+    memberUid: alice
+
+    dn: cn=workbench-admins,ou=groups,${baseDN}
+    objectClass: posixGroup
+    cn: workbench-admins
+    gidNumber: 20002
+    memberUid: carol
+  '';
+
+  # The host's commands for workspaces made at run time: a credential for
+  # an owner, unless the test takes it away, and whether the directory
+  # still has them in the group.
+  environmentCommand = pkgs.writeShellScript "workspace-env" ''
+    test -e /run/no-credential && exit 1
+    echo "WORKSPACE_TOKEN=token-of-$1"
+  '';
+  ownerCommand = pkgs.writeShellScript "workspace-owner" ''
+    ${pkgs.openldap}/bin/ldapsearch -x -LLL -H ldap://127.0.0.1 -b ou=groups,${baseDN} \
+      "(&(cn=workbench)(memberUid=$1))" dn | grep -q '^dn:'
+  '';
 
   # Attaches to a workspace's shared console the way `workbench console`
   # does, and presses Enter until the guest's login prompt shows.
@@ -71,7 +131,7 @@ let
     page = web.open(start)
     form = re.search(r'<form[^>]*action="([^"]+)"', page.read().decode())
     action = urllib.parse.urljoin(page.url, form.group(1).replace("&amp;", "&"))
-    done = web.open(action, urllib.parse.urlencode({"login": f"{user}@${domain}", "password": "password"}).encode())
+    done = web.open(action, urllib.parse.urlencode({"login": user, "password": "password"}).encode())
     body = done.read().decode()
     # Dex may still ask to grant the client access.
     req = re.search(r'name="req" value="([^"]+)"', body)
@@ -91,7 +151,7 @@ pkgs.testers.runNixOSTest {
       imports = [ flake.nixosModules.default ];
 
       virtualisation = {
-        memorySize = 8192;
+        memorySize = 10240;
         cores = 4;
         diskSize = 30720;
       };
@@ -101,19 +161,81 @@ pkgs.testers.runNixOSTest {
         pkgs.jq
         pkgs.curl
         pkgs.python3
+        pkgs.openldap
       ];
       security.pki.certificateFiles = [ "${certs}/ca.crt" ];
       networking.hosts."127.0.0.1" = [ domain ];
 
-      # Dex stands in for Keycloak, with the same claim for the user.
+      services.openldap = {
+        enable = true;
+        urlList = [ "ldap:///" ];
+        settings.children = {
+          "cn=schema".includes = map (s: "${pkgs.openldap}/etc/schema/${s}.ldif") [
+            "core"
+            "cosine"
+            "nis"
+            "inetorgperson"
+          ];
+          "olcDatabase={1}mdb".attrs = {
+            objectClass = [
+              "olcDatabaseConfig"
+              "olcMdbConfig"
+            ];
+            olcDatabase = "{1}mdb";
+            olcDbDirectory = "/var/lib/openldap/db";
+            olcSuffix = baseDN;
+            olcRootDN = "cn=admin,${baseDN}";
+            olcRootPW = "admin";
+            olcAccess = [
+              "{0}to attrs=userPassword by anonymous auth by * none"
+              "{1}to * by * read"
+            ];
+          };
+        };
+        declarativeContents.${baseDN} = directory;
+      };
+      systemd.tmpfiles.rules = [ "d /var/lib/openldap/db 0700 openldap openldap -" ];
+
+      # Dex stands in for Keycloak: it reads the users and their groups from
+      # the directory, with the same claims, and again at each refresh.
       services.dex = {
         enable = true;
         settings = {
           issuer = "https://${domain}/dex";
           storage.type = "memory";
           web.http = "127.0.0.1:5556";
-          enablePasswordDB = true;
           oauth2.skipApprovalScreen = true;
+          connectors = [
+            {
+              type = "ldap";
+              id = "ldap";
+              name = "LDAP";
+              config = {
+                host = "127.0.0.1:389";
+                insecureNoSSL = true;
+                userSearch = {
+                  baseDN = "ou=users,${baseDN}";
+                  filter = "(objectClass=posixAccount)";
+                  username = "uid";
+                  idAttr = "uid";
+                  emailAttr = "mail";
+                  nameAttr = "cn";
+                  preferredUsernameAttr = "uid";
+                };
+                groupSearch = {
+                  baseDN = "ou=groups,${baseDN}";
+                  filter = "(objectClass=posixGroup)";
+                  userMatchers = [
+                    {
+                      userAttr = "uid";
+                      groupAttr = "memberUid";
+                    }
+                  ];
+                  nameAttr = "cn";
+                };
+              };
+            }
+          ];
           staticClients = [
             {
               id = "workbench";
@@ -122,15 +244,11 @@ pkgs.testers.runNixOSTest {
               secret = "test-client-secret";
             }
           ];
-          # The password of each is "password".
-          staticPasswords = map (user: {
-            email = "${user}@${domain}";
-            hash = "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W";
-            username = user;
-            preferredUsername = user;
-            userID = user;
-          }) users;
         };
+      };
+      systemd.services.dex = {
+        after = [ "openldap.service" ];
+        wants = [ "openldap.service" ];
       };
       services.nginx.virtualHosts.${domain}.locations."/dex/".proxyPass = "http://127.0.0.1:5556";
 
@@ -139,9 +257,20 @@ pkgs.testers.runNixOSTest {
         inherit domain;
         web = {
           enable = true;
-          admins = [ "carol" ];
+          adminGroups = [ "workbench-admins" ];
+          # A test can't wait five minutes for a session to be checked.
+          sessionRefresh = "15s";
+          selfService = {
+            enable = true;
+            groups = [ "workbench" ];
+            os = [ "ubuntu" ];
+            maxDiskGiB = 32;
+            environmentCommand = "${environmentCommand}";
+            ownerCommand = "${ownerCommand}";
+          };
           oidc = {
             provider = "oidc";
+            scope = "openid email profile groups offline_access";
             issuerUrl = "https://${domain}/dex";
             clientSecretFile = "${pkgs.writeText "client-secret" "test-client-secret"}";
             cookieSecretFile = "${pkgs.writeText "cookie-secret" "0123456789abcdef0123456789abcdef"}";
@@ -201,7 +330,7 @@ pkgs.testers.runNixOSTest {
         networking.hosts.${nodes.host.networking.primaryIPAddress} = [
           domain
         ]
-        ++ map (name: "${name}.${domain}") (lib.attrNames workspaces);
+        ++ map (name: "${name}.${domain}") (lib.attrNames workspaces ++ [ "alice-dev" ]);
         networking.interfaces.eth1.ipv4.addresses = lib.mkForce [
           {
             address = clientIP;
@@ -483,5 +612,95 @@ pkgs.testers.runNixOSTest {
         host.succeed("echo bob | workbench destroy bob")
         host.fail("test -e /var/lib/workbench/bob")
         host.succeed("test -f /var/lib/workbench/alice/disk.raw")
+
+    # Workspaces people make themselves, with the groups from the directory.
+    def create(user, name, keys=""):
+        form = f"-d name={name} -d os=ubuntu -d memory_gib=4 -d disk_gib=16 --data-urlencode ssh_keys={shlex.quote(keys)}"
+        return client.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {as_user(user)} {ui_form} {form} https://${domain}/api/create"
+        ).strip()
+
+    with subtest("bob, outside the group, can't make a workspace"):
+        assert status_code(f"{as_user('bob')} https://${domain}/new") == "403"
+        assert create("bob", "bob-dev").startswith("403"), "bob may not"
+        page = client.succeed(f"curl -s {as_user('alice')} https://${domain}/")
+        assert 'href="/new"' in page, "alice may"
+
+    with subtest("a failing credential command refuses the request"):
+        host.succeed("touch /run/no-credential")
+        out = create("alice", "alice-dev")
+        assert out.startswith("303") and "/new?error=" in out and "credential" in out, out
+        host.fail("test -e /var/lib/workbench/configs/alice-dev.json")
+        host.fail("test -e /var/lib/workbench/alice-dev")
+        host.succeed("rm /run/no-credential")
+
+    with subtest("alice, in the group, makes a workspace and reaches it"):
+        key = host.succeed("cat ${sshKey}/id.pub").strip()
+        out = create("alice", "alice-dev", key)
+        assert out == "303 https://${domain}/?w=alice-dev", out
+        config = json.loads(host.succeed("cat /var/lib/workbench/configs/alice-dev.json"))
+        assert config["owner"] == "alice" and config["selfService"] and config["ip"] == "10.232.0.128", config
+        host.succeed("getent passwd wb-alice-dev")
+        workspaces["alice-dev"] = {"ip": config["ip"], "owner": "alice"}
+        host.wait_until_succeeds(f"ssh {ssh_opts} alice@{config['ip']} true", timeout=900)
+        guest("alice-dev", "cloud-init status --wait >/dev/null")
+        guest("alice-dev", "timeout 600 sh -c 'until systemctl is-active workspace-app.service; do sleep 5; done'")
+        pid = guest("alice-dev", "systemctl show -P MainPID workspace-app.service").strip()
+        env = guest("alice-dev", f"sudo cat /proc/{pid}/environ | tr '\\0' '\\n'")
+        assert "WORKSPACE_TOKEN=token-of-alice" in env, env
+        # One virtual host, no reload: the access check names the address.
+        for user, code in (("alice", "200"), ("carol", "200"), ("bob", "403")):
+            client.wait_until_succeeds(
+                f"curl -s -o /dev/null -w '%{{http_code}}' {as_user(user)} {url('alice-dev')}/.well-known/t3/environment | grep -qx {code}",
+                timeout=300,
+            )
+
+    with subtest("the quota refuses alice's second workspace"):
+        out = create("alice", "alice-two")
+        assert "quota" in out, out
+        host.fail("test -e /var/lib/workbench/configs/alice-two.json")
+
+    with subtest("leaving the group cuts alice off, and the timer stops her VM"):
+        host.succeed(
+            "printf 'dn: cn=workbench,ou=groups,${baseDN}\\nchangetype: modify\\ndelete: memberUid\\nmemberUid: alice\\n' "
+            "| ldapmodify -x -H ldap://127.0.0.1 -D cn=admin,${baseDN} -w admin"
+        )
+        # At the next session refresh, the groups come without workbench.
+        client.wait_until_succeeds(
+            f"curl -s -o /dev/null -w '%{{http_code}}' {as_user('alice')} {url('alice-dev')}/ | grep -qx 403",
+            timeout=120,
+        )
+        assert status_code(f"{as_user('alice')} {url('alice')}/.well-known/t3/environment") == "200", "her declared one stays"
+        host.succeed("systemctl start workbench-self-service-reconcile.service")
+        host.wait_until_succeeds("systemctl show -P ActiveState workbench@alice-dev.service | grep -qx inactive", timeout=180)
+        host.succeed("test -e /var/lib/workbench/.left/alice-dev && test -f /var/lib/workbench/alice-dev/disk.raw")
+        # Started again, by anyone: the next pass stops it again.
+        host.succeed("workbench start alice-dev")
+        host.succeed("systemctl start workbench-self-service-reconcile.service")
+        host.wait_until_succeeds("systemctl show -P ActiveState workbench@alice-dev.service | grep -qx inactive", timeout=180)
+        page = client.succeed(f"curl -s {as_user('carol')} 'https://${domain}/?w=alice-dev'")
+        assert "owner left" in page, page[:2000]
+
+    with subtest("back in the group, her workspace starts again"):
+        host.fail("test -e /var/lib/workbench/.stopped/alice-dev")
+        host.succeed(
+            "printf 'dn: cn=workbench,ou=groups,${baseDN}\\nchangetype: modify\\nadd: memberUid\\nmemberUid: alice\\n' "
+            "| ldapmodify -x -H ldap://127.0.0.1 -D cn=admin,${baseDN} -w admin"
+        )
+        host.succeed("systemctl start workbench-self-service-reconcile.service")
+        host.wait_until_succeeds("systemctl show -P ActiveState workbench@alice-dev.service | grep -qx active", timeout=180)
+        host.fail("test -e /var/lib/workbench/.left/alice-dev")
+
+    with subtest("an admin destroys it, and its user and tap go"):
+        tap = config["tap"]
+        out = client.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {as_user('carol')} {ui_form} "
+            "-d ws=alice-dev -d confirm=alice-dev https://${domain}/api/destroy"
+        ).strip()
+        assert out == "303 https://${domain}/", out
+        host.fail("test -e /var/lib/workbench/configs/alice-dev.json")
+        host.fail("test -e /var/lib/workbench/alice-dev")
+        host.fail("getent passwd wb-alice-dev")
+        host.fail(f"ip link show {tap}")
   '';
 }
