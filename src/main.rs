@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use workbench::cli::{self, ExitCode};
 use workbench::config::DEFAULT_CONFIG_DIRS;
 use workbench::memoryd::{self, BehindPool};
 use workbench::{agent, launch};
@@ -22,6 +23,34 @@ struct Args {
 #[allow(clippy::doc_markdown)]
 #[derive(Subcommand)]
 enum Command {
+    /// List workspaces, their VMs and disks
+    Status {
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+        /// Where workspace disks live
+        #[arg(long, default_value = "/var/lib/workbench")]
+        state_root: PathBuf,
+    },
+    /// Create a T3 Code pairing link for the owner; flags after the name go
+    /// to t3
+    Pair {
+        workspace: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Attach to the serial console (Ctrl-] quits)
+    Console { workspace: String },
+    /// Stop a workspace and delete its disk
+    Destroy {
+        workspace: String,
+        /// Do not ask for confirmation
+        #[arg(long)]
+        yes: bool,
+        /// Where workspace disks live
+        #[arg(long, default_value = "/var/lib/workbench")]
+        state_root: PathBuf,
+    },
     /// Become the workspace's VM (internal: the unit's ExecStart)
     Run { workspace: String },
     /// Power the VM off cleanly (internal: the unit's ExecStop)
@@ -58,6 +87,9 @@ enum Command {
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(args) {
+        if let Some(ExitCode(code)) = e.downcast_ref::<ExitCode>() {
+            std::process::exit(*code);
+        }
         eprintln!("workbench: {e:#}");
         std::process::exit(1);
     }
@@ -70,11 +102,24 @@ fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
         // Becomes cloud-hypervisor: no runtime threads left behind.
         Command::Run { workspace } => launch::run(&dirs, &workspace),
+        Command::Console { workspace } => cli::console(&dirs, &workspace),
         Command::Shutdown { workspace, timeout } => {
             rt()?.block_on(launch::shutdown(&dirs, &workspace, Duration::from_secs(timeout)))
         }
         Command::Memory { status_file, behind, reserve_percent, reserve_min_gib } => rt()?
             .block_on(memoryd::run(memoryd::Options { dirs, status_file, behind, reserve_percent, reserve_min_gib })),
         Command::GuestAgent { config } => rt()?.block_on(agent::run(&config)),
+        Command::Pair { workspace, args } => rt()?.block_on(cli::pair(&dirs, &workspace, args)),
+        Command::Status { json, state_root } => {
+            rt()?.block_on(cli::status(&mut std::io::stdout().lock(), &dirs, &state_root, json))
+        }
+        Command::Destroy { workspace, yes, state_root } => rt()?.block_on(cli::destroy(
+            &dirs,
+            &state_root,
+            &workspace,
+            yes,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+        )),
     }
 }

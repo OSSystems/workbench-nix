@@ -7,6 +7,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod agent;
+pub mod cli;
 pub mod config;
 pub mod launch;
 pub mod memoryd;
