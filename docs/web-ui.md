@@ -65,7 +65,14 @@ gets the workspace's name and the browser's cookies, and:
    browser's. **The app never sees the SSO cookie**, so code running in a
    workspace can't replay it against the UI or another workspace.
 
-Answers are cached for 10 s per cookie. On a 403, nginx shows the UI's
+The app's answers can't set a cookie for the whole domain either: nginx
+makes every `Domain` its host's, so a workspace's app can't put an SSO
+cookie of its choosing in a browser that way. Script in the app still can,
+since the workspaces share the domain: the most it does is sign that
+browser in as the app's owner, never as the person who opened it.
+
+Answers are cached for 10 s per SSO cookie; the app's cookies are no part
+of the key. On a 403, nginx shows the UI's
 `/denied` page at the workspace's address, styled from `https://<domain>`,
 with a link back to it.
 
@@ -228,7 +235,9 @@ NixOS workspace whose new generation doesn't boot.
   socket per running VM, keeps the last 256 KiB of output, and fans it out
   to every browser. Everyone types into the same console.
 - New viewers first get the kept output, so opening the console of a VM
-  that just failed shows why.
+  that just failed shows why. A workspace of the same name made again for
+  someone else starts with none of it, and the viewers of the one before
+  are let go.
 - **Restart with console** restarts the VM with the console open, for the
   boot menu: systemd-boot waits `boot.loader.timeout` seconds, 1 by default.
 - When the VM stops, the terminal says so and reconnects when it starts.

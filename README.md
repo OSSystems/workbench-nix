@@ -294,8 +294,10 @@ An app without the hook has no sign-in action.
 ## Development
 
 ```sh
-nix develop       # cargo, clippy, rustfmt, rust-analyzer; links ./vmkit
-cargo test
+nix develop       # cargo, clippy, rustfmt, rust-analyzer, lld, wasm-bindgen; links ./vmkit
+cargo test --workspace
+cargo test -p workbench-web --features ssr
+nix build .#web .#web.site   # the UI's server, and its WebAssembly and assets
 nix flake check   # rustfmt, clippy and the tests, the module evaluations, and the VM test
 nix fmt -- $(git ls-files '*.nix')
 ```
