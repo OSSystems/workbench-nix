@@ -203,7 +203,8 @@ impl AppState {
     /// Who `name` is here.
     #[must_use]
     pub fn viewer(&self, name: &str) -> Option<Viewer> {
-        is_user_name(name).then(|| Viewer { name: name.to_owned(), admin: self.opts.admins.iter().any(|a| a == name) })
+        let admin = self.opts.admins.iter().any(|a| a == name);
+        is_user_name(name).then(|| Viewer { name: name.to_owned(), admin, creates: admin })
     }
 
     /// Every workspace, collected at most once a second whoever asks.

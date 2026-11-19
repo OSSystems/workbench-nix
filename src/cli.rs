@@ -245,6 +245,13 @@ pub async fn destroy(
         let _ = input.read_line(&mut answer);
         ensure!(answer.trim() == name, "not confirmed; nothing deleted");
     }
+    // One made at run time has more than its disk to take away.
+    if declared.as_ref().is_some_and(|c| c.self_service) {
+        let t = crate::self_service::Template::load(Path::new(crate::self_service::TEMPLATE))?;
+        crate::self_service::destroy(&t, name).await?;
+        writeln!(out, "Deleted {} and everything of {name}.", state_dir.display())?;
+        return Ok(());
+    }
     let unit = unit_name(name);
     let stop = tokio::process::Command::new("systemctl").args(["stop", &unit]).output().await?;
     if !stop.status.success() {

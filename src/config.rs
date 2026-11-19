@@ -88,6 +88,19 @@ pub struct Config {
     /// When set, may use the VM's sockets: the web UI's group.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub socket_group: String,
+
+    /// Made at run time by its owner, not declared in Nix.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub self_service: bool,
+    /// The VM user's id, for one made at run time: its user is a userdb
+    /// record the host writes with it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub uid: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn is_mac(mac: &str) -> bool {
@@ -96,7 +109,7 @@ fn is_mac(mac: &str) -> bool {
         && parts.iter().all(|p| p.len() == 2 && p.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
 }
 
-fn is_env_name(name: &str) -> bool {
+pub(crate) fn is_env_name(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty()
         && (b[0].is_ascii_alphabetic() || b[0] == b'_')
@@ -290,6 +303,12 @@ pub fn load(dirs: &[PathBuf], name: &str) -> anyhow::Result<Config> {
         };
         let c = parse(&raw).with_context(|| path.display().to_string())?;
         ensure!(c.name == name, "{} names workspace {:?}", path.display(), c.name);
+        // A workspace made at run time whose name the Nix configuration
+        // took later: neither starts on the other's disk.
+        let later = dirs.iter().skip_while(|d| *d != dir).skip(1);
+        if let Some(other) = later.into_iter().find(|d| d.join(format!("{name}.json")).exists()) {
+            bail!("{name} is in both {} and {}; remove one", dir.display(), other.display());
+        }
         return Ok(c);
     }
     let dirs: Vec<_> = dirs.iter().map(|d| d.display().to_string()).collect();
@@ -353,6 +372,8 @@ pub(crate) mod tests {
             control_port: 5001,
             agent_port: 5002,
             socket_group: String::new(),
+            self_service: false,
+            uid: 0,
         }
     }
 
@@ -424,8 +445,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// The declarative directory comes first; a later directory only adds
-    /// workspaces, which is where self-service configs are meant to go.
+    /// A later directory only adds workspaces, which is where self-service
+    /// configs go; a name in two directories loads from neither.
     #[test]
     fn config_directories_precedence() {
         let (etc, lib) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -445,7 +466,10 @@ pub(crate) mod tests {
         std::fs::write(lib.path().join("Bad.json"), "").unwrap();
         let dirs = [etc.path().to_owned(), lib.path().to_owned()];
         assert_eq!(configured(&dirs), ["alice-dev", "bob"]);
-        assert_eq!(load(&dirs, "alice-dev").unwrap().owner, "alice", "want the /etc config");
+        let both = load(&dirs, "alice-dev").unwrap_err().to_string();
+        assert!(both.contains("in both"), "{both}");
+        std::fs::remove_file(lib.path().join("alice-dev.json")).unwrap();
+        assert_eq!(load(&dirs, "alice-dev").unwrap().owner, "alice");
         load(&dirs, "bob").unwrap();
         assert!(load(&dirs, "../etc/passwd").is_err(), "loaded a path outside the config directories");
         let mut renamed = test_config();
