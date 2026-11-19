@@ -215,7 +215,7 @@ pkgs.testers.runNixOSTest {
 
     cookies = {}
     for name in workspaces:
-        with subtest(f"{name} pairs over HTTPS"):
+        with subtest(f"{name} signs a browser in over HTTPS"):
             def session_state(cookie=None, name=name):
                 header = f"-H 'Cookie: {cookie}'" if cookie else ""
                 return json.loads(client.succeed(
@@ -223,8 +223,10 @@ pkgs.testers.runNixOSTest {
                 ))
             client.wait_until_succeeds(f"curl -sf {url(name)}/.well-known/t3/environment", timeout=300)
             assert not session_state()["authenticated"]
-            grant = json.loads(host.succeed(f"workbench pair {name} --json"))
-            assert grant["pairUrl"] == f"{url(name)}/pair#token={grant['credential']}", grant
+            link = host.succeed(f"workbench sign-in {name}").strip()
+            prefix = f"{url(name)}/pair#token="
+            assert link.startswith(prefix), link
+            grant = {"credential": link.removeprefix(prefix)}
             client.succeed(
                 f"curl -sf -c /tmp/{name}.jar -H 'Origin: {url(name)}' "
                 f"-H 'Content-Type: application/json' "
@@ -281,6 +283,8 @@ pkgs.testers.runNixOSTest {
         print(out)
         for name in workspaces:
             assert name in out
+        for ws in json.loads(host.succeed("workbench status --json")):
+            assert ws["state"] == "running" and ws["signIn"] and not ws.get("appUpdate"), ws
 
     with subtest("a NixOS workspace restarts with its store and configuration"):
         host.succeed("systemctl restart workbench@bob.service")
@@ -289,8 +293,15 @@ pkgs.testers.runNixOSTest {
         out = guest("bob", "journalctl -b -u workspace-store.service")
         assert "copying" not in out, out
 
+    with subtest("a stop lasts until a start"):
+        host.succeed("workbench stop bob")
+        host.succeed("test -e /var/lib/workbench/.stopped/bob")
+        # What a reboot does: start everything wanted by multi-user.target.
+        host.succeed("systemctl start workbench@bob.service")
+        host.succeed("systemctl show -P ActiveState workbench@bob.service | grep -qx inactive")
+        assert json.loads(host.succeed("workbench status --json"))[1]["state"] == "stopped"
+
     with subtest("a stop powers the guest off and destroy deletes the disk"):
-        host.succeed("systemctl stop workbench@bob.service")
         host.succeed("test -f /var/lib/workbench/bob/disk.raw")
         host.fail("echo nope | workbench destroy bob")
         host.succeed("test -f /var/lib/workbench/bob/disk.raw")

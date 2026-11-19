@@ -1,0 +1,18 @@
+[package]
+name = "workbench-model"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "What workbench's host, its CLI and its web UI agree on: names, workspaces and their states"
+license = "MIT"
+publish = false
+
+[dependencies]
+jiff = { version = "1.0.1", default-features = false, features = ["serde", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0.154"
+
+[lints]
+workspace = true

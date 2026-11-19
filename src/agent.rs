@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use vmkit::{control, hostutil, vsock};
 
 use crate::config::Config;
@@ -17,14 +17,19 @@ use crate::launch::GuestConfig;
 
 /// Where the guest mounts the app bundle.
 pub const GUEST_APP: &str = "/run/workspace/config/app";
+/// The app's optional sign-in hook: run as the owner, it prints one URL
+/// that signs a browser in to the app, and nothing else.
+pub const SIGN_IN_HOOK: &str = "/run/workspace/config/app/bin/sign-in-link";
 /// The largest request the agent reads.
 const MAX_REQUEST: u64 = 64 << 10;
 /// The largest reply the host reads.
 const MAX_REPLY: u64 = 1 << 20;
 /// How long a host request may take to arrive.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long pairing may run.
-const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the app's sign-in hook may run.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+/// The most of a hook's stdout and stderr each kept.
+const MAX_OUTPUT: u64 = 64 << 10;
 /// How often the guest reports its memory.
 const STATS_EVERY: Duration = Duration::from_secs(2);
 
@@ -41,6 +46,9 @@ pub struct Request {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reply {
+    /// In a ping's answer: the app has a sign-in hook.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_in: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stdout: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -116,7 +124,7 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(conn: S, gc: &Guest
         Ok(Err(e)) => Reply::error(e.to_string()),
         Ok(Ok(line)) => match serde_json::from_slice::<Request>(&line) {
             Err(_) => Reply::error("invalid JSON"),
-            Ok(req) => answer(req, gc).await,
+            Ok(req) => answer(req, gc, Path::new(SIGN_IN_HOOK)).await,
         },
     };
     let Ok(mut raw) = serde_json::to_vec(&reply) else { return };
@@ -126,35 +134,20 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(conn: S, gc: &Guest
     let _ = conn.shutdown().await;
 }
 
-async fn answer(req: Request, gc: &GuestConfig) -> Reply {
+async fn answer(req: Request, gc: &GuestConfig, hook: &Path) -> Reply {
     match req.op.as_str() {
-        "ping" => Reply::default(),
-        "pair" => pair_as_owner(gc, &req.args).await.unwrap_or_else(|e| Reply::error(format!("{e:#}"))),
+        "ping" => Reply { sign_in: hook.exists(), ..Reply::default() },
+        "sign-in" if !hook.exists() => Reply::error("the app has no sign-in hook"),
+        "sign-in" => {
+            let argv = [hook.to_string_lossy().into_owned()];
+            run_as_owner(gc, &argv, HOOK_TIMEOUT).await.unwrap_or_else(|e| Reply::error(format!("{e:#}")))
+        }
         _ => Reply::error("unknown op"),
     }
 }
 
-/// The pairing command for a workspace: the owner's T3 Code server is
-/// reached at the workspace URL. What the host adds comes after, so it
-/// cannot replace the label; a later `--base-url` would, which only the
-/// host may send.
-pub(crate) fn pair_argv(gc: &GuestConfig, args: &[String]) -> Vec<String> {
-    let mut argv: Vec<String> =
-        [&format!("{GUEST_APP}/bin/t3"), "auth", "pairing", "create", "--base-url", &gc.url, "--label", "workbench"]
-            .map(str::to_owned)
-            .into();
-    argv.extend(args.iter().cloned());
-    argv
-}
-
-/// Creates a pairing credential as the owner, against the T3 Code state the
-/// owner's server uses.
-async fn pair_as_owner(gc: &GuestConfig, args: &[String]) -> anyhow::Result<Reply> {
-    let argv = pair_argv(gc, args);
-    run_as_owner(gc, &argv, PAIR_TIMEOUT).await
-}
-
-/// Runs a command as the owner, in their home, and collects what it prints.
+/// Runs a command as the owner, in their home, with the workspace's URL in
+/// `WORKSPACE_URL`, and keeps the start of what it prints.
 pub(crate) async fn run_as_owner(gc: &GuestConfig, argv: &[String], timeout: Duration) -> anyhow::Result<Reply> {
     let user = nix::unistd::User::from_name(&gc.owner)?.ok_or_else(|| anyhow!("unknown user {:?}", gc.owner))?;
     let home = user.dir.to_string_lossy().into_owned();
@@ -165,7 +158,7 @@ pub(crate) async fn run_as_owner(gc: &GuestConfig, argv: &[String], timeout: Dur
         .env("HOME", &home)
         .env("USER", &gc.owner)
         .env("LOGNAME", &gc.owner)
-        .env("T3CODE_HOME", format!("{home}/.t3"))
+        .env("WORKSPACE_URL", &gc.url)
         .env(
             "PATH",
             format!("{GUEST_APP}/sw/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin"),
@@ -174,20 +167,55 @@ pub(crate) async fn run_as_owner(gc: &GuestConfig, argv: &[String], timeout: Dur
         .uid(user.uid.as_raw())
         .gid(user.gid.as_raw())
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let out = tokio::time::timeout(timeout, cmd.output())
+    let mut child = cmd.spawn().with_context(|| argv[0].clone())?;
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let run = async {
+        let (out, err, status) = tokio::join!(read_limited(stdout), read_limited(stderr), child.wait());
+        anyhow::Ok((out, err, status?))
+    };
+    let (stdout, stderr, status) = tokio::time::timeout(timeout, run)
         .await
         .map_err(|_| anyhow!("{} did not finish within {timeout:?}", argv[0]))??;
-    Ok(Reply {
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        exit_code: out.status.code().unwrap_or(-1),
-        error: String::new(),
-    })
+    Ok(Reply { stdout, stderr, exit_code: status.code().unwrap_or(-1), ..Reply::default() })
 }
 
-/// Sends one request to a workspace's agent over vsock.
-pub async fn ask(c: &Config, req: &Request, timeout: Duration) -> anyhow::Result<Reply> {
+/// Keeps the first [`MAX_OUTPUT`] bytes of a pipe and drains the rest, so
+/// the command never blocks on it.
+async fn read_limited(pipe: Option<impl AsyncRead + Unpin>) -> String {
+    let Some(mut pipe) = pipe else { return String::new() };
+    let mut kept = Vec::new();
+    let _ = (&mut pipe).take(MAX_OUTPUT).read_to_end(&mut kept).await;
+    let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// Why a request found no agent to answer it.
+#[derive(Debug)]
+pub enum AskError {
+    /// The VM's vsock socket, or the agent behind it, could not be reached,
+    /// or the exchange broke.
+    Unreachable(anyhow::Error),
+    /// No answer in time.
+    Timeout,
+}
+
+impl std::fmt::Display for AskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AskError::Unreachable(e) => write!(f, "{e:#}"),
+            AskError::Timeout => f.write_str("the guest agent did not answer in time"),
+        }
+    }
+}
+
+impl std::error::Error for AskError {}
+
+/// Sends one request to a workspace's agent over vsock and returns its
+/// reply, failed or not.
+pub async fn exchange(c: &Config, req: &Request, timeout: Duration) -> Result<Reply, AskError> {
     let exchange = async {
         let conn = vmkit::ch::dial_guest(c.vsock(), c.agent_port_u32(), timeout)
             .await
@@ -199,9 +227,15 @@ pub async fn ask(c: &Config, req: &Request, timeout: Duration) -> anyhow::Result
         let line = control::read_line(&mut conn, MAX_REPLY).await.context("the agent's reply")?;
         anyhow::Ok(serde_json::from_slice::<Reply>(&line)?)
     };
-    let reply = tokio::time::timeout(timeout, exchange)
-        .await
-        .map_err(|_| anyhow!("the guest agent of {} did not answer within {timeout:?}", c.name))??;
+    match tokio::time::timeout(timeout, exchange).await {
+        Err(_) => Err(AskError::Timeout),
+        Ok(r) => r.map_err(AskError::Unreachable),
+    }
+}
+
+/// Sends one request to a workspace's agent; a failed reply is an error.
+pub async fn ask(c: &Config, req: &Request, timeout: Duration) -> anyhow::Result<Reply> {
+    let reply = exchange(c, req, timeout).await.with_context(|| format!("the guest agent of {}", c.name))?;
     if !reply.error.is_empty() {
         bail!("{}", reply.error);
     }
@@ -225,26 +259,25 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     use tokio::net::UnixListener;
 
-    #[test]
-    fn pair_args() {
-        let gc = GuestConfig { url: "https://alice.ws.test".into(), ..GuestConfig::default() };
-        let got = pair_argv(&gc, &["--json".into(), "--base-url".into(), "https://evil.test".into()]);
-        assert_eq!(
-            got,
-            [
-                "/run/workspace/config/app/bin/t3",
-                "auth",
-                "pairing",
-                "create",
-                "--base-url",
-                "https://alice.ws.test",
-                "--label",
-                "workbench",
-                "--json",
-                "--base-url",
-                "https://evil.test"
-            ]
-        );
+    /// The ping says whether the app has the hook; sign-in needs it.
+    #[tokio::test]
+    async fn sign_in_needs_the_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("sign-in-link");
+        let ping = Request { op: "ping".into(), args: vec![] };
+        let gc = GuestConfig::default();
+        assert!(!answer(ping.clone(), &gc, &hook).await.sign_in);
+        let reply = answer(Request { op: "sign-in".into(), args: vec![] }, &gc, &hook).await;
+        assert_eq!(reply.error, "the app has no sign-in hook");
+        std::fs::write(&hook, "").unwrap();
+        assert!(answer(ping, &gc, &hook).await.sign_in);
+    }
+
+    #[tokio::test]
+    async fn output_is_bounded() {
+        let big = vec![b'x'; 200 << 10];
+        let kept = read_limited(Some(&big[..])).await;
+        assert_eq!(kept.len() as u64, MAX_OUTPUT);
     }
 
     /// Stands in for cloud-hypervisor's host-side vsock socket with one
@@ -299,5 +332,7 @@ mod tests {
         assert_eq!(reply.exit_code, 2);
         assert_eq!(serde_json::to_string(&reply).unwrap(), r#"{"stdout":"x\n","exitCode":2}"#);
         assert_eq!(serde_json::to_string(&Reply::default()).unwrap(), r#"{"exitCode":0}"#);
+        let ping = Reply { sign_in: true, ..Reply::default() };
+        assert_eq!(serde_json::to_string(&ping).unwrap(), r#"{"signIn":true,"exitCode":0}"#);
     }
 }
