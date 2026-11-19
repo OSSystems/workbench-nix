@@ -1,0 +1,397 @@
+# Web UI
+
+The specification of workbench's web UI: what it shows, who may do what,
+and how each piece works on the host. The static mockup of every screen is
+[`web-ui/index.html`](web-ui/index.html); `workbench-web` implements it,
+and `services.workbench.web` sets it up.
+
+## Premises
+
+- **One address.** The UI is at `https://<domain>`, each workspace at
+  `https://<ws>.<domain>`. One certificate covers `<domain>` and
+  `*.<domain>`.
+- **Single sign-on everywhere.** Keycloak, through oauth2-proxy, guards the
+  UI and every workspace. Nobody reaches a workspace's app without signing in,
+  whatever the app does about accounts.
+- **Two roles.** A person sees and controls the workspaces they own. Admins,
+  a list in the Nix configuration, see and control all of them.
+- **No database.** State comes from the workspace configs, systemd, the VM's
+  sockets and a few files the host already writes. It is what
+  `workbench status` collects, called as a function.
+- **Rendered on the server, hydrated in the browser.** A Leptos app in
+  Rust: the server renders every page, and the same components, compiled to
+  WebAssembly, take over in the browser for live updates, dialogs and
+  keyboard shortcuts. Actions are server functions, and their forms post
+  without JavaScript too. What the browser and the server exchange, and
+  the checks on it, are one crate's, `workbench-model`, compiled for both.
+- **Works on a phone.** The same pages at 360 px wide: the list becomes the
+  page and the side panel becomes its own screen.
+- **Dark and light**, following the system's setting.
+
+## Identity
+
+```
+browser ──► nginx ──auth_request──► oauth2-proxy ──OIDC──► Keycloak
+              │
+              ├─ <domain>        ──► workbench web   (unix socket)
+              └─ <ws>.<domain>   ──► the workspace's app  (after an owner check)
+```
+
+- **oauth2-proxy** is the Keycloak client. It lives at `/oauth2/` on every
+  host name, so no workspace name is reserved, and its cookie is set on
+  `.<domain>` so one sign-in covers the UI and all workspaces. It runs with
+  `--set-xauthrequest` and a cookie named `_workbench_auth`.
+- **The user** is Keycloak's `preferred_username`, which must be the
+  person's LDAP uid: the same name workspaces have as `owner`. nginx takes it
+  from `X-Auth-Request-Preferred-Username` and passes it to `workbench-web`
+  as `X-Workbench-User`, overwriting whatever the browser sent.
+- **`workbench-web` listens only on unix sockets** that nginx's group can
+  reach, so that header cannot be forged.
+- **Signing out** is `/oauth2/sign_out`, which also ends the Keycloak session
+  (`--backend-logout-url`).
+
+### Workspaces behind SSO
+
+Each workspace's virtual host has an `auth_request` to `workbench-web`'s
+authorization socket (`/run/workbench-web/authz.sock`, `GET /authz`). It
+gets the workspace's name and the browser's cookies, and:
+
+1. asks oauth2-proxy (`/oauth2/auth`) who the cookie belongs to;
+2. answers `401` when nobody is signed in (nginx redirects to
+   `/oauth2/start?rd=<the URL>`), `403` when the user is neither the owner
+   nor an admin, `200` otherwise;
+3. with the `200`, returns the cookies minus `_workbench_auth*` in
+   `X-Workbench-Cookie`, which nginx sends to the app instead of the
+   browser's. **The app never sees the SSO cookie**, so code running in a
+   workspace can't replay it against the UI or another workspace.
+
+Answers are cached for 10 s per cookie. On a 403, nginx shows the UI's
+`/denied` page at the workspace's address, styled from `https://<domain>`,
+with a link back to it.
+
+The check lives in `workbench-web`, not in nginx, so runtime configs, the admin list and
+the owner rule are in one tested place.
+
+## Screens
+
+```
+https://<domain>/                    Workspaces
+https://<domain>/?w=<ws>             Workspaces, with <ws> in the side panel
+https://<domain>/w/<ws>/sign-in      Sign in to <ws>'s app
+https://<domain>/w/<ws>/console      Serial console
+https://<domain>/host                Host memory (admins)
+```
+
+### Workspaces (`/`)
+
+A top bar with the mark, a field that finds a workspace by name (`Ctrl K`
+or `/`) and the user's menu (**Sign out**). A sidebar with **Workspaces**,
+**Host** (admins only), and under **Yours** the user's workspaces with
+their status dot. The main area lists workspaces in
+groups by state (Running, Starting, Failing, Stopped), with chips to filter
+by All, Running and Stopped. Admins get a chip for **Mine** and an Owner
+column.
+
+A row has the status dot, the name, a short note (the address, "booting",
+"since Nov 3"), the system, the memory and one primary action:
+
+| State | Primary action |
+|---|---|
+| Running, the app was never opened from this browser | **Open and sign in** |
+| Running | **Open** |
+| Starting | **Open** (the app may already answer) |
+| Stopped | **Start** |
+| Failing | **Console** |
+| Stopping, Restarting | none; the row says what it waits for |
+
+**A line along the bottom edge of each row is its memory:** its length is
+what the VM holds now out of the most it may grow to. Sage while running,
+amber while starting, red while failing; a stopped workspace has none.
+
+**The side panel** shows the selected workspace: name, status and since
+when, the update notice, then Address, Owner (admins), System, Memory (a
+meter with a tick at the boot size), Disk on host, and the actions:
+
+- **Open** (`↵`)
+- **Sign in to app** (`S`), only when the app supports it
+- **Console** (`C`)
+- **Restart…** (`R`), unless it is stopped
+- **Stop…**, apart at the bottom below a rule, plain: its dialog says what
+  it costs
+
+On a phone the panel is a page of its own (`/?w=<ws>` with the list
+hidden), reached by tapping a row.
+
+Keyboard: `J`/`K` move, `↵` opens, `S` signs in, `C` opens the console, `R`
+restarts, `/` or `Ctrl K` focuses the command field. Shortcuts never act on
+their own; Restart and Stop still open their dialog.
+
+#### States
+
+The state of a workspace comes from its unit, the VM and the agent:
+
+| Unit `ActiveState`/`SubState` | VM | Agent | Shown as |
+|---|---|---|---|
+| `active`/`running` | `Running` | answers | **Running** |
+| `activating`, or `active` and the agent doesn't answer | | | **Starting** |
+| `deactivating` | | | **Stopping**, or **Restarting** after a restart |
+| `inactive` | | | **Stopped** |
+| `failed`, or `activating`/`auto-restart` | | | **Failing** |
+
+The unit has `Restart=always`, so a VM that keeps crashing cycles through
+`activating`/`auto-restart`; that is Failing, not Starting. A state always
+has a label, never only a color.
+
+- **Loading:** skeleton rows, the first time only.
+- **Empty:** "You don't have a workspace yet", what one is, and that an
+  admin creates it.
+- **Starting:** "booting"; a NixOS workspace takes longer on its first boot
+  after an update, while it copies the app onto its disk.
+- **Failing:** a notice in the panel: "The VM won't stay up. Its console
+  shows why." with **Console** and **Restart…**.
+- **App update:** "A new app version is on the host. Restart to use it." with
+  **Restart…** (see [App updates](#app-updates)).
+- **Lost connection:** when the live updates drop, a bar says "Reconnecting…
+  Showing the state at 10:42." and actions stay enabled: they are plain
+  forms, and their answer says if they failed.
+
+### Sign in to app (`/w/<ws>/sign-in`)
+
+Some apps have accounts of their own on top of the host's SSO; T3 Code, for
+one, lets a browser in only after it follows a one-time link. The UI gets
+that link from the app and sends the browser to it, so the person never
+copies a credential:
+
+1. **Open and sign in**, or **Sign in to app**, posts the workspace's name
+   to `/api/sign-in`, in a new tab.
+2. `workbench-web` asks the guest agent for a link (`op: "sign-in"`, over
+   vsock). The agent runs the app's `bin/sign-in-link` as the owner; it
+   prints one URL and nothing else on stdout.
+3. The URL must start with the workspace's own URL. `workbench-web` answers
+   `303 See Other` to it, with `Cache-Control: no-store`. The link is never
+   shown and never logged.
+4. The browser remembers, in `localStorage`, that it has signed in to `<ws>`,
+   so the next time the primary action is just **Open**.
+
+The `GET` of `/w/<ws>/sign-in` is a page with one button. It signs in
+nothing, so link previews don't spend links, and it is the address to send
+someone: "Sign in to `<ws>`'s app".
+
+An app without `bin/sign-in-link` gets no sign-in action: **Open** is all,
+and the app's own screen takes over. The agent's `ping` answer says whether
+the hook exists.
+
+Errors, on the sign-in page above its button:
+
+| Situation | Message | Action |
+|---|---|---|
+| Stopped | "`<ws>` is stopped. Start it, then sign in." | **Start `<ws>`** |
+| The agent doesn't answer | "`<ws>` is still starting." | **Try again** |
+| The hook failed | "The app couldn't make a sign-in link." Its stderr under Details. | **Try again**, **Console** |
+| Not a URL of the workspace | "The app answered something that isn't a link to `<ws>`." | **Try again** |
+| 90 s without an answer | "The app took too long to answer." | **Try again** |
+
+**Another device** (a link or QR code for a phone) is for later; it would
+be a second action in the panel.
+
+### Start, stop and restart
+
+| Action | Confirmation | The dialog says |
+|---|---|---|
+| **Start** | none | — |
+| **Restart** | dialog | Stops everything running in the VM; open app tabs lose their connection for about a minute. Keeps everything on its disk. Brings the app and system now on the host. |
+| **Stop** | dialog, red button | Stops the VM and the app. Keeps everything on its disk. It stays stopped, also across host reboots, until someone starts it. |
+| Delete | not in the UI | stays `workbench destroy` |
+
+Without JavaScript, **Restart…** and **Stop…** are links to
+`/w/<ws>/restart` and `/w/<ws>/stop`, pages with the same text and button.
+
+After a confirm, the page comes back with the row in its new state; the
+live updates carry it to the end. An action on a workspace that is already
+changing state is refused with "`<ws>` is already restarting".
+
+**Stopped stays stopped.** Stop writes `/var/lib/workbench/.stopped/<ws>`
+before it stops the unit; the unit has
+`ConditionPathExists=!/var/lib/workbench/.stopped/%i`, so a host reboot
+skips it. Start removes the file first. `workbench start` and
+`workbench stop` do the same from the shell.
+
+### Console (`/w/<ws>/console`)
+
+The VM's serial console in the browser, for the owner and admins: what the
+guest prints while it boots, the `ttyS0` login, and the boot menu of a
+NixOS workspace whose new generation doesn't boot.
+
+- A terminal fills the page, under a bar with the workspace, its state,
+  **Restart…** and the number of people watching ("2 connected").
+- It is **shared**: `workbench-web` keeps one connection to the serial
+  socket per running VM, keeps the last 256 KiB of output, and fans it out
+  to every browser. Everyone types into the same console.
+- New viewers first get the kept output, so opening the console of a VM
+  that just failed shows why.
+- **Restart with console** restarts the VM with the console open, for the
+  boot menu: systemd-boot waits `boot.loader.timeout` seconds, 1 by default.
+- When the VM stops, the terminal says so and reconnects when it starts.
+- `workbench console` on the host attaches to the same shared console when
+  `workbench-web` runs, and to the serial socket otherwise.
+
+### Host (`/host`, admins)
+
+Host memory, from `/proc/meminfo` and `/run/vmkit/memory/<pool>.json`:
+
+- one bar of the host's total: what each pool holds (`committedBytes`),
+  what it is waiting for (`pendingBytes`), the reserve, and what's free;
+- a row per pool with those numbers and "denied 4 min ago" when `deniedAt`
+  is recent;
+- "no data from `<pool>` since 10:12" when its `updatedAt` is over 30 s old;
+- below, every workspace with its owner, memory now, boot and most.
+
+### Errors
+
+- **403** at `<domain>/w/<ws>/…` for a workspace that isn't yours, and the
+  same page for one that doesn't exist, so names don't leak.
+- **403** at `<ws>.<domain>` from the authorization check: "This workspace
+  isn't yours. You're signed in as bob." with **Sign out** and a link to
+  the UI.
+- **502** when the host can't be read (systemd or a config fails): "Couldn't
+  read the workspaces from the host." with the error under Details.
+
+## App updates
+
+A restart brings the app and the system on the host now; until then the VM
+runs what it started with. `workbench run` writes the store path it starts
+the app from to `<runtimeDir>/app`. The UI compares it with the config's
+`app`: when they differ, the workspace has an update and the panel says so.
+
+## The service
+
+`workbench-web.service` runs `workbench-web` as its own user,
+`workbench-web`:
+
+- It reads the configs and `/run/vmkit/memory/*.json`, and runs `systemctl
+  show`, which needs no privilege.
+- It is in the group `workbench`, which gets read and write on each VM's
+  sockets: `<runtimeDir>/vm` becomes setgid `wb-<ws>:workbench`, and the
+  unit's `ExecStartPost`, `workbench share-sockets`, makes the API, vsock
+  and serial sockets `0660` once cloud-hypervisor has made them.
+- A polkit rule lets it start, stop and restart `workbench@*.service`, and
+  nothing else.
+- It owns `/var/lib/workbench/.stopped/`.
+- It listens on `/run/workbench-web/ui.sock` and
+  `/run/workbench-web/authz.sock`, `0660` with nginx's group, and on
+  `/run/workbench-web/console.sock`, for `workbench console`.
+
+Every `POST` must have `Origin: https://<domain>`. The workspaces are
+sibling subdomains, so they are the same site and `SameSite` cookies don't
+stop them; the `Origin` check does.
+
+### What each action calls
+
+| Action | Underneath |
+|---|---|
+| List | the configs, `systemctl show`, cloud-hypervisor's `Info`, an agent `ping`; in parallel, 2 s per VM |
+| Start | remove the stop marker, `systemctl start workbench@<ws>` |
+| Stop | write the stop marker, `systemctl stop workbench@<ws>`: `workbench shutdown` presses the power button and waits up to 90 s |
+| Restart | `systemctl restart workbench@<ws>` |
+| Sign in | the agent's `sign-in` over vsock, 90 s |
+| Console | the serial socket, shared |
+| Host | `/proc/meminfo`, `/run/vmkit/memory/*.json` |
+
+### Live updates
+
+`GET /events` is a server-sent event stream. While anyone listens, the
+server collects the state every 2 s and sends what the listener may see,
+as JSON, whenever something changed; the hydrated page renders the list and
+side panels from it and keeps the selection. Without JavaScript the page is
+just a page, current when loaded.
+
+## Endpoints
+
+| Method | Path | Answer |
+|---|---|---|
+| `GET` | `/` | the Workspaces page; `?w=<ws>` selects one |
+| `GET` | `/events` | event stream of the list |
+| `GET` | `/api/workspaces` | the user's workspaces as JSON; all of them for admins |
+| `GET` | `/w/<ws>/start`, `/w/<ws>/stop`, `/w/<ws>/restart` | confirmation pages |
+| `GET` | `/w/<ws>/sign-in` | the sign-in page |
+| `POST` | `/api/control` | server function: `ws` and `action` (`start`, `stop`, `restart`); `303` to `/?w=<ws>` from a form |
+| `POST` | `/api/sign-in` | server function: `ws`; `303` to the app's link |
+| `GET` | `/w/<ws>/console` | the console page |
+| `GET` | `/w/<ws>/console/socket` | WebSocket to the shared console |
+| `GET` | `/host` | host memory, admins |
+| `GET` | `/denied` | the 403 page nginx shows at a workspace's address |
+| `GET` | `/authz` | on `authz.sock` only, for nginx |
+
+A workspace as `/api/workspaces` gives it:
+
+```json
+{
+  "name": "alice",
+  "owner": "alice",
+  "url": "https://alice.ws.example.com",
+  "os": "ubuntu",
+  "state": "running",
+  "since": "2026-11-16T09:12:00Z",
+  "appUpdate": true,
+  "signIn": true,
+  "memoryBytes": 3435973836,
+  "bootMemoryBytes": 2147483648,
+  "maxMemoryBytes": 17179869184,
+  "diskBytes": 68719476736,
+  "diskUsedBytes": 44023414784
+}
+```
+
+## The Nix module
+
+```nix
+services.workbench.web = {
+  enable = true;
+  admins = [ "alice" ];
+  oidc = {
+    issuerUrl = "https://sso.example.com/realms/example";
+    clientId = "workbench";
+    clientSecretFile = "/run/secrets/workbench-oidc";
+    cookieSecretFile = "/run/secrets/workbench-cookie";
+  };
+};
+```
+
+It sets up `workbench-web.service`, oauth2-proxy, the nginx virtual host
+for `<domain>` and `auth_request` on every workspace's, the group, the
+socket permissions, the stop marker condition and the polkit rule. Without
+`web.enable`, workspaces are served as before, without SSO.
+
+The Keycloak client is a confidential OIDC client with the one redirect
+URI `https://<domain>/oauth2/callback`, and a mapper that puts the LDAP uid
+in `preferred_username`. A sign-in that starts at a workspace's address
+comes back through that callback, then to the workspace.
+
+## Tests
+
+- Rust: the authorization rule, the `authz` answer and its cookie filter,
+  the state derivation, the sign-in link check, the console fan-out, and
+  the pages and server functions against fake systemd and agent.
+- NixOS: `checks.workspaces` gains Dex as the identity provider, oauth2-proxy
+  and the UI. It signs in as alice and as bob, checks each reaches only their
+  own workspace and gets 403 on the other's, that the app never sees the
+  SSO cookie, that stop survives a reboot of the unit's condition, and that
+  sign-in redirects to a link of the workspace.
+
+## Later
+
+- **Create a workspace:** **New workspace** in the empty state and the bar;
+  the configs go to `/var/lib/workbench/configs`, which the host reads.
+- **A page per workspace** with tabs: Console, then secrets, SSH keys, port
+  previews and the NixOS config. The name in the panel links to it.
+- **Sign in another device**, with a QR code.
+
+## Open
+
+- That Keycloak's `preferred_username` is the LDAP uid in our realm.
+- Whether cloud-hypervisor's serial socket takes more than one client. The
+  shared console doesn't need it, but `workbench console` without
+  `workbench-web` does.
+- T3 Code's `bin/sign-in-link` belongs in t3code-nix. Until then the
+  workbench module writes it, around `t3 auth pairing create --json`.
+- A workspace's app can't use paths under `/oauth2/`: oauth2-proxy has them.
