@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use workbench::config::DEFAULT_CONFIG_DIRS;
-use workbench::launch;
+use workbench::{agent, launch};
 
 /// Persistent per-person workspaces: long-lived cloud-hypervisor VMs.
 #[derive(Parser)]
@@ -30,6 +30,12 @@ enum Command {
         #[arg(long, default_value_t = 90)]
         timeout: u64,
     },
+    /// The agent inside the guest (internal)
+    GuestAgent {
+        /// Workspace settings from the config share
+        #[arg(long, default_value = "/run/workspace/config/workspace.json")]
+        config: PathBuf,
+    },
 }
 
 fn main() {
@@ -50,5 +56,6 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Shutdown { workspace, timeout } => {
             rt()?.block_on(launch::shutdown(&dirs, &workspace, Duration::from_secs(timeout)))
         }
+        Command::GuestAgent { config } => rt()?.block_on(agent::run(&config)),
     }
 }
