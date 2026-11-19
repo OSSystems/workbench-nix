@@ -1,0 +1,86 @@
+[package]
+name = "workbench-web"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "workbench's web UI: a Leptos app rendered on the server and hydrated in the browser"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "workbench-web"
+path = "src/main.rs"
+required-features = ["ssr"]
+
+[dependencies]
+leptos = "0.8.23"
+leptos_meta = "0.8.7"
+leptos_router = "0.8.17"
+send_wrapper = "0.6.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+workbench-model = { path = "../model" }
+
+# The browser's; Leptos builds them on the server too.
+console_error_panic_hook = { version = "0.1.7", optional = true }
+js-sys = "0.3.103"
+# The wasm-bindgen command that makes the site must be this version.
+wasm-bindgen = "=0.2.126"
+web-sys = { version = "0.3.103", features = [
+  "BinaryType", "CssStyleDeclaration", "Document", "Element", "EventSource", "HtmlDialogElement",
+  "HtmlElement", "HtmlInputElement", "KeyboardEvent", "Location", "MediaQueryList", "MessageEvent", "NodeList",
+  "Storage", "WebSocket", "Window",
+] }
+
+# The server's.
+anyhow = { version = "1.0.104", optional = true }
+axum = { version = "0.8.9", optional = true, features = ["ws"] }
+clap = { version = "4.6.8", optional = true, features = ["derive"] }
+futures-util = { version = "0.3.31", optional = true, features = ["sink"] }
+http-body-util = { version = "0.1.5", optional = true }
+hyper = { version = "1.12.0", optional = true, features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", optional = true, default-features = false, features = ["tokio"] }
+jiff = { version = "1.0.1", optional = true }
+leptos_axum = { version = "0.8.10", optional = true }
+tokio = { version = "1.54.1", optional = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5.2", optional = true, features = ["util"] }
+tower-http = { version = "0.6.6", optional = true, features = ["fs", "set-header"] }
+vmkit = { path = "../vmkit", optional = true }
+workbench = { path = "..", optional = true }
+
+[dev-dependencies]
+jiff = "1.0.1"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+hydrate = [
+  "leptos/hydrate",
+  "dep:console_error_panic_hook",
+]
+ssr = [
+  "leptos/nonce",
+  "leptos/ssr",
+  "leptos_meta/ssr",
+  "leptos_router/ssr",
+  "dep:anyhow",
+  "dep:axum",
+  "dep:clap",
+  "dep:futures-util",
+  "dep:http-body-util",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:jiff",
+  "dep:leptos_axum",
+  "dep:tokio",
+  "dep:tower",
+  "dep:tower-http",
+  "dep:vmkit",
+  "dep:workbench",
+]
+
+[lints]
+workspace = true

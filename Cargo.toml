@@ -9,7 +9,7 @@ repository = "https://github.com/OSSystems/workbench-nix"
 publish = false
 
 [workspace]
-members = ["model"]
+members = ["model", "web"]
 # vmkit is the flake's input, linked here by the dev shell and the build.
 exclude = ["vmkit"]
 
@@ -39,3 +39,10 @@ tempfile = "3.27.0"
 
 [lints]
 workspace = true
+
+# The web UI's WebAssembly, small rather than fast.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
