@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use workbench::cli::{self, ExitCode};
 use workbench::config::DEFAULT_CONFIG_DIRS;
 use workbench::memoryd::{self, BehindPool};
+use workbench::self_service::{self, Template};
 use workbench::{agent, launch};
 use workbench_model::Verb;
 
@@ -92,12 +93,36 @@ enum Command {
         #[arg(long = "mem-reserve-min-gib", default_value_t = 2.0)]
         reserve_min_gib: f64,
     },
+    /// Workspaces people make themselves (internal: the web UI's units and
+    /// the boot and reconciliation services)
+    SelfService {
+        /// The host's template for them
+        #[arg(long, default_value = self_service::TEMPLATE)]
+        template: PathBuf,
+        #[command(subcommand)]
+        command: SelfServiceCommand,
+    },
     /// The agent inside the guest (internal)
     GuestAgent {
         /// Workspace settings from the config share
         #[arg(long, default_value = "/run/workspace/config/workspace.json")]
         config: PathBuf,
     },
+}
+
+// The comments are the help text, written for people, not rustdoc.
+#[allow(clippy::doc_markdown)]
+#[derive(Subcommand)]
+enum SelfServiceCommand {
+    /// Make the workspace the web UI asked for
+    Create { workspace: String },
+    /// Stop a workspace made at run time and delete it
+    Destroy { workspace: String },
+    /// Put back, at boot, the users and taps of workspaces made at run time,
+    /// and start them
+    Setup,
+    /// Stop the workspaces of owners who left
+    Reconcile,
 }
 
 #[derive(clap::Args)]
@@ -137,6 +162,17 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Memory { status_file, behind, reserve_percent, reserve_min_gib } => rt()?
             .block_on(memoryd::run(memoryd::Options { dirs, status_file, behind, reserve_percent, reserve_min_gib })),
         Command::GuestAgent { config } => rt()?.block_on(agent::run(&config)),
+        Command::SelfService { template, command } => {
+            let t = Template::load(&template)?;
+            rt()?.block_on(async {
+                match command {
+                    SelfServiceCommand::Create { workspace } => self_service::create(&dirs, &t, &workspace).await,
+                    SelfServiceCommand::Destroy { workspace } => self_service::destroy(&t, &workspace).await,
+                    SelfServiceCommand::Setup => self_service::setup(&t).await,
+                    SelfServiceCommand::Reconcile => self_service::reconcile(&t).await,
+                }
+            })
+        }
         Command::Start { workspace, state } => {
             rt()?.block_on(cli::control(&dirs, &state.path, Verb::Start, &workspace))
         }

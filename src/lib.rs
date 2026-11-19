@@ -11,4 +11,5 @@ pub mod cli;
 pub mod config;
 pub mod launch;
 pub mod memoryd;
+pub mod self_service;
 pub mod state;

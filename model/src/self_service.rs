@@ -1,0 +1,247 @@
+//! Workspaces people make themselves: the name rule, the SSH keys they
+//! paste, the host's limits and quotas, and the request the web UI hands
+//! to the host. Both check a request with the same code.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::is_workspace_name;
+
+/// The smallest disk a workspace made at run time gets.
+pub const MIN_DISK_GIB: i64 = 16;
+/// The most SSH keys a request carries.
+pub const MAX_SSH_KEYS: usize = 16;
+/// The longest SSH key line.
+const MAX_SSH_KEY: usize = 8192;
+
+/// The key types a pasted SSH key may have.
+const SSH_KEY_TYPES: [&str; 7] = [
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+];
+
+/// A uid as the start of workspace names: `.` and `_` become `-`, so
+/// `samuel.silva` owns `samuel-silva` and `samuel-silva-<suffix>`.
+#[must_use]
+pub fn slug(uid: &str) -> String {
+    uid.replace(['.', '_'], "-")
+}
+
+/// Whether `owner` may name a workspace `name`: their slug, or their slug,
+/// a dash and a suffix, and a workspace name either way.
+pub fn check_name(owner: &str, name: &str) -> Result<(), String> {
+    let slug = slug(owner);
+    let theirs =
+        name == slug || name.strip_prefix(&slug).and_then(|r| r.strip_prefix('-')).is_some_and(|s| !s.is_empty());
+    if !theirs {
+        return Err(format!("The name must be {slug} or start with {slug}-."));
+    }
+    if !is_workspace_name(name) {
+        return Err(
+            "The name must be lowercase letters, digits and dashes, at most 28 characters, starting with a letter."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The SSH keys in pasted text, one per line, `<type> <key> [comment]`;
+/// blank lines are skipped.
+pub fn parse_ssh_keys(text: &str) -> Result<Vec<String>, String> {
+    let mut keys = Vec::new();
+    for (i, line) in text.lines().map(str::trim).enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let n = i + 1;
+        let mut parts = line.split_ascii_whitespace();
+        let (Some(kind), Some(blob)) = (parts.next(), parts.next()) else {
+            return Err(format!("SSH key on line {n}: expected <type> <key> [comment]."));
+        };
+        if !SSH_KEY_TYPES.contains(&kind) {
+            return Err(format!("SSH key on line {n}: {kind:?} isn't a key type the host takes."));
+        }
+        let base64 =
+            blob.len() >= 16 && blob.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='));
+        if !base64 || line.len() > MAX_SSH_KEY || line.chars().any(char::is_control) {
+            return Err(format!("SSH key on line {n} isn't a public key."));
+        }
+        let comment: Vec<&str> = parts.collect();
+        keys.push(if comment.is_empty() {
+            format!("{kind} {blob}")
+        } else {
+            format!("{kind} {blob} {}", comment.join(" "))
+        });
+    }
+    if keys.len() > MAX_SSH_KEYS {
+        return Err(format!("At most {MAX_SSH_KEYS} SSH keys."));
+    }
+    Ok(keys)
+}
+
+/// What the host lets people make, from the Nix configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Limits {
+    /// The guest systems offered.
+    pub os: Vec<String>,
+    /// What every VM boots with.
+    #[serde(rename = "bootMemMiB")]
+    pub boot_mem_mib: i64,
+    /// The most memory a VM may grow to.
+    #[serde(rename = "maxMemoryGiB")]
+    pub max_memory_gib: i64,
+    #[serde(rename = "maxDiskGiB")]
+    pub max_disk_gib: i64,
+    /// How many workspaces a person may make, unless an admin set theirs.
+    pub quota: u32,
+}
+
+impl Limits {
+    /// The least a VM may be allowed to grow to: its boot memory.
+    #[must_use]
+    pub fn min_memory_gib(&self) -> i64 {
+        (self.boot_mem_mib + 1023) / 1024
+    }
+}
+
+/// A person's quota: what an admin set for them, or the host's.
+#[must_use]
+pub fn quota_of(quotas: &BTreeMap<String, u32>, default: u32, user: &str) -> u32 {
+    quotas.get(user).copied().unwrap_or(default)
+}
+
+/// A workspace someone asks for: what the web UI writes and the host's
+/// `workbench self-service create` makes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Request {
+    pub name: String,
+    pub owner: String,
+    pub os: String,
+    pub ssh_authorized_keys: Vec<String>,
+    #[serde(rename = "maxMemoryGiB")]
+    pub max_memory_gib: i64,
+    #[serde(rename = "diskGiB")]
+    pub disk_gib: i64,
+}
+
+impl Request {
+    /// Checks the name rule and the limits; the quota and whether the
+    /// name is free need the host.
+    pub fn check(&self, limits: &Limits) -> Result<(), String> {
+        check_name(&self.owner, &self.name)?;
+        if !limits.os.contains(&self.os) {
+            return Err(format!("{:?} isn't a system this host offers.", self.os));
+        }
+        let keys = parse_ssh_keys(&self.ssh_authorized_keys.join("\n"))?;
+        if keys != self.ssh_authorized_keys {
+            return Err("SSH keys must be one per entry.".into());
+        }
+        let (lo, hi) = (limits.min_memory_gib(), limits.max_memory_gib);
+        if !(lo..=hi).contains(&self.max_memory_gib) {
+            return Err(format!("Memory must be from {lo} to {hi} GiB."));
+        }
+        if !(MIN_DISK_GIB..=limits.max_disk_gib).contains(&self.disk_gib) {
+            return Err(format!("Disk must be from {MIN_DISK_GIB} to {} GiB.", limits.max_disk_gib));
+        }
+        Ok(())
+    }
+}
+
+/// How a request ended, for the web UI to say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Outcome {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+/// What the New workspace page shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewView {
+    pub limits: Limits,
+    /// The viewer's slug, which names start with.
+    pub slug: String,
+    /// Workspaces made at run time the viewer owns, and their quota.
+    pub owned: u32,
+    pub quota: u32,
+}
+
+/// A person on the host page's quotas.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaRow {
+    pub user: String,
+    pub owned: u32,
+    pub quota: u32,
+    /// Whether an admin set it, rather than the host's default.
+    pub own: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbJhk5H0h7Oi79LSHLWfuffv6uFcuXtm77kewxrwQsD";
+
+    #[test]
+    fn names_start_with_the_owners_slug() {
+        assert_eq!(slug("samuel.silva"), "samuel-silva");
+        assert!(check_name("samuel.silva", "samuel-silva").is_ok());
+        assert!(check_name("samuel.silva", "samuel-silva-data").is_ok());
+        assert!(check_name("samuel.silva", "samuel.silva").is_err(), "a dot never makes a host name");
+        assert!(check_name("samuel.silva", "samuel-silva-").is_err());
+        assert!(check_name("samuel.silva", "samuel-silvas").is_err());
+        assert!(check_name("bob", "alice").is_err());
+        assert!(check_name("ana_paula", "ana-paula").is_ok(), "an underscore becomes a dash too");
+        assert!(check_name("ana_paula", "ana_paula").is_err(), "still a DNS label");
+        assert!(check_name("alice", "alice-a-name-much-too-long-here").is_err());
+    }
+
+    #[test]
+    fn ssh_keys() {
+        assert_eq!(parse_ssh_keys(&format!("\n {KEY}  me@laptop \n\n")).unwrap(), [format!("{KEY} me@laptop")]);
+        assert_eq!(parse_ssh_keys(KEY).unwrap(), [KEY]);
+        assert!(parse_ssh_keys("ssh-dss AAAAB3NzaC1kc3MAAACBAP").is_err());
+        assert!(parse_ssh_keys("ssh-ed25519").is_err());
+        assert!(parse_ssh_keys("command=\"x\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA").is_err(), "no options");
+        assert!(parse_ssh_keys("ssh-ed25519 not*base64*at*all*!").is_err());
+        assert!(parse_ssh_keys(&format!("{KEY}\n").repeat(MAX_SSH_KEYS + 1)).is_err());
+        assert!(parse_ssh_keys("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn requests_within_the_limits() {
+        let limits =
+            Limits { os: vec!["ubuntu".into()], boot_mem_mib: 2048, max_memory_gib: 16, max_disk_gib: 128, quota: 1 };
+        let ok = Request {
+            name: "alice".into(),
+            owner: "alice".into(),
+            os: "ubuntu".into(),
+            ssh_authorized_keys: vec![KEY.into()],
+            max_memory_gib: 8,
+            disk_gib: 64,
+        };
+        assert_eq!(ok.check(&limits), Ok(()));
+        for bad in [
+            Request { os: "nixos".into(), ..ok.clone() },
+            Request { max_memory_gib: 1, ..ok.clone() },
+            Request { max_memory_gib: 17, ..ok.clone() },
+            Request { disk_gib: 8, ..ok.clone() },
+            Request { disk_gib: 129, ..ok.clone() },
+            Request { name: "bob".into(), ..ok.clone() },
+            Request { ssh_authorized_keys: vec![format!("{KEY}\n{KEY}")], ..ok.clone() },
+        ] {
+            assert!(bad.check(&limits).is_err(), "{bad:?}");
+        }
+        let quotas = BTreeMap::from([("alice".to_owned(), 3)]);
+        assert_eq!((quota_of(&quotas, 1, "alice"), quota_of(&quotas, 1, "bob")), (3, 1));
+    }
+}
