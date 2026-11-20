@@ -46,14 +46,19 @@ enum Command {
         #[command(flatten)]
         state: StateRoot,
     },
-    /// Restart a workspace, with the app and system now on the host
+    /// Restart a workspace, with the apps and packages now on the host
     Restart {
         workspace: String,
         #[command(flatten)]
         state: StateRoot,
     },
-    /// Print a link that signs a browser in to the workspace's app
-    SignIn { workspace: String },
+    /// Print a link that signs a browser in to an app of the workspace
+    #[command(alias = "sign-in")]
+    OpenLink {
+        workspace: String,
+        /// The app's id; a workspace with one app needs none
+        app: Option<String>,
+    },
     /// Attach to the serial console (Ctrl-] quits)
     Console { workspace: String },
     /// Stop a workspace and delete its disk
@@ -116,6 +121,8 @@ enum Command {
 enum SelfServiceCommand {
     /// Make the workspace the web UI asked for
     Create { workspace: String },
+    /// Give a workspace made at run time the apps the web UI asked for
+    Apps { workspace: String },
     /// Stop a workspace made at run time and delete it
     Destroy { workspace: String },
     /// Put back, at boot, the users and taps of workspaces made at run time,
@@ -166,6 +173,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                 match command {
                     SelfServiceCommand::Create { workspace } => self_service::create(&dirs, &t, &workspace).await,
                     SelfServiceCommand::Destroy { workspace } => self_service::destroy(&t, &workspace).await,
+                    SelfServiceCommand::Apps { workspace } => self_service::apps(&t, &workspace).await,
                     SelfServiceCommand::Setup => self_service::setup(&t).await,
                     SelfServiceCommand::Reconcile => self_service::reconcile(&t).await,
                 }
@@ -178,7 +186,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Restart { workspace, state } => {
             rt()?.block_on(cli::control(&dirs, &state.path, Verb::Restart, &workspace))
         }
-        Command::SignIn { workspace } => rt()?.block_on(cli::sign_in(&dirs, &workspace)),
+        Command::OpenLink { workspace, app } => rt()?.block_on(cli::open_link(&dirs, &workspace, app.as_deref())),
         Command::Status { json, state_root } => {
             rt()?.block_on(cli::status(&mut std::io::stdout().lock(), &dirs, &state_root, json))
         }

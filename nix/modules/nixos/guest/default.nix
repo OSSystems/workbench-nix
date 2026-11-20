@@ -1,8 +1,8 @@
-# What makes a NixOS system a workspace. The host shares the app's
-# closure, the workspace's settings and its secrets over virtiofs; at every
-# boot this module mounts them, copies the closure into the guest's own
-# store, and sets the network, the owner, SSH, the agent and the app up from
-# them. Everything else is the owner's: it is imported by the system the
+# What makes a NixOS system a workspace. The host shares the closure of
+# its packages and apps, the workspace's settings and its secrets over
+# virtiofs; at every boot this module mounts them, copies the closure into
+# the guest's own store, and sets the network, the owner, SSH and the agent
+# up from them. The agent runs the apps. Everything else is the owner's: it is imported by the system the
 # host builds for a new disk, and by the flake the owner rebuilds after.
 {
   config,
@@ -52,15 +52,6 @@ let
     done
   '';
 
-  startApp = pkgs.writeShellScript "workspace-app" ''
-    set -eu
-    owner=$(${jq} -r .owner ${workspaceJSON})
-    home=$(${lib.getExe' pkgs.getent "getent"} passwd "$owner" | cut -d: -f6)
-    cd "$home"
-    export HOME="$home" USER="$owner" LOGNAME="$owner"
-    export PATH="/run/wrappers/bin:$home/.nix-profile/bin:/etc/profiles/per-user/$owner/bin:/run/current-system/sw/bin"
-    exec ${pkgs.util-linux}/bin/setpriv --reuid="$owner" --regid="$(id -g "$owner")" --init-groups ${app}/bin/serve
-  '';
 in
 {
   imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];
@@ -172,6 +163,12 @@ in
         fi
         nix-store --load-db < ${configDir}/registration
         ln -sfn "$(readlink ${app})" /nix/var/nix/gcroots/workspace-app
+        rm -f /nix/var/nix/gcroots/workspace-app-*
+        for bundle in ${configDir}/apps/*; do
+          if [ -e "$bundle" ]; then
+            ln -sfn "$(readlink "$bundle")" "/nix/var/nix/gcroots/workspace-app-''${bundle##*/}"
+          fi
+        done
       '';
     };
 
@@ -199,8 +196,9 @@ in
       '';
     };
 
+    # It runs each app as a unit of its own, workspace-app-<id>.
     workspace-agent = {
-      description = "Workspace agent: memory reports and host requests";
+      description = "Workspace agent: memory reports, apps and host requests";
       wantedBy = [ "multi-user.target" ];
       requires = [ "workspace-store.service" ];
       after = [ "workspace-store.service" ];
@@ -208,32 +206,6 @@ in
         ExecStart = "${app}/bin/workspace-agent";
         Restart = "always";
         RestartSec = 2;
-      };
-    };
-
-    workspace-app = {
-      description = "Workspace app";
-      wantedBy = [ "multi-user.target" ];
-      requires = [
-        "workspace-store.service"
-        "workspace-init.service"
-      ];
-      wants = [ "network-online.target" ];
-      after = [
-        "workspace-store.service"
-        "workspace-init.service"
-        "network-online.target"
-      ];
-      unitConfig.RequiresMountsFor = [ secretsDir ];
-      serviceConfig = {
-        EnvironmentFile = [
-          "${configDir}/environment"
-          "-${secretsDir}/environment"
-        ];
-        ExecStart = startApp;
-        Restart = "always";
-        RestartSec = 5;
-        KillMode = "mixed";
       };
     };
   };

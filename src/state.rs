@@ -1,6 +1,6 @@
-//! What a workspace is doing, from its unit, its VM and its agent; start,
-//! stop and restart; and the app's sign-in link. The CLI and the web UI
-//! both call these.
+//! What a workspace is doing, from its unit, its VM and its agent; what
+//! its next start changes; start, stop and restart; and an app's sign-in
+//! link. The CLI and the web UI both call these.
 
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use tokio::process::Command;
 use vmkit::ch::Client;
 use vmkit::hostutil;
 use vmkit::memory::MIB;
+use workbench_model::apps::{self, App, Boot, BootApp, app_url};
 use workbench_model::{State, Verb, Workspace, is_workspace_name};
 
 use crate::agent::{self, Request};
@@ -19,8 +20,8 @@ use crate::config::{self, Config};
 
 /// How long each VM may take to answer the API and the agent.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long the app's sign-in hook may take, the agent's minute and some.
-pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long an app's sign-in hook may take, the agent's minute and some.
+pub const OPEN_LINK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The unit of a workspace.
 #[must_use]
@@ -164,6 +165,8 @@ async fn probe(dirs: &[PathBuf], state_root: &Path, name: String, u: UnitInfo) -
         disk = c.disk();
         ws.boot_memory_bytes = c.boot_mem_mib * MIB;
         ws.max_memory_bytes = c.max_mem_mib * MIB;
+        let mut open_links = vec![];
+        let mut running = None;
         if matches!(u.active.as_str(), "active" | "deactivating") {
             if let Ok(Ok(info)) = tokio::time::timeout(PROBE_TIMEOUT, Client::new(c.api_socket()).info()).await {
                 ws.vm = info.state;
@@ -171,16 +174,24 @@ async fn probe(dirs: &[PathBuf], state_root: &Path, name: String, u: UnitInfo) -
                 match agent::ask(&c, &Request { op: "ping".into(), args: vec![] }, PROBE_TIMEOUT).await {
                     Ok(reply) => {
                         ws.agent = "up".into();
-                        ws.sign_in = reply.sign_in;
+                        open_links = reply.open_links;
                         agent_up = true;
                     }
                     Err(_) => ws.agent = "down".into(),
                 }
             }
-            if let Ok(started) = hostutil::read_bounded(c.started_app(), 4096) {
-                ws.app_update = String::from_utf8_lossy(&started).trim() != c.app;
-            }
+            running = booted(&c);
         }
+        let next = c.boot();
+        ws.changes = apps::changes(running.as_ref(), &next);
+        ws.apps = union(&next, running.as_ref())
+            .map(|a| App {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                url: app_url(&c.url, &a.id),
+                open_link: open_links.contains(&a.id),
+            })
+            .collect();
     }
     ws.state = derive_state(&u, &ws.vm, agent_up);
     ws.since = since(&u, ws.state);
@@ -191,6 +202,32 @@ async fn probe(dirs: &[PathBuf], state_root: &Path, name: String, u: UnitInfo) -
     }
     ws.name = name;
     ws
+}
+
+/// What the running VM booted with, from the record `workbench run` left;
+/// none before it is written. A VM a host from before apps started left
+/// only its packages, and runs no app the host knows of.
+#[must_use]
+pub fn booted(c: &Config) -> Option<Boot> {
+    if let Ok(raw) = hostutil::read_bounded(c.booted(), 1 << 20) {
+        return serde_json::from_slice(&raw).ok();
+    }
+    let old = hostutil::read_bounded(Path::new(&c.runtime_dir).join("app"), 4096).ok()?;
+    Some(Boot { packages: String::from_utf8_lossy(&old).trim().to_owned(), apps: vec![] })
+}
+
+/// The config's apps, then those only `running` has.
+fn union<'a>(next: &'a Boot, running: Option<&'a Boot>) -> impl Iterator<Item = &'a BootApp> {
+    let only_running = running.into_iter().flat_map(|r| &r.apps).filter(|a| next.app(&a.id).is_none());
+    next.apps.iter().chain(only_running)
+}
+
+/// The apps a browser may reach now: the config's, and those the running
+/// VM has that its next start leaves out.
+#[must_use]
+pub fn reachable_apps(c: &Config) -> Vec<BootApp> {
+    let running = booted(c);
+    union(&c.boot(), running.as_ref()).cloned().collect()
 }
 
 /// Keeps a stopped workspace stopped across host reboots: its unit has
@@ -243,7 +280,7 @@ pub async fn control(state_root: &Path, verb: Verb, name: &str, wait: bool) -> a
 
 /// Why a workspace's app gave no sign-in link.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SignInError {
+pub enum OpenLinkError {
     /// The agent does not answer.
     Starting(String),
     /// The hook failed, with its exit code and what it printed on stderr.
@@ -254,47 +291,47 @@ pub enum SignInError {
     Timeout,
 }
 
-impl std::fmt::Display for SignInError {
+impl std::fmt::Display for OpenLinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SignInError::Starting(d) => write!(f, "the guest agent isn't answering: {d}"),
-            SignInError::Failed { exit_code: 0, detail } => write!(f, "the sign-in hook failed: {detail}"),
-            SignInError::Failed { exit_code, detail } => {
+            OpenLinkError::Starting(d) => write!(f, "the guest agent isn't answering: {d}"),
+            OpenLinkError::Failed { exit_code: 0, detail } => write!(f, "the sign-in hook failed: {detail}"),
+            OpenLinkError::Failed { exit_code, detail } => {
                 write!(f, "the sign-in hook failed (exit status {exit_code}): {detail}")
             }
-            SignInError::NotALink => {
+            OpenLinkError::NotALink => {
                 f.write_str("the sign-in hook printed something that isn't a link to the workspace")
             }
-            SignInError::Timeout => f.write_str("the app took too long to answer"),
+            OpenLinkError::Timeout => f.write_str("the app took too long to answer"),
         }
     }
 }
 
-impl std::error::Error for SignInError {}
+impl std::error::Error for OpenLinkError {}
 
-/// Asks the workspace's app, through the agent, for a link that signs a
-/// browser in to it.
-pub async fn sign_in_link(c: &Config) -> Result<String, SignInError> {
-    let req = Request { op: "sign-in".into(), args: vec![] };
-    let reply = match agent::exchange(c, &req, SIGN_IN_TIMEOUT).await {
-        Err(agent::AskError::Timeout) => return Err(SignInError::Timeout),
-        Err(agent::AskError::Unreachable(e)) => return Err(SignInError::Starting(format!("{e:#}"))),
+/// Asks an app of the workspace, through the agent, for a link that signs
+/// a browser in to it.
+pub async fn open_link(c: &Config, app: &str) -> Result<String, OpenLinkError> {
+    let req = Request { op: "open-link".into(), args: vec![app.to_owned()] };
+    let reply = match agent::exchange(c, &req, OPEN_LINK_TIMEOUT).await {
+        Err(agent::AskError::Timeout) => return Err(OpenLinkError::Timeout),
+        Err(agent::AskError::Unreachable(e)) => return Err(OpenLinkError::Starting(format!("{e:#}"))),
         Ok(reply) => reply,
     };
     if !reply.error.is_empty() {
-        return Err(SignInError::Failed { exit_code: 0, detail: reply.error });
+        return Err(OpenLinkError::Failed { exit_code: 0, detail: reply.error });
     }
     if reply.exit_code != 0 {
-        return Err(SignInError::Failed { exit_code: reply.exit_code, detail: reply.stderr.trim().to_owned() });
+        return Err(OpenLinkError::Failed { exit_code: reply.exit_code, detail: reply.stderr.trim().to_owned() });
     }
-    check_sign_in_link(&reply.stdout, &c.url).ok_or(SignInError::NotALink)
+    check_open_link(&reply.stdout, &app_url(&c.url, app)).ok_or(OpenLinkError::NotALink)
 }
 
 /// Accepts what the hook printed only if it is one absolute URL on the
-/// workspace's own origin, so the UI cannot be made to send a browser
-/// anywhere else.
+/// app's own origin, so the UI cannot be made to send a browser anywhere
+/// else.
 #[must_use]
-pub fn check_sign_in_link(out: &str, base: &str) -> Option<String> {
+pub fn check_open_link(out: &str, base: &str) -> Option<String> {
     let link = out.trim();
     if link.is_empty() || link.contains(char::is_whitespace) {
         return None;
@@ -351,23 +388,25 @@ mod tests {
     /// The UI redirects a browser to whatever the hook prints, so only a
     /// link on the workspace's own origin passes.
     #[test]
-    fn sign_in_link_check() {
-        let base = "https://alice.ws.test";
+    fn open_link_check() {
+        let base = "https://alice--t3code.ws.test";
         for (out, ok) in [
-            ("https://alice.ws.test/pair#token=abc\n", true),
-            ("https://alice.ws.test", true),
-            ("https://evil.test/?alice.ws.test", false),
-            ("https://alice.ws.test.evil.test/", false),
-            ("http://alice.ws.test/", false),
-            ("https://alice.ws.test:8443/", false),
-            ("https://user@alice.ws.test/", false),
-            ("Pairing link: https://alice.ws.test/x", false),
-            ("https://alice.ws.test/a\nhttps://b/", false),
+            ("https://alice--t3code.ws.test/pair#token=abc\n", true),
+            ("https://alice--t3code.ws.test", true),
+            ("https://alice.ws.test/pair#token=abc", false),
+            ("https://alice--other.ws.test/", false),
+            ("https://evil.test/?alice--t3code.ws.test", false),
+            ("https://alice--t3code.ws.test.evil.test/", false),
+            ("http://alice--t3code.ws.test/", false),
+            ("https://alice--t3code.ws.test:8443/", false),
+            ("https://user@alice--t3code.ws.test/", false),
+            ("Pairing link: https://alice--t3code.ws.test/x", false),
+            ("https://alice--t3code.ws.test/a\nhttps://b/", false),
             ("//evil.test/", false),
             ("javascript:alert(1)", false),
             ("", false),
         ] {
-            assert_eq!(check_sign_in_link(out, base).is_some(), ok, "{out:?}");
+            assert_eq!(check_open_link(out, base).is_some(), ok, "{out:?}");
         }
     }
 
@@ -384,6 +423,26 @@ mod tests {
         u.active = "active".into();
         assert_eq!(since(&u, State::Running), Some(up));
         assert_eq!(since(&u, State::Stopped), Some(down));
+    }
+
+    /// What the VM booted with: the record, or for one a host from before
+    /// apps started, its packages and no app.
+    #[test]
+    fn booted_records() {
+        let mut c = crate::config::tests::test_config();
+        let dir = tempfile::tempdir().unwrap();
+        c.runtime_dir = dir.path().to_string_lossy().into();
+        assert_eq!(booted(&c), None);
+        std::fs::write(dir.path().join("app"), "/nix/store/old-app\n").unwrap();
+        let old = booted(&c).unwrap();
+        assert_eq!((old.packages.as_str(), old.apps.len()), ("/nix/store/old-app", 0));
+        assert_eq!(apps::changes(Some(&old), &c.boot()).len(), 2, "its app comes, and new packages");
+        std::fs::write(c.booted(), serde_json::to_vec(&c.boot()).unwrap()).unwrap();
+        assert_eq!(booted(&c), Some(c.boot()));
+        let running = c.boot();
+        c.apps.clear();
+        std::fs::write(c.booted(), serde_json::to_vec(&running).unwrap()).unwrap();
+        assert_eq!(reachable_apps(&c), running.apps, "an app that goes at the next start is reached until then");
     }
 
     #[test]
