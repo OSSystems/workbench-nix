@@ -7,9 +7,12 @@ and `services.workbench.web` sets it up.
 
 ## Premises
 
-- **One address.** The UI is at `https://<domain>`, each workspace at
-  `https://<ws>.<domain>`. One certificate covers `<domain>` and
+- **One address.** The UI is at `https://<domain>`, each app of a
+  workspace at `https://<ws>--<app>.<domain>`, and `https://<ws>.<domain>`
+  leads to the workspace's panel. One certificate covers `<domain>` and
   `*.<domain>`.
+- **A workspace is a VM; apps are what runs in it.** None, one or several,
+  and none is its main one. See [Apps](#apps).
 - **Single sign-on everywhere.** Keycloak, through oauth2-proxy, guards the
   UI and every workspace. Nobody reaches a workspace's app without signing in,
   whatever the app does about accounts.
@@ -36,8 +39,9 @@ and `services.workbench.web` sets it up.
 ```
 browser ──► nginx ──auth_request──► oauth2-proxy ──OIDC──► Keycloak
               │
-              ├─ <domain>        ──► workbench web   (unix socket)
-              └─ <ws>.<domain>   ──► the workspace's app  (after an owner check)
+              ├─ <domain>              ──► workbench web   (unix socket)
+              ├─ <ws>--<app>.<domain>  ──► that app in the VM  (after an owner check)
+              └─ <ws>.<domain>         ──► 302 to <domain>/?w=<ws>
 ```
 
 - **oauth2-proxy** is the Keycloak client. It lives at `/oauth2/` on every
@@ -65,19 +69,24 @@ browser ──► nginx ──auth_request──► oauth2-proxy ──OIDC─�
 
 ### Workspaces behind SSO
 
-All workspaces share one virtual host, `*.<domain>`, so a workspace made at
-run time needs no nginx reload. It takes the workspace's name from the host
-name and has an `auth_request` to `workbench-web`'s authorization socket
-(`/run/workbench-web/authz.sock`, `GET /authz`). That gets the name and the
-browser's cookies, and:
+All apps of all workspaces share one virtual host, `*.<domain>`, so a
+workspace made at run time, or an app added to one, needs no nginx reload.
+It takes the workspace's name and the app's id from the host name,
+`<ws>--<app>`; workspace names have no `--`, and app ids no dash, so it
+reads one way. A host name without an app is sent to the workspace's
+panel. The rest has an `auth_request` to `workbench-web`'s authorization
+socket (`/run/workbench-web/authz.sock`, `GET /authz`). That gets the two
+names and the browser's cookies, and:
 
 1. asks oauth2-proxy (`/oauth2/auth`) who the cookie belongs to and their
    groups;
 2. answers `401` when nobody is signed in (nginx redirects to
    `/oauth2/start?rd=<the URL>`), `403` when the user may not use the
-   workspace (see [who may what](#who-may-what)), `200` otherwise;
+   workspace (see [who may what](#who-may-what)) or it hasn't the app, `200`
+   otherwise. An app it has is one of its config's, or one the running VM
+   has that its next start leaves out;
 3. with the `200`, returns the app's address in `X-Workbench-Upstream`
-   (`<ip>:<appPort>`, from the config), which nginx proxies to, and the
+   (`<ip>:<port>`, from the config), which nginx proxies to, and the
    cookies minus `_workbench_auth*` in `X-Workbench-Cookie`, which nginx
    sends to the app instead of the browser's. **The app never sees the SSO
    cookie**, so code running in a workspace can't replay it against the UI
@@ -93,8 +102,8 @@ What oauth2-proxy says about the SSO cookie, the user and the groups, is
 cached for 10 s per SSO cookie; the app's cookies are no part of the key.
 The decision and the address are made for each request, from that and the
 workspace's config. On a 403, nginx shows the UI's `/denied` page at the
-workspace's address, styled from `https://<domain>`, with a link back to
-it.
+app's address, styled from `https://<domain>`: "isn't yours", or, for a
+workspace of the viewer's, that it has no such app and a link to its panel.
 
 The check lives in `workbench-web`, not in nginx, so runtime configs, the
 groups, the admin list and the owner rule are in one tested place.
@@ -112,12 +121,51 @@ A workspace made at run time is reachable by its owner only while the
 owner is in a self-service group: leaving the group cuts it off at the next
 session refresh, before the reconciliation below stops its VM.
 
+## Apps
+
+An app is what runs in a workspace and is opened from a browser, at an
+address of its own, `<ws>--<app>.<domain>`, so each is an origin of its own
+and their cookies never mix. The host offers them,
+`services.workbench.apps`; each workspace says which it has, from none to
+all. T3 Code, `t3code`, is the one there is now; a terminal app is for
+later, and it would be another kind, opened in the UI rather than at an
+address.
+
+An app is a bundle the host shares with the guest at `config/apps/<id>`:
+`bin/serve`, which the guest agent runs at every boot as the owner, as a
+unit of its own, `workspace-app-<id>`, with `APP_PORT` and `APP_URL`; and,
+if the app has a sign-in of its own, `bin/open-link`, which prints a
+one-time link that signs a browser in to it.
+
+**What the VM booted with stays until it restarts.** The config says what
+the next start boots: the workspace's packages and its apps, each at a
+version. `workbench run` writes what it boots to `<runtimeDir>/booted.json`.
+Their difference, computed in one place, `workbench_model::apps::changes`,
+is everything that waits for a restart:
+
+| Change | Comes from | The panel says |
+|---|---|---|
+| `appAdded` | an app in the config, not in the VM | "T3 Code comes with the next restart." It doesn't open until then. |
+| `appRemoved` | an app in the VM, not in the config | "T3 Code goes with the next restart." It still opens until then. |
+| `appUpdated` | another bundle or port | "A new version of T3 Code comes with the next restart." |
+| `packages` | another packages bundle | "New packages come with the next restart." |
+
+A VM that doesn't run has no changes: its next start boots the config
+whatever it is. Each app's stage, ready, coming, going or updating, and
+whether it opens now, follow from the changes; the UI renders them and
+decides nothing. Anything else a restart brings later, such as memory, is
+one more kind of change.
+
+A VM a host from before apps started left `<runtimeDir>/app` instead: it
+runs no app the host knows of, so its apps come with its next restart.
+
 ## Screens
 
 ```
 https://<domain>/                    Workspaces
 https://<domain>/?w=<ws>             Workspaces, with <ws> in the side panel
-https://<domain>/w/<ws>/sign-in      Sign in to <ws>'s app
+https://<domain>/w/<ws>/open/<app>   Open <app> of <ws>
+https://<domain>/w/<ws>/apps         The apps of a workspace made at run time
 https://<domain>/w/<ws>/console      Serial console
 https://<domain>/host                Host memory and quotas (admins)
 https://<domain>/new                 New workspace (self-service)
@@ -134,16 +182,16 @@ groups by state (Running, Starting, Failing, Stopped), with chips to filter
 by All, Running and Stopped. Admins get a chip for **Mine** and an Owner
 column.
 
-A row has the status dot, the name, a short note (the address, "booting",
-"since Nov 3"), the system, the memory and one primary action:
+A row has the status dot, the name, a short note (its apps, "T3 Code after
+a restart", "no apps", "booting", "since Nov 3"), the system, the memory and
+one primary action:
 
 | State | Primary action |
 |---|---|
-| Running, the app was never opened from this browser | **Open and sign in** |
-| Running | **Open** |
-| Starting | **Open** (the app may already answer) |
+| Running, with an app | **Open**, its first app, with a one-time link the first time from this browser |
+| Starting, with an app | **Open** (the app may already answer) |
+| Running or Starting without one, Failing | **Console** |
 | Stopped | **Start** |
-| Failing | **Console** |
 | Stopping, Restarting | none; the row says what it waits for |
 
 **A line along the bottom edge of each row is its memory:** its length is
@@ -151,13 +199,21 @@ what the VM holds now out of the most it may grow to. Sage while running,
 amber while starting, red while failing; a stopped workspace has none.
 
 **The side panel** shows the selected workspace: name, status and since
-when, the update notice, then Address, Owner (admins), System, Memory (a
-meter with a tick at the boot size), Disk on host, and the actions:
+when, what waits for a restart, then Owner (admins), System, Memory (a
+meter with a tick at the boot size), Disk on host, its apps and the
+actions:
 
-- **Open** (`↵`)
-- **Sign in to app** (`S`), only when the app supports it
+- **Apps**: each app's **Open `<app>`**, the first primary (`↵`), and a ⋯
+  menu with **Open on another device…**, **Open with a new link** and
+  **Copy address**. An app that comes with the next restart shows
+  "T3 Code · after a restart", disabled. A workspace made at run time has
+  **Edit…** there, and without apps a dashed box, "No apps yet", with
+  **Add an app…**; one from the Nix configuration says its console is the
+  way in.
+- **Start `<ws>`**, when stopped
 - **Console** (`C`)
-- **Restart…** (`R`), unless it is stopped
+- **Restart…** (`R`), unless it is stopped; primary when something waits
+  for it
 - **Stop…**, apart at the bottom below a rule, plain: its dialog says what
   it costs
 - **Destroy…**, at the other end of that row, in red, only for a workspace
@@ -166,8 +222,7 @@ meter with a tick at the boot size), Disk on host, and the actions:
 On a phone the panel is a page of its own (`/?w=<ws>` with the list
 hidden), reached by tapping a row.
 
-Keyboard: `J`/`K` move, `↵` opens, `S` signs in, `C` opens the console, `R`
-restarts, `/` or `Ctrl K` focuses the command field. Shortcuts never act on
+Keyboard: `J`/`K` move, `↵` opens, `C` opens the console, `R` restarts, `/` or `Ctrl K` focuses the command field. Shortcuts never act on
 their own; Restart and Stop still open their dialog.
 
 #### States
@@ -191,61 +246,83 @@ has a label, never only a color.
   workspace** for whoever may create one; that an admin creates it for
   everyone else.
 - **Starting:** "booting"; a NixOS workspace takes longer on its first boot
-  after an update, while it copies the app onto its disk.
+  after an update, while it copies the apps onto its disk.
 - **Failing:** a notice in the panel: "The VM won't stay up. Its console
   shows why." with **Console** and **Restart…**.
-- **App update:** "A new app version is on the host. Restart to use it." with
-  **Restart…** (see [App updates](#app-updates)).
+- **Waiting for a restart:** what the next start changes, as above, with
+  **Restart…** primary.
 - **Lost connection:** when the live updates drop, a bar says "Reconnecting…
   Showing the state at 10:42." and actions stay enabled: they are plain
   forms, and their answer says if they failed.
 
-### Sign in to app (`/w/<ws>/sign-in`)
+### Open an app (`/w/<ws>/open/<app>`)
 
 Some apps have accounts of their own on top of the host's SSO; T3 Code, for
 one, lets a browser in only after it follows a one-time link. The UI gets
 that link from the app and sends the browser to it, so the person never
 copies a credential:
 
-1. **Open and sign in**, or **Sign in to app**, posts the workspace's name
-   to `/api/sign-in`, in a new tab.
-2. `workbench-web` asks the guest agent for a link (`op: "sign-in"`, over
-   vsock). The agent runs the app's `bin/sign-in-link` as the owner; it
-   prints one URL and nothing else on stdout.
-3. The URL must start with the workspace's own URL. `workbench-web` answers
+1. **Open `<app>`** posts the workspace and the app to `/api/open`, in a
+   new tab.
+2. `workbench-web` asks the guest agent for a link (`op: "open-link"`, over
+   vsock). The agent runs the app's `bin/open-link` as the owner; it prints
+   one URL and nothing else on stdout.
+3. The URL must be on the app's own origin. `workbench-web` answers
    `303 See Other` to it, with `Cache-Control: no-store`. The link is never
    shown and never logged.
-4. The browser remembers, in `localStorage`, that it has signed in to `<ws>`,
-   so the next time the primary action is just **Open**.
+4. The browser remembers, in `localStorage`, that it opened `<ws>/<app>`,
+   so the next time **Open** is just the app's address. **Open with a new
+   link**, in the ⋯ menu, signs it in again.
 
-The `GET` of `/w/<ws>/sign-in` is a page with one button. It signs in
-nothing, so link previews don't spend links, and it is the address to send
-someone: "Sign in to `<ws>`'s app".
+**Open on another device…** asks for the same link as data, for a dialog
+with its QR code and the link to copy: it works once, and whoever has it
+gets in. It needs JavaScript; without, the menu item leads to the open page.
 
-An app without `bin/sign-in-link` gets no sign-in action: **Open** is all,
-and the app's own screen takes over. The agent's `ping` answer says whether
-the hook exists.
+The `GET` of `/w/<ws>/open/<app>` is a page with one button. It opens
+nothing, so link previews don't spend links. An app without
+`bin/open-link` opens at its address; the agent's `ping` answer names the
+apps with the hook.
 
-Errors, on the sign-in page above its button:
+Errors, on the open page:
 
 | Situation | Message | Action |
 |---|---|---|
-| Stopped | "`<ws>` is stopped. Start it, then sign in." | **Start `<ws>`** |
-| The agent doesn't answer | "`<ws>` is still starting." | **Try again** |
-| The hook failed | "The app couldn't make a sign-in link." Its stderr under Details. | **Try again**, **Console** |
-| Not a URL of the workspace | "The app answered something that isn't a link to `<ws>`." | **Try again** |
-| 90 s without an answer | "The app took too long to answer." | **Try again** |
+| Stopped | "`<ws>` is stopped. Start it, then open `<app>`." | **Start `<ws>`** |
+| It comes with the next restart | "`<app>` comes with the next restart of `<ws>`." | **Restart `<ws>`…** |
+| The agent doesn't answer | "`<app>` isn't answering in `<ws>` yet." | **Try again**, **Console** |
+| The hook failed | "`<app>` couldn't make a sign-in link." Its stderr under Details. | **Try again**, **Console** |
+| Not a URL of the app | "`<app>` answered something that isn't a link to it." | **Try again** |
+| 90 s without an answer | "`<app>` took too long to answer." | **Try again** |
 
-**Another device** (a link or QR code for a phone) is for later; it would
-be a second action in the panel.
+### The apps of a workspace (`/w/<ws>/apps`)
+
+A workspace made at run time changes its apps from its panel, **Edit…** or
+**Add an app…**, in a dialog, or on this page without JavaScript: a
+checkbox per app `web.selfService.apps` offers, then **Save** or **Save and
+restart**; a stopped workspace has only **Save**. Nothing on its disk
+changes. A workspace from the Nix configuration has its apps there.
+
+`workbench-web` writes the request to
+`<stateDir>/self-service/requests/<ws>.apps.json` and starts
+`workbench-apps@<ws>.service`, which runs `workbench self-service apps <ws>`
+as root: under the self-service lock, it checks the apps are offered, puts
+them in the config and says how it went in `results/<ws>.apps.json`. One
+change of a workspace's apps at a time: another while one runs is refused,
+since it would join that run, and an outcome older than the request counts
+for nothing. **Save and restart** then restarts the workspace; **Save**
+leaves the change waiting for the next start, and the panel says so.
+
+Every deploy makes the configs again from the template, keeping what each
+workspace was given: its system, even one no longer offered, and its
+memory.
 
 ### Start, stop and restart
 
 | Action | Confirmation | The dialog says |
 |---|---|---|
 | **Start** | none | — |
-| **Restart** | dialog | Stops everything running in the VM; open app tabs lose their connection for about a minute. Keeps everything on its disk. Brings the app and system now on the host. |
-| **Stop** | dialog, red button | Stops the VM and the app. Keeps everything on its disk. It stays stopped, also across host reboots, until someone starts it. |
+| **Restart** | dialog | Stops everything running in the VM; open app tabs lose their connection for about a minute. Keeps everything on its disk. Brings the apps and packages it has now, as the host has them. |
+| **Stop** | dialog, red button | Stops the VM and its apps. Keeps everything on its disk. It stays stopped, also across host reboots, until someone starts it. |
 | **Destroy** | its page, typing the name | Deletes the disk and everything on it, for good. Only for a workspace made at run time, by its owner or an admin; the others stay `workbench destroy`. |
 
 Without JavaScript, **Restart…** and **Stop…** are links to
@@ -294,6 +371,7 @@ bar and the empty state. A page with one form:
 | SSH keys | pasted, one per line, `<type> <key> [comment]`; the directory has no SSH keys to take |
 | Memory | the most the VM grows to, from the boot size up to `web.selfService.maxMemoryGiB` |
 | Disk | from 16 GiB up to `web.selfService.maxDiskGiB` |
+| Apps | checkboxes of `web.selfService.apps`, all checked; none is fine, and they can change later |
 
 The page says how many of their quota the person has left. **Create**
 refuses, saying why, a name taken by any workspace, a disk or a config, a
@@ -325,9 +403,18 @@ unit runs `workbench self-service create <ws>` as root, which:
 7. writes the config to `<stateDir>/configs/<ws>.json`, makes the disk and
    the secrets directory, and starts `workbench@<ws>`.
 
-`workbench-self-service.service`, at boot, puts the userdb records and
-network files back from the configs, since `/run` is empty then, and starts
-the workspaces not stopped. The answer to the form is the list with the new
+`workbench-self-service.service`, at boot and whenever a deploy changes the
+template, makes each config again from the template: the host's paths, the
+packages and the apps' bundles change, the workspace's own settings, its
+address, its VM user, its apps and the image its disk came from don't. An
+app no longer offered goes, and a config from before apps gets every app
+offered, which was its one. An Ubuntu workspace's cloud-init seed is
+written again when what it says changed, such as the nameservers, with an
+instance id made from it, so the guest sets itself up again at its next
+boot, as a declared one does. A running VM keeps what it booted with, and
+the panel shows what its restart brings. Then it puts the userdb records and
+network files back from the configs, since `/run` is empty at boot, and
+starts the workspaces not stopped. The answer to the form is the list with the new
 workspace selected, booting; or the form again with why it was refused,
 from `<stateDir>/self-service/results/<ws>.json`. `self-service/` is root's:
 the UI writes only in `requests/` and `quotas/`, and root reads them without
@@ -379,18 +466,12 @@ Host memory, from `/proc/meminfo` and `/run/vmkit/memory/<pool>.json`:
 
 - **403** at `<domain>/w/<ws>/…` for a workspace that isn't yours, and the
   same page for one that doesn't exist, so names don't leak.
-- **403** at `<ws>.<domain>` from the authorization check: "This workspace
-  isn't yours. You're signed in as bob." with **Sign out** and a link to
-  the UI.
+- **403** at `<ws>--<app>.<domain>` from the authorization check: "This
+  workspace isn't yours. You're signed in as bob." with **Sign out** and a
+  link to the UI; **404** "`<ws>` has no app `<app>`" for one of the
+  viewer's, with a link to its panel.
 - **502** when the host can't be read (systemd or a config fails): "Couldn't
   read the workspaces from the host." with the error under Details.
-
-## App updates
-
-A restart brings the app and the system on the host now; until then the VM
-runs what it started with. `workbench run` writes the store path it starts
-the app from to `<runtimeDir>/app`. The UI compares it with the config's
-`app`: when they differ, the workspace has an update and the panel says so.
 
 ## The service
 
@@ -403,7 +484,8 @@ the app from to `<runtimeDir>/app`. The UI compares it with the config's
   sockets: `<runtimeDir>/vm` becomes setgid `wb-<ws>:workbench`, and the
   unit's `ExecStartPost`, `workbench share-sockets`, makes the API, vsock
   and serial sockets `0660` once cloud-hypervisor has made them.
-- A polkit rule lets it start, stop and restart `workbench@*.service`, and
+- A polkit rule lets it start, stop and restart `workbench@*.service`,
+  start `workbench-create@`, `workbench-destroy@` and `workbench-apps@`, and
   nothing else.
 - It owns `/var/lib/workbench/.stopped/`.
 - It listens on `/run/workbench-web/ui.sock` and
@@ -424,8 +506,9 @@ stop them; the `Origin` check does.
 | Restart | `systemctl restart workbench@<ws>` |
 | Create | the request file, `systemctl start workbench-create@<ws>`, 5 min |
 | Destroy | `systemctl start workbench-destroy@<ws>` |
+| Apps | the request file, `systemctl start workbench-apps@<ws>`, then a restart if asked |
 | Quota | `<stateDir>/self-service/quotas.json`, written in place |
-| Sign in | the agent's `sign-in` over vsock, 90 s |
+| Open | the agent's `open-link` over vsock, 90 s |
 | Console | the serial socket, shared |
 | Host | `/proc/meminfo`, `/run/vmkit/memory/*.json` |
 
@@ -445,18 +528,21 @@ just a page, current when loaded.
 | `GET` | `/events` | event stream of the list |
 | `GET` | `/api/workspaces` | the user's workspaces as JSON; all of them for admins |
 | `GET` | `/w/<ws>/start`, `/w/<ws>/stop`, `/w/<ws>/restart` | confirmation pages |
-| `GET` | `/w/<ws>/sign-in` | the sign-in page |
+| `GET` | `/w/<ws>/open/<app>` | the app's open page |
 | `POST` | `/api/control` | server function: `ws` and `action` (`start`, `stop`, `restart`); `303` to `/?w=<ws>` from a form |
-| `POST` | `/api/sign-in` | server function: `ws`; `303` to the app's link |
+| `POST` | `/api/open` | server function: `ws`, `app`; `303` to the app's link |
+| `POST` | `/api/device-link` | server function: `ws`, `app`; the link and its QR code as JSON |
+| `GET` | `/w/<ws>/apps` | the apps page of a workspace made at run time |
+| `POST` | `/api/apps` | server function: `ws`, `apps[<i>]`, `restart`; `303` to `/?w=<ws>` |
 | `GET` | `/new` | the New workspace page |
-| `POST` | `/api/create` | server function: `name`, `os`, `ssh_keys`, `memory_gib`, `disk_gib`; `303` to `/?w=<ws>` |
+| `POST` | `/api/create` | server function: `name`, `os`, `ssh_keys`, `memory_gib`, `disk_gib`, `apps[<i>]`; `303` to `/?w=<ws>` |
 | `GET` | `/w/<ws>/destroy` | the Destroy page |
 | `POST` | `/api/destroy` | server function: `ws`, `confirm`, the name typed again; `303` to `/` |
 | `POST` | `/api/quota` | server function, admins: `user`, `quota`; `303` to `/host` |
 | `GET` | `/w/<ws>/console` | the console page |
 | `GET` | `/w/<ws>/console/socket` | WebSocket to the shared console |
 | `GET` | `/host` | host memory, admins |
-| `GET` | `/denied` | the 403 page nginx shows at a workspace's address |
+| `GET` | `/denied` | the page nginx shows at an app's address it refused |
 | `GET` | `/authz` | on `authz.sock` only, for nginx |
 
 A workspace as `/api/workspaces` gives it:
@@ -469,8 +555,10 @@ A workspace as `/api/workspaces` gives it:
   "os": "ubuntu",
   "state": "running",
   "since": "2026-11-16T09:12:00Z",
-  "appUpdate": true,
-  "signIn": true,
+  "apps": [
+    { "id": "t3code", "name": "T3 Code", "url": "https://alice--t3code.ws.example.com", "openLink": true }
+  ],
+  "changes": [{ "kind": "packages" }],
   "memoryBytes": 3435973836,
   "bootMemoryBytes": 2147483648,
   "maxMemoryBytes": 17179869184,
@@ -499,6 +587,7 @@ services.workbench.web = {
     os = [ "ubuntu" "nixos" ];
     maxMemoryGiB = 16;
     maxDiskGiB = 128;
+    apps = [ "t3code" ];
     # Prints the workspace's secret environment for an owner; fails or
     # prints nothing when there is none.
     environmentCommand = "/run/current-system/sw/bin/workspace-env";
@@ -509,7 +598,7 @@ services.workbench.web = {
 ```
 
 It sets up `workbench-web.service`, oauth2-proxy, the nginx virtual host
-for `<domain>` and `auth_request` on every workspace's, the group, the
+for `<domain>` and the one, with `auth_request`, for every app, the group, the
 socket permissions, the stop marker condition and the polkit rule. Without
 `web.enable`, workspaces are served as before, without SSO.
 
@@ -526,8 +615,9 @@ module knows neither.
 ## Tests
 
 - Rust: the authorization rule, the `authz` answer and its cookie filter,
-  the state derivation, the sign-in link check, the console fan-out, and
-  the pages and server functions against fake systemd and agent.
+  the state derivation, what waits for a restart and each app's stage, the
+  open link check, the console fan-out, and the pages and server functions
+  against fake systemd and agent.
 - Rust, too: the name rule, the SSH key check, the quota, the request's
   validation and the address picked.
 - NixOS: `checks.workspaces` has OpenLDAP with the users and groups, Dex
@@ -535,12 +625,14 @@ module knows neither.
   come from the directory as in production. It signs in as alice and as
   bob, checks each reaches only their own workspace and gets 403 on the
   other's, that the app never sees the SSO cookie, that stop survives a
-  reboot of the unit's condition, and that sign-in redirects to a link of
-  the workspace. For self-service: alice, in the group, creates a workspace
-  and reaches it; bob, outside it, can't create; the quota refuses alice's
-  second; a failing credential command refuses the request; and taking
-  alice out of the group cuts her off at the next refresh, and the timer
-  stops her VM.
+  reboot of the unit's condition, and that opening an app redirects to a
+  link on its origin. For self-service: alice, in the group, creates a
+  workspace and reaches its app; she takes the app away, which waits for a
+  restart and goes with it, and adds it back; a config from before apps
+  gets its app back; bob, outside the group, can't create; the quota
+  refuses alice's second; a failing credential command refuses the
+  request; and taking alice out of the group cuts her off at the next
+  refresh, and the timer stops her VM.
 
 ## Later
 
@@ -548,15 +640,17 @@ module knows neither.
   own API, instead of a command that reads them.
 - **A page per workspace** with tabs: Console, then secrets, SSH keys, port
   previews and the NixOS config. The name in the panel links to it.
-- **Sign in another device**, with a QR code.
+- **Terminal apps**, such as herdr: a kind of app opened in the UI, in a
+  terminal like the console's, rather than at an address.
 
 ## Open
 
 - Whether cloud-hypervisor's serial socket takes more than one client. The
   shared console doesn't need it, but `workbench console` without
   `workbench-web` does.
-- T3 Code's `bin/sign-in-link` belongs in t3code-nix. Until then the
-  workbench module writes it, around `t3 auth pairing create --json`.
-- A workspace's app can't use paths under `/oauth2/`: oauth2-proxy has them.
+- T3 Code's `serve` and `openLink` belong in t3code-nix. Until then the
+  workbench module writes them, around `t3 serve` and
+  `t3 auth pairing create --json`.
+- An app can't use paths under `/oauth2/`: oauth2-proxy has them.
 - The name rule is a prefix: someone whose slug is `samuel` may take
   `samuel-silva`, before `samuel.silva` does. Names are first come.
