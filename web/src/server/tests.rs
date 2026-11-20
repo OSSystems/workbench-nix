@@ -8,9 +8,10 @@ use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
 use workbench::config::Config;
 use workbench::self_service::Paths;
-use workbench::state::SignInError;
-use workbench_model::self_service::{Limits, Outcome, Request as Asked};
-use workbench_model::{State, Verb, Workspace};
+use workbench::state::OpenLinkError;
+use workbench_model::apps::{AppInfo, BootApp};
+use workbench_model::self_service::{AppsRequest, Limits, Outcome, Request as Asked};
+use workbench_model::{App, State, Verb, Workspace};
 
 use super::*;
 
@@ -19,7 +20,7 @@ const ORIGIN: &str = "https://ws.test";
 #[derive(Default)]
 struct Fake {
     controlled: Arc<Mutex<Vec<(Verb, String)>>>,
-    sign_in: Mutex<Option<Result<String, SignInError>>>,
+    open_link: Mutex<Option<Result<String, OpenLinkError>>>,
     /// Workspaces made at run time, besides the declared ones.
     made: Vec<Workspace>,
     /// Where the units write how they went, and what they say.
@@ -41,7 +42,12 @@ fn ws(name: &str, owner: &str, state: State) -> Workspace {
         ip: "10.232.0.10".into(),
         os: "ubuntu".into(),
         state,
-        sign_in: true,
+        apps: vec![App {
+            id: "t3code".into(),
+            name: "T3 Code".into(),
+            url: format!("https://{name}--t3code.ws.test"),
+            open_link: true,
+        }],
         unit: "active".into(),
         vm: "Running".into(),
         ..Workspace::default()
@@ -71,7 +77,7 @@ impl Backend for Fake {
                 owner: w.owner.clone(),
                 url: w.url.clone(),
                 ip: w.ip.clone(),
-                app_port: 3773,
+                apps: vec![t3code()],
                 self_service: true,
                 ..Config::default()
             });
@@ -85,12 +91,19 @@ impl Backend for Fake {
             name: name.into(),
             owner: owner.into(),
             url: format!("https://{name}.ws.test"),
+            ip: "10.232.0.10".into(),
+            apps: vec![t3code()],
             ..Config::default()
         })
     }
 
-    fn sign_in(&self, _: Config) -> BoxFuture<'_, Result<String, SignInError>> {
-        let answer = self.sign_in.lock().unwrap().clone().unwrap_or(Ok("https://alice.ws.test/pair#token=t".into()));
+    fn reachable(&self, c: &Config) -> Vec<BootApp> {
+        c.apps.clone()
+    }
+
+    fn open_link(&self, _: Config, _: String) -> BoxFuture<'_, Result<String, OpenLinkError>> {
+        let answer =
+            self.open_link.lock().unwrap().clone().unwrap_or(Ok("https://alice--t3code.ws.test/pair#token=t".into()));
         Box::pin(async move { answer })
     }
 
@@ -108,7 +121,7 @@ impl Backend for Fake {
         let name = unit.split_once('@').map(|(_, r)| r.trim_end_matches(".service")).unwrap_or_default();
         let outcome = self.outcome.lock().unwrap().clone();
         if let (Some(paths), Some(o)) = (&self.paths, &outcome) {
-            let out = paths.outcome(name);
+            let out = if unit.starts_with("workbench-apps@") { paths.apps_outcome(name) } else { paths.outcome(name) };
             std::fs::create_dir_all(out.parent().unwrap()).unwrap();
             std::fs::write(out, serde_json::to_vec(o).unwrap()).unwrap();
         }
@@ -117,6 +130,10 @@ impl Backend for Fake {
             Ok(())
         })
     }
+}
+
+fn t3code() -> BootApp {
+    BootApp { id: "t3code".into(), name: "T3 Code".into(), port: 3773, bundle: "/nix/store/x-t3code".into() }
 }
 
 fn state(fake: Fake) -> AppState {
@@ -128,6 +145,7 @@ fn state(fake: Fake) -> AppState {
             max_memory_gib: 16,
             max_disk_gib: 128,
             quota: 1,
+            apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into() }],
         },
     });
     let opts = Options {
@@ -274,36 +292,78 @@ async fn actions_need_the_uis_origin_and_the_workspace() {
 }
 
 #[tokio::test]
-async fn sign_in_sends_the_browser_to_the_apps_link() {
+async fn open_sends_the_browser_to_the_apps_link() {
     let _turn = TURN.lock().await;
     let s = state(Fake::default());
-    let (code, headers, _) = send(ui(&s), post("/api/sign-in", "alice", ORIGIN, "ws=alice")).await;
+    let open = "ws=alice&app=t3code";
+    let (code, headers, _) = send(ui(&s), post("/api/open", "alice", ORIGIN, open)).await;
     assert_eq!(code, StatusCode::SEE_OTHER);
-    assert_eq!(headers[header::LOCATION], "https://alice.ws.test/pair#token=t");
+    assert_eq!(headers[header::LOCATION], "https://alice--t3code.ws.test/pair#token=t");
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
-    let (code, _, _) = send(ui(&s), post("/api/sign-in", "bob", ORIGIN, "ws=alice")).await;
+    let (code, _, _) = send(ui(&s), post("/api/open", "bob", ORIGIN, open)).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
-    // A stopped workspace has no link: its sign-in page says why.
-    let (code, headers, _) = send(ui(&s), post("/api/sign-in", "bob", ORIGIN, "ws=bob")).await;
+    // A stopped workspace has no link: the app's open page says why.
+    let (code, headers, _) = send(ui(&s), post("/api/open", "bob", ORIGIN, "ws=bob&app=t3code")).await;
     assert_eq!(code, StatusCode::SEE_OTHER);
-    assert_eq!(headers[header::LOCATION], "/w/bob/sign-in");
-    let (code, _, body) = send(ui(&s), get("/w/bob/sign-in", "bob")).await;
+    assert_eq!(headers[header::LOCATION], "/w/bob/open/t3code");
+    let (code, _, body) = send(ui(&s), get("/w/bob/open/t3code", "bob")).await;
     assert_eq!(code, StatusCode::CONFLICT);
     assert!(body.contains("is stopped"), "{body}");
+    let (code, _, _) = send(ui(&s), get("/w/alice/open/nope", "alice")).await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "an app it hasn't");
 
     let failing = Fake::default();
-    *failing.sign_in.lock().unwrap() = Some(Err(SignInError::Failed { exit_code: 2, detail: "boom".into() }));
+    *failing.open_link.lock().unwrap() = Some(Err(OpenLinkError::Failed { exit_code: 2, detail: "boom".into() }));
     let s = state(failing);
-    let (_, headers, _) = send(ui(&s), post("/api/sign-in", "alice", ORIGIN, "ws=alice")).await;
+    let (_, headers, _) = send(ui(&s), post("/api/open", "alice", ORIGIN, open)).await;
     let to = headers[header::LOCATION].to_str().unwrap().to_owned();
-    assert!(to.starts_with("/w/alice/sign-in?error=failed&detail=exit%20status%202"), "{to}");
+    assert!(to.starts_with("/w/alice/open/t3code?error=failed&detail=exit%20status%202"), "{to}");
     let (code, _, body) = send(ui(&s), get(&to, "alice")).await;
     assert_eq!(code, StatusCode::BAD_GATEWAY);
     assert!(body.contains("couldn't make a sign-in link") && body.contains("boom"), "{body}");
 
     // Only a NixOS workspace is told about its slower first boot.
-    let (_, _, body) = send(ui(&s), get("/w/alice/sign-in?error=starting", "alice")).await;
-    assert!(body.contains("is still starting") && !body.contains("NixOS"), "{body}");
+    let (_, _, body) = send(ui(&s), get("/w/alice/open/t3code?error=starting", "alice")).await;
+    assert!(body.contains("isn't answering") && !body.contains("NixOS"), "{body}");
+}
+
+/// An app that comes with the next restart doesn't open until then, and
+/// the panel says what waits for it.
+#[tokio::test]
+async fn what_waits_for_a_restart() {
+    let _turn = TURN.lock().await;
+    let mut dev = made("alice-dev", "alice");
+    dev.changes = vec![workbench_model::Change::AppAdded { app: "t3code".into() }];
+    let (_dir, fake) = self_serve(vec![dev], None);
+    let s = state(fake);
+    let (_, h, _) =
+        send(ui(&s), with_groups(post("/api/open", "alice", ORIGIN, "ws=alice-dev&app=t3code"), "workbench")).await;
+    assert_eq!(h[header::LOCATION], "/w/alice-dev/open/t3code");
+    let (code, _, body) = send(ui(&s), with_groups(get("/w/alice-dev/open/t3code", "alice"), "workbench")).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(body.contains("comes with the next restart"), "{body}");
+    let (_, _, body) = send(ui(&s), with_groups(get("/?w=alice-dev", "alice"), "workbench")).await;
+    assert!(
+        body.contains("T3 Code comes with the next restart.") && body.contains("T3 Code after a restart"),
+        "{body}"
+    );
+}
+
+/// The link for another device comes back as data, with its QR code.
+#[tokio::test]
+async fn a_link_for_another_device() {
+    let _turn = TURN.lock().await;
+    let s = state(Fake::default());
+    let mut req = post("/api/device-link", "alice", ORIGIN, "ws=alice&app=t3code");
+    req.headers_mut().insert(header::ACCEPT, "application/json".parse().unwrap());
+    let (code, headers, body) = send(ui(&s), req).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let d: workbench_model::apps::DeviceLink = serde_json::from_str(&body).unwrap();
+    assert_eq!(d.link, "https://alice--t3code.ws.test/pair#token=t");
+    assert!(d.size > 20 && d.qr.starts_with('M'), "{d:?}");
+    let (code, _, _) = send(ui(&s), post("/api/device-link", "bob", ORIGIN, "ws=alice&app=t3code")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -325,19 +385,25 @@ async fn the_access_check() {
     let check = |ws: &str, cookie: &str| {
         Request::get("/authz")
             .header("x-workbench-workspace", ws)
+            .header("x-workbench-app", "t3code")
             .header(header::COOKIE, cookie)
             .body(Body::empty())
             .unwrap()
     };
     let (code, _, _) = send(authz_router(s.clone()), check("alice", "t3=1")).await;
     assert_eq!(code, StatusCode::UNAUTHORIZED, "nobody signed in");
-    let (code, h, _) = send(authz_router(s.clone()), check("alice", "_workbench_auth=bob; t3=1")).await;
+    let (code, h, _) = send(authz_router(s.clone()), check("alice", "_workbench_auth=bob:staff,workbench; t3=1")).await;
     assert_eq!((code, h["x-workbench-user"].to_str().unwrap()), (StatusCode::FORBIDDEN, "bob"));
+    assert_eq!(h["x-workbench-groups"], "staff,workbench", "for the refusal's page");
     let (code, h, _) = send(authz_router(s.clone()), check("alice", "t3=1; _workbench_auth=alice")).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(h["x-workbench-cookie"], "t3=1", "the app never gets the SSO cookie");
+    assert!(!h.contains_key("x-workbench-groups"), "a pass carries no groups");
     let (code, _, _) = send(authz_router(s.clone()), check("alice", "_workbench_auth=carol")).await;
     assert_eq!(code, StatusCode::OK, "admins reach every workspace");
+    let mut other = check("alice", "_workbench_auth=alice");
+    other.headers_mut().insert("x-workbench-app", "herdr".parse().unwrap());
+    assert_eq!(send(authz_router(s.clone()), other).await.0, StatusCode::FORBIDDEN, "an app it hasn't");
     let (code, _, _) = send(authz_router(s), check("nobody", "_workbench_auth=carol")).await;
     assert_eq!(code, StatusCode::FORBIDDEN, "a workspace that doesn't exist");
 
@@ -383,7 +449,8 @@ async fn people_in_the_group_make_their_own() {
     let (_, _, body) = send(ui(&s), with_groups(get("/", "alice"), "workbench")).await;
     assert!(body.contains(r#"href="/new""#), "the list offers it");
 
-    let form = format!("name=alice-dev&os=ubuntu&memory_gib=8&disk_gib=64&ssh_keys={}", super::encode(KEY));
+    let form =
+        format!("name=alice-dev&os=ubuntu&memory_gib=8&disk_gib=64&apps%5B0%5D=t3code&ssh_keys={}", super::encode(KEY));
     let (code, _, _) = send(ui(&s), post("/api/create", "bob", ORIGIN, &form)).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
     let (code, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, &form), "workbench")).await;
@@ -391,18 +458,74 @@ async fn people_in_the_group_make_their_own() {
     assert_eq!(*units.lock().unwrap(), ["workbench-create@alice-dev.service"]);
     let asked: Asked = serde_json::from_slice(&std::fs::read(paths.request("alice-dev")).unwrap()).unwrap();
     assert_eq!((asked.owner.as_str(), asked.ssh_authorized_keys.as_slice()), ("alice", [KEY.to_owned()].as_slice()));
+    assert_eq!(asked.apps, ["t3code"]);
+    assert!(body_has_apps(&s).await, "the form offers the host's apps");
 
     for (bad, says) in [
         ("name=bob-dev&os=ubuntu&memory_gib=8&disk_gib=64", "start%20with%20alice-"),
         ("name=alice-x&os=nixos&memory_gib=8&disk_gib=64", "isn%27t%20a%20system"),
         ("name=alice-x&os=ubuntu&memory_gib=99&disk_gib=64", "Memory%20must%20be"),
         ("name=alice&os=ubuntu&memory_gib=8&disk_gib=64", "is%20taken"),
+        ("name=alice-x&os=ubuntu&memory_gib=8&disk_gib=64&apps%5B0%5D=herdr", "isn%27t%20an%20app"),
     ] {
         let (code, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, bad), "workbench")).await;
         let to = h[header::LOCATION].to_str().unwrap();
         assert!(code == StatusCode::SEE_OTHER && to.starts_with("/new?error=") && to.contains(says), "{bad}: {to}");
     }
     assert_eq!(units.lock().unwrap().len(), 1, "nothing refused reaches the host");
+}
+
+async fn body_has_apps(s: &AppState) -> bool {
+    let (_, _, body) = send(ui(s), with_groups(get("/new", "alice"), "workbench")).await;
+    body.contains(r#"name="apps[0]" value="t3code" checked"#)
+}
+
+/// A workspace made at run time changes its apps through the host's unit;
+/// a declared one's are the Nix configuration's.
+#[tokio::test]
+async fn apps_of_a_workspace_made_at_run_time() {
+    let _turn = TURN.lock().await;
+    let (dir, fake) = self_serve(vec![made("alice-dev", "alice")], Some(Outcome { ok: true, error: String::new() }));
+    let (units, calls, outcome) = (fake.units.clone(), fake.controlled.clone(), fake.outcome.clone());
+    let s = state(fake);
+    let paths = Paths(dir.path().to_owned());
+    let as_alice = |form: &str| with_groups(post("/api/apps", "alice", ORIGIN, form), "workbench");
+    let (code, _, body) = send(ui(&s), with_groups(get("/w/alice-dev/apps", "alice"), "workbench")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body.contains("Apps in") && body.contains("Save and restart"), "{body}");
+    let (code, _, _) = send(ui(&s), with_groups(get("/w/alice/apps", "alice"), "workbench")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "a declared workspace's apps are Nix's");
+    assert_eq!(send(ui(&s), as_alice("ws=alice&apps%5B0%5D=t3code")).await.0, StatusCode::FORBIDDEN);
+
+    let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev")).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-dev");
+    let asked: AppsRequest = serde_json::from_slice(&std::fs::read(paths.apps_request("alice-dev")).unwrap()).unwrap();
+    assert!(asked.apps.is_empty(), "none at all");
+    assert!(calls.lock().unwrap().is_empty(), "saved for the next start");
+    let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev&apps%5B0%5D=t3code&restart=true")).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-dev");
+    assert_eq!(*calls.lock().unwrap(), [(Verb::Restart, "alice-dev".to_owned())], "and now");
+    assert_eq!(*units.lock().unwrap(), ["workbench-apps@alice-dev.service", "workbench-apps@alice-dev.service"]);
+    let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev&apps%5B0%5D=nope")).await;
+    assert!(h[header::LOCATION].to_str().unwrap().starts_with("/w/alice-dev/apps?error="), "{h:?}");
+    assert_eq!(units.lock().unwrap().len(), 2, "nothing refused reaches the host");
+
+    // One at a time: another would join the run, which reads one request.
+    s.making.lock().unwrap().insert("alice-dev/apps".into());
+    let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev")).await;
+    assert!(h[header::LOCATION].to_str().unwrap().contains("being%20changed"), "{h:?}");
+    s.making.lock().unwrap().clear();
+    assert_eq!(units.lock().unwrap().len(), 2);
+
+    // An outcome from before the request says nothing of it.
+    let stale = paths.apps_outcome("alice-dev");
+    std::fs::write(&stale, br#"{"ok":false,"error":"an old refusal"}"#).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&stale).unwrap().set_modified(old).unwrap();
+    *outcome.lock().unwrap() = None;
+    let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev")).await;
+    let to = h[header::LOCATION].to_str().unwrap();
+    assert!(to.contains("said%20nothing") && !to.contains("old%20refusal"), "{to}");
 }
 
 #[tokio::test]
@@ -478,9 +601,12 @@ async fn only_workspaces_made_at_run_time_are_destroyed_here() {
 async fn the_denied_page_is_styled_from_the_ui() {
     let _turn = TURN.lock().await;
     let s = state(Fake::default());
-    let (code, headers, body) = send(ui(&s), get("/denied?ws=alice", "bob")).await;
+    let (code, headers, body) = send(ui(&s), get("/denied?ws=alice&app=t3code", "bob")).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
     assert!(body.contains("alice.ws.test") && body.contains("bob") && body.contains("https://ws.test/assets/app.css"));
+    let (code, _, body) = send(ui(&s), get("/denied?ws=alice&app=herdr", "alice")).await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "her own workspace hasn't that app");
+    assert!(body.contains("has no app") && body.contains("herdr"), "{body}");
     assert!(headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap().starts_with("default-src 'none'"));
     let (_, _, body) = send(ui(&s), get("/denied?ws=%3Cscript%3E", "bob")).await;
     assert!(!body.contains("<script>"));

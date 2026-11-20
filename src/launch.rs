@@ -20,6 +20,8 @@ use vmkit::hostutil::{self, Account};
 use vmkit::memory::GIB;
 use vmkit::virtiofs;
 
+use workbench_model::apps::app_url;
+
 use crate::config::{self, Config};
 
 /// The largest closure listing or registration copied to the guest.
@@ -75,7 +77,8 @@ pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
         chown(&socket, Some(vm_user.uid), Some(vm_user.gid))?;
     }
     drop(runtime);
-    fs::write(c.started_app(), format!("{}\n", c.app))?;
+    // What the VM boots with, for as long as it runs; the web UI reads it.
+    hostutil::atomic_write(c.booted(), &serde_json::to_vec(&c.boot())?, 0o644)?;
     let host_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let argv = cloud_hypervisor_argv(&c, u32::try_from(host_cpus).unwrap_or(u32::MAX));
     eprintln!("starting workspace {} for {} at {}", c.name, c.owner, c.ip);
@@ -187,9 +190,23 @@ pub struct GuestConfig {
     pub ip: String,
     pub gateway: String,
     pub nameservers: Vec<String>,
+    /// The first app's port, or 0: what guests of earlier releases had.
     pub app_port: i64,
     pub control_port: i64,
     pub agent_port: i64,
+    /// The apps the agent runs.
+    #[serde(default)]
+    pub apps: Vec<GuestApp>,
+}
+
+/// An app in `workspace.json`: its bundle is `config/apps/<id>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestApp {
+    pub id: String,
+    pub name: String,
+    pub port: u16,
+    /// Its address, which a sign-in link must be on.
+    pub url: String,
 }
 
 impl GuestConfig {
@@ -202,19 +219,33 @@ impl GuestConfig {
             ip: c.ip.clone(),
             gateway: c.gateway.clone(),
             nameservers: c.nameservers.clone(),
-            app_port: c.app_port,
+            app_port: c.apps.first().map_or(0, |a| i64::from(a.port)),
             control_port: c.control_port,
             agent_port: c.agent_port,
+            apps: c
+                .apps
+                .iter()
+                .map(|a| GuestApp { id: a.id.clone(), name: a.name.clone(), port: a.port, url: app_url(&c.url, &a.id) })
+                .collect(),
         }
+    }
+
+    #[must_use]
+    pub fn app(&self, id: &str) -> Option<&GuestApp> {
+        self.apps.iter().find(|a| a.id == id)
     }
 }
 
-/// Writes what the guest starts its services from: the app in the closure,
-/// the closure's paths and their registration, the owner's SSH keys, the
-/// non-secret environment and `workspace.json`.
+/// Writes what the guest starts its services from: the packages and the
+/// apps in the closure, the closure's paths and their registration, the
+/// owner's SSH keys, the non-secret environment and `workspace.json`.
 pub(crate) fn write_config_share(c: &Config, dir: &Path) -> anyhow::Result<()> {
     make_dir(dir, 0o755)?;
-    std::os::unix::fs::symlink(&c.app, dir.join("app"))?;
+    std::os::unix::fs::symlink(&c.packages, dir.join("app"))?;
+    make_dir(&dir.join("apps"), 0o755)?;
+    for app in &c.apps {
+        std::os::unix::fs::symlink(&app.bundle, dir.join("apps").join(&app.id))?;
+    }
     for (name, src) in [("store-paths", &c.closure), ("registration", &c.registration)] {
         let raw = hostutil::read_bounded(src, MAX_CLOSURE_FILE).with_context(|| src.clone())?;
         write_read_only(&dir.join(name), &raw)?;
@@ -451,11 +482,13 @@ mod tests {
         fs::write(&c.closure, "/nix/store/x-app\n").unwrap();
         fs::write(&c.registration, "/nix/store/x-app\nsha256:0\n0\n\n0\n").unwrap();
         write_config_share(&c, &dir).unwrap();
-        assert_eq!(fs::read_link(dir.join("app")).unwrap(), Path::new(&c.app));
+        assert_eq!(fs::read_link(dir.join("app")).unwrap(), Path::new(&c.packages));
+        assert_eq!(fs::read_link(dir.join("apps/t3code")).unwrap(), Path::new(&c.apps[0].bundle));
         assert_eq!(fs::read_to_string(dir.join("environment")).unwrap(), "LLM_URL=\"https://llm.example\"\n");
         let gc: GuestConfig = serde_json::from_slice(&fs::read(dir.join("workspace.json")).unwrap()).unwrap();
         assert_eq!(gc, GuestConfig::of(&c));
         assert_eq!(gc.agent_port, 5002);
+        assert_eq!((gc.app_port, gc.apps[0].url.as_str()), (3773, "https://alice-dev--t3code.ws.test"));
         for (name, src) in [("store-paths", &c.closure), ("registration", &c.registration)] {
             let (got, want) = (fs::read(dir.join(name)).unwrap(), fs::read(src).unwrap());
             assert!(!want.is_empty() && got == want, "{name} is not a copy of {src}");
@@ -472,7 +505,7 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            ["agentPort", "appPort", "controlPort", "gateway", "ip", "name", "nameservers", "owner", "url"]
+            ["agentPort", "appPort", "apps", "controlPort", "gateway", "ip", "name", "nameservers", "owner", "url"]
         );
     }
 

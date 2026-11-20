@@ -1,6 +1,7 @@
 //! What workbench's host, its CLI and its web UI agree on: workspace and
-//! user names, a workspace's status and the state people see, who may
-//! control it, and how the UI lists workspaces. It compiles for the host
+//! user names, a workspace's status and the state people see, its apps and
+//! what waits for a restart, who may control it, and how the UI lists
+//! workspaces. It compiles for the host
 //! and for the browser, so the web UI's server and its WebAssembly share
 //! the same types and checks.
 
@@ -10,13 +11,16 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+pub mod apps;
 pub mod self_service;
+
+pub use apps::{App, Change, OpenBlocker, Stage};
 
 /// A gibibyte.
 pub const GIB: i64 = 1 << 30;
 
 /// Whether `name` is a workspace name: a lowercase DNS label of at most 28
-/// characters.
+/// characters, without `--`, which comes before an app's id in its address.
 #[must_use]
 pub fn is_workspace_name(name: &str) -> bool {
     let b = name.as_bytes();
@@ -24,6 +28,7 @@ pub fn is_workspace_name(name: &str) -> bool {
         && b[0].is_ascii_lowercase()
         && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
         && b[b.len() - 1] != b'-'
+        && !name.contains("--")
 }
 
 /// Whether `name` is a user name the guest and the host accept.
@@ -114,12 +119,13 @@ pub struct Workspace {
     /// How often systemd restarted the VM since it was started.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub restarts: u32,
-    /// The host has a newer app than the VM started with.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub app_update: bool,
-    /// The app can sign a browser in.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub sign_in: bool,
+    /// Its apps: the config's, then those only the running VM has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<App>,
+    /// What the next start changes, from what the VM booted with; empty
+    /// when nothing waits for a restart, or no VM runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<Change>,
     /// The unit's `ActiveState`.
     pub unit: String,
     /// The VM's state, as cloud-hypervisor says, or `-`.
@@ -246,26 +252,37 @@ impl FromStr for Verb {
     }
 }
 
-/// Why a workspace cannot sign a browser in to its app yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SignInBlocker {
-    Stopped,
-    Starting,
-    /// The app has no sign-in hook.
-    NoHook,
-}
-
 impl Workspace {
-    /// What keeps the workspace from signing a browser in, if anything.
     #[must_use]
-    pub fn sign_in_blocker(&self) -> Option<SignInBlocker> {
+    pub fn app(&self, id: &str) -> Option<&App> {
+        self.apps.iter().find(|a| a.id == id)
+    }
+
+    /// Where an app stands between the VM that runs and the next start.
+    #[must_use]
+    pub fn stage(&self, app: &str) -> Stage {
+        Stage::of(app, &self.changes)
+    }
+
+    /// What keeps an app from opening now, if anything. One that goes
+    /// with the next start still opens until then.
+    #[must_use]
+    pub fn open_blocker(&self, app: &str) -> Option<OpenBlocker> {
+        if self.app(app).is_none() {
+            return Some(OpenBlocker::Unknown);
+        }
         match self.state {
-            State::Stopped | State::Stopping => Some(SignInBlocker::Stopped),
-            State::Starting | State::Restarting | State::Failing => Some(SignInBlocker::Starting),
-            State::Running if !self.sign_in => Some(SignInBlocker::NoHook),
+            State::Stopped | State::Stopping => Some(OpenBlocker::Stopped),
+            State::Starting | State::Restarting | State::Failing => Some(OpenBlocker::Starting),
+            State::Running if !self.stage(app).runs() => Some(OpenBlocker::Coming),
             State::Running => None,
         }
+    }
+
+    /// The apps the VM runs, or would run once started: not those that
+    /// only come with the next start.
+    pub fn running_apps(&self) -> impl Iterator<Item = &App> {
+        self.apps.iter().filter(|a| self.stage(&a.id).runs())
     }
 
     /// The address without its scheme.
@@ -292,6 +309,9 @@ pub struct Row {
 pub struct Snapshot {
     pub viewer: Viewer,
     pub rows: Vec<Row>,
+    /// The apps a workspace made at run time may have.
+    #[serde(default)]
+    pub apps: Vec<apps::AppInfo>,
 }
 
 impl Snapshot {
@@ -308,7 +328,7 @@ impl Snapshot {
                 r
             })
             .collect();
-        Snapshot { viewer, rows }
+        Snapshot { viewer, rows, apps: vec![] }
     }
 
     #[must_use]
@@ -487,7 +507,7 @@ mod tests {
         for ok in ["a", "ab", "a-b", "alice-dev", &"a".repeat(28)] {
             assert!(is_workspace_name(ok), "{ok}");
         }
-        for bad in ["", "-a", "a-", "1a", "A", "a_b", "a.b", ".stopped", &"a".repeat(29)] {
+        for bad in ["", "-a", "a-", "1a", "A", "a_b", "a.b", ".stopped", "a--b", &"a".repeat(29)] {
             assert!(!is_workspace_name(bad), "{bad}");
         }
         assert!(is_user_name("_svc.x-1") && !is_user_name("Bob") && !is_user_name("a/b"));
@@ -556,15 +576,20 @@ mod tests {
     }
 
     #[test]
-    fn sign_in_blockers() {
+    fn open_blockers() {
         let mut w = ws("a", "alice", State::Running).ws;
-        assert_eq!(w.sign_in_blocker(), Some(SignInBlocker::NoHook));
-        w.sign_in = true;
-        assert_eq!(w.sign_in_blocker(), None);
+        let app = |id: &str| App { id: id.into(), name: id.into(), url: String::new(), open_link: true };
+        w.apps = vec![app("t3code"), app("herdr"), app("old")];
+        w.changes = vec![Change::AppAdded { app: "herdr".into() }, Change::AppRemoved { app: "old".into() }];
+        assert_eq!(w.open_blocker("t3code"), None);
+        assert_eq!(w.open_blocker("herdr"), Some(OpenBlocker::Coming));
+        assert_eq!(w.open_blocker("old"), None, "it goes at the next start, not before");
+        assert_eq!(w.open_blocker("nope"), Some(OpenBlocker::Unknown));
+        assert_eq!(w.running_apps().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["t3code", "old"]);
         w.state = State::Failing;
-        assert_eq!(w.sign_in_blocker(), Some(SignInBlocker::Starting));
+        assert_eq!(w.open_blocker("t3code"), Some(OpenBlocker::Starting));
         w.state = State::Stopped;
-        assert_eq!(w.sign_in_blocker(), Some(SignInBlocker::Stopped));
+        assert_eq!(w.open_blocker("t3code"), Some(OpenBlocker::Stopped));
     }
 
     /// The JSON `workbench status --json` and `/api/workspaces` give.
@@ -576,7 +601,12 @@ mod tests {
             owner: "alice".into(),
             state: State::Running,
             since: Some("2026-11-16T09:12:00Z".parse().unwrap()),
-            sign_in: true,
+            apps: vec![App {
+                id: "t3code".into(),
+                name: "T3 Code".into(),
+                url: "https://alice--t3code.ws.test".into(),
+                open_link: true,
+            }],
             unit: "active".into(),
             vm: "Running".into(),
             memory_bytes: 3 * GIB,
@@ -584,7 +614,11 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&w).unwrap(),
-            r#"{"name":"alice","configured":true,"owner":"alice","state":"running","since":"2026-11-16T09:12:00Z","signIn":true,"unit":"active","vm":"Running","memoryBytes":3221225472,"diskBytes":0,"diskUsedBytes":0}"#
+            concat!(
+                r#"{"name":"alice","configured":true,"owner":"alice","state":"running","since":"2026-11-16T09:12:00Z","#,
+                r#""apps":[{"id":"t3code","name":"T3 Code","url":"https://alice--t3code.ws.test","openLink":true}],"#,
+                r#""unit":"active","vm":"Running","memoryBytes":3221225472,"diskBytes":0,"diskUsedBytes":0}"#
+            )
         );
     }
 

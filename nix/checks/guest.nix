@@ -42,8 +42,8 @@ assert lib.all (u: units ? ${u}) [
   "workspace-store"
   "workspace-init"
   "workspace-agent"
-  "workspace-app"
 ];
+assert !(units ? workspace-app);
 assert lib.elem "/run/workspace/config/authorized_keys/%u"
   config.services.openssh.authorizedKeysFiles;
 pkgs.writeText "guest" (builtins.unsafeDiscardStringContext config.system.build.toplevel.drvPath)

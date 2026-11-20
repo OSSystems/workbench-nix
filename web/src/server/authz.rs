@@ -1,7 +1,8 @@
-//! nginx's `auth_request` for every workspace: only those the UI lets use
-//! it reach its app, at the address the answer names, and the app gets the
-//! browser's cookies without the single sign-on one, so code in a workspace
-//! cannot replay it against the UI or another workspace.
+//! nginx's `auth_request` for every app of every workspace: only those the
+//! UI lets use the workspace reach its apps, at the address the answer
+//! names, and an app gets the browser's cookies without the single sign-on
+//! one, so code in a workspace cannot replay it against the UI or another
+//! workspace.
 
 use std::time::{Duration, Instant};
 
@@ -19,9 +20,11 @@ use super::{AppState, Identity, lock};
 /// is made for every request.
 const CACHE_FOR: Duration = Duration::from_secs(10);
 
-/// `GET /authz`, with the workspace in `X-Workbench-Workspace`.
+/// `GET /authz`, with the workspace in `X-Workbench-Workspace` and the app
+/// in `X-Workbench-App`.
 pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let name = headers.get("x-workbench-workspace").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let (name, app) = (header("x-workbench-workspace"), header("x-workbench-app"));
     // An app's cookie may hold any byte: only the SSO cookie must be text.
     let cookie = headers.get(header::COOKIE).map_or(&[][..], HeaderValue::as_bytes);
     let (sso, theirs) = split_cookie(cookie, &state.opts.cookie_name);
@@ -34,11 +37,22 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
     if let Ok(v) = HeaderValue::from_str(&viewer.name) {
         out.insert("x-workbench-user", v);
     }
+    // Only for the page nginx shows on a refusal, which tells "not yours"
+    // from "no such app" by the owner rule: an answer that lets the
+    // request through carries the app's cookies, and must stay small.
+    let mut refused = out.clone();
+    if let Ok(v) = HeaderValue::from_str(&who.groups.join(",")) {
+        refused.insert("x-workbench-groups", v);
+    }
     // The owner rule of the list, from the config alone: a workspace made
     // at run time needs its owner still in a self-service group.
     let config = state.backend.config(name).ok().filter(|c| viewer.may_use(&c.owner, c.self_service));
-    let Some(c) = config else { return (StatusCode::FORBIDDEN, out).into_response() };
-    if let Ok(v) = HeaderValue::from_str(&format!("{}:{}", c.ip, c.app_port)) {
+    let Some(c) = config else { return (StatusCode::FORBIDDEN, refused).into_response() };
+    // The UI's page for a workspace without the app tells the two apart.
+    let Some(port) = state.backend.reachable(&c).into_iter().find(|a| a.id == app).map(|a| a.port) else {
+        return (StatusCode::FORBIDDEN, refused).into_response();
+    };
+    if let Ok(v) = HeaderValue::from_str(&format!("{}:{port}", c.ip)) {
         out.insert("x-workbench-upstream", v);
     }
     if let Ok(v) = HeaderValue::from_bytes(&theirs) {
