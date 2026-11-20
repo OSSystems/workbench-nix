@@ -7,8 +7,10 @@ What the host exchanges with a workspace's guest. The tests in
   keeps at the version its owner last rebuilt with, a few releases behind
   the host perhaps. It changes with care: fields are added, not renamed or
   removed, and readers ignore what they do not know.
-- The agent comes with the app bundle the host shares, so it is always the
-  host's version, and so are its requests: they change with workbench.
+- The agent comes with the packages bundle the host shares, so it is the
+  version of the host that started the VM, and so are its requests: they
+  change with workbench. A host newer than the VM's agent finds no app it
+  knows of in it, and says the apps come with its next restart.
 
 What workbench exchanges with other vmkit controllers on the host (the
 memory pool status files, the control channel's `stats` request) is
@@ -29,19 +31,40 @@ start: what the agent and `nixosModules.guest` set the guest up from.
   "nameservers": ["1.1.1.1", "8.8.8.8"],
   "appPort": 3773,
   "controlPort": 5001,
-  "agentPort": 5002
+  "agentPort": 5002,
+  "apps": [
+    { "id": "t3code", "name": "T3 Code", "port": 3773, "url": "https://alice--t3code.ws.example.com" }
+  ]
 }
 ```
 
 | Field | Meaning |
 |---|---|
 | `name` | The workspace, and the guest's host name. |
-| `owner` | The person's user name in the guest; the app runs as this user. |
-| `url` | Where the app is opened, the base of pairing links. |
+| `owner` | The person's user name in the guest; the apps run as this user. |
+| `url` | The workspace's address, which leads to its panel. |
 | `ip`, `gateway`, `nameservers` | The guest's `/32` address, the host's address it routes through, DNS. |
-| `appPort` | The port the app listens on. |
+| `appPort` | The first app's port, or 0: what guests from before apps read. Nothing reads it now. |
 | `controlPort` | The vsock port the agent reports memory to, on the host. |
 | `agentPort` | The vsock port the agent listens on for the host. |
+| `apps` | The apps the VM boots with: each one's id, name, port and address. Its bundle is `config/apps/<id>`. |
+
+## The shares
+
+The config share, `/run/workspace/config`, holds besides `workspace.json`:
+
+| Path | What |
+|---|---|
+| `app` | The workspace's packages: `sw/` on everyone's PATH, `bin/workspace-agent`, and `bin/serve`, which only waits: guests set up before apps run it as the owner. |
+| `apps/<id>` | An app's bundle: `bin/serve`, and `bin/open-link` when it signs browsers in. |
+| `store-paths`, `registration` | The closure of all of them, which a NixOS guest copies into its store. |
+| `authorized_keys/<owner>`, `environment` | The owner's SSH keys and the non-secret environment. |
+
+The agent starts each app at boot with `systemd-run`, as the unit
+`workspace-app-<id>`: its `bin/serve`, as the owner in their home, with
+`Restart=always`, the environment and secret environment files, the
+packages first on `PATH`, `APP_PORT` and `APP_URL`. An agent that restarts
+leaves the units it finds.
 
 ## The agent
 
@@ -55,7 +78,7 @@ describes), so it trusts what it is asked.
   1 MiB, and closes the connection.
 
 ```json
-{"op":"sign-in"}
+{"op":"open-link","args":["t3code"]}
 ```
 
 | Field | Meaning |
@@ -69,27 +92,28 @@ describes), so it trusts what it is asked.
 
 | Field | Meaning |
 |---|---|
-| `signIn` | In the answer to `ping`: the app has a sign-in hook. Absent when false. |
+| `openLinks` | In the answer to `ping`: the apps with a sign-in hook. Absent when none. |
 | `stdout`, `stderr` | What the operation's command printed, each cut at 64 KiB; absent when empty. |
 | `exitCode` | How it exited; always present, `0` for an operation without a command. |
 | `error` | Why the request failed; absent on success. When present, the other fields say nothing. |
 
 Failures the agent reports in `error`: `no request` (nothing within 10 s),
 `invalid JSON`, `unknown op`, and an operation's own reasons, such as an
-unknown owner, an app without a sign-in hook or a command that did not
-finish in time.
+unknown owner, no such app, an app without a sign-in hook or a command that
+did not finish in time.
 
 ### `ping`
 
-No arguments; the reply is `{"exitCode":0}`, with `signIn` when the app
-bundle has `bin/sign-in-link`. The host's `workbench status` and the web UI
-use it to show whether the agent is up and whether the app signs browsers
+No arguments; the reply is `{"exitCode":0}`, with `openLinks` naming the
+apps whose bundle has `bin/open-link`. The host's `workbench status` and the
+web UI use it to show whether the agent is up and which apps sign browsers
 in.
 
-### `sign-in`
+### `open-link`
 
-Runs the app bundle's `bin/sign-in-link` as the owner, in their home, with
-`HOME`, `USER`, `LOGNAME`, `WORKSPACE_URL` (the workspace's `url`) and a
-`PATH` with the bundle's `sw/bin` first, for at most 60 s, and replies with
-what it printed and its exit code. The hook prints one URL on the
-workspace's own origin; the host checks that before it uses it.
+One argument, an app the VM booted with. Runs its `bin/open-link` as the
+owner, in their home, with `HOME`, `USER`, `LOGNAME`, `WORKSPACE_URL`,
+`APP_URL` (the app's `url`), `APP_PORT` and a `PATH` with the packages'
+`sw/bin` first, for at most 60 s, and replies with what it printed and its
+exit code. The hook prints one URL on the app's own origin; the host checks
+that before it uses it.
