@@ -58,9 +58,10 @@ memory pools.
   cloud-hypervisor, so the VM is the unit and no daemon's child. Restarting
   or upgrading the memory daemon or the CLI never stops a VM. A deploy does
   not restart workspaces either: a new app or package set reaches a
-  workspace at its next restart (`systemctl restart workbench@alice`).
+  workspace at its next restart (`workbench restart alice`).
   Stopping a workspace presses its ACPI power button and waits for the guest
-  to shut down.
+  to shut down; `workbench stop` keeps it stopped across host reboots until
+  `workbench start`.
 - **Declared in Nix, no reconciler.** Each workspace is rendered to
   `/etc/workbench/<name>.json` plus an instance of the template unit.
   Configs are also looked up in `/var/lib/workbench/configs`, which
@@ -100,6 +101,9 @@ Day to day, on the host:
 
 ```sh
 sudo workbench status
+sudo workbench restart alice        # with the host's app and system now
+sudo workbench stop alice           # stays stopped, also across reboots
+sudo workbench start alice
 sudo workbench console alice        # serial console, Ctrl-] quits
 sudo workbench destroy alice        # asks for the name, then deletes the disk
 ```
@@ -210,7 +214,7 @@ workspace; the menu waits `boot.loader.timeout`, one second by default.
 - creates the owner's account in `wheel` if it does not exist yet, and
   writes `/etc/nixos` on a new disk;
 - lets sshd read the owner's keys from the config share, with passwords off;
-- starts `workspace-agent.service` (memory reports, pairing) and
+- starts `workspace-agent.service` (memory reports, sign-in) and
   `workspace-app.service`, the app as the owner with the workspace's
   environment;
 - prepends the host's tools (`extraPackages`) to every login's `PATH`;
@@ -261,6 +265,38 @@ keeps working.
 | the `store` share | The app's closure, at `/nix/store` (Ubuntu) or `/run/workspace/host/nix/store` (NixOS) |
 | vsock | The agent reports memory to the host on `controlPort` and answers it on `agentPort` |
 
+## Web UI
+
+`services.workbench.web` serves a web UI at `https://<domain>` and puts
+single sign-on in front of every workspace: whatever the app does about
+accounts, only the workspace's owner and the admins reach it. People see
+and control their own workspaces: start, stop, restart, sign in to the app
+and the serial console. Admins see all of them and the host's memory.
+
+```nix
+services.workbench.web = {
+  enable = true;
+  admins = [ "alice" ];
+  oidc = {
+    issuerUrl = "https://sso.example.com/realms/example";
+    clientId = "workbench";
+    clientSecretFile = "/run/secrets/workbench-oidc";
+    cookieSecretFile = "/run/secrets/workbench-cookie"; # openssl rand -hex 16
+  };
+};
+```
+
+The identity provider, Keycloak by default, needs a confidential OIDC
+client with the redirect URI `https://<domain>/oauth2/callback`, and its
+`preferred_username` claim must be the LDAP uid workspaces have as
+`owner`. The certificate must cover `<domain>` as well as `*.<domain>`.
+
+The UI is `workbench-web`, a Leptos app in Rust: the server renders the
+pages and the browser hydrates them with the same components compiled to
+WebAssembly. It runs as its own user, reaches the VMs through sockets its
+group may use and starts, stops and restarts workspaces through polkit.
+[docs/web-ui.md](docs/web-ui.md) has the whole design.
+
 ## Apps
 
 Each workspace runs one app: the web UI its owner opens at
@@ -270,19 +306,30 @@ Each workspace runs one app: the web UI its owner opens at
 
 [T3 Code](https://github.com/pingdotgg/t3code) is the default
 (`package`, from [t3code-nix](https://github.com/OSSystems/t3code-nix)); it
-runs `t3 serve` on `appPort`. It has no accounts, so pairing is its
-authentication: a pairing link for the owner is made inside the guest, over
-vsock.
+runs `t3 serve` on `appPort`. It has no accounts: a browser gets in by
+following a one-time pairing link, made for the owner inside the guest.
+The module gives it the sign-in hook below, around `t3 auth pairing create`.
+
+### The sign-in hook
+
+An app bundle may have `bin/sign-in-link`. The agent runs it as the owner,
+with the workspace's URL in `WORKSPACE_URL`, when someone asks to sign a
+browser in to the app; it prints one URL on the workspace's own origin and
+nothing else on stdout. `workbench sign-in` prints it:
 
 ```sh
-sudo workbench pair alice           # flags after the name go to t3
+sudo workbench sign-in alice
 ```
+
+An app without the hook has no sign-in action.
 
 ## Development
 
 ```sh
-nix develop       # cargo, clippy, rustfmt, rust-analyzer; links ./vmkit
-cargo test
+nix develop       # cargo, clippy, rustfmt, rust-analyzer, lld, wasm-bindgen; links ./vmkit
+cargo test --workspace
+cargo test -p workbench-web --features ssr
+nix build .#web .#web.site   # the UI's server, and its WebAssembly and assets
 nix flake check   # rustfmt, clippy and the tests, the module evaluations, and the VM test
 nix fmt -- $(git ls-files '*.nix')
 ```

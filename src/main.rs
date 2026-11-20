@@ -6,6 +6,7 @@ use workbench::cli::{self, ExitCode};
 use workbench::config::DEFAULT_CONFIG_DIRS;
 use workbench::memoryd::{self, BehindPool};
 use workbench::{agent, launch};
+use workbench_model::Verb;
 
 /// Persistent per-person workspaces: long-lived cloud-hypervisor VMs.
 #[derive(Parser)]
@@ -32,13 +33,26 @@ enum Command {
         #[arg(long, default_value = "/var/lib/workbench")]
         state_root: PathBuf,
     },
-    /// Create a T3 Code pairing link for the owner; flags after the name go
-    /// to t3
-    Pair {
+    /// Start a workspace
+    Start {
         workspace: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        #[command(flatten)]
+        state: StateRoot,
     },
+    /// Stop a workspace; it stays stopped across host reboots until started
+    Stop {
+        workspace: String,
+        #[command(flatten)]
+        state: StateRoot,
+    },
+    /// Restart a workspace, with the app and system now on the host
+    Restart {
+        workspace: String,
+        #[command(flatten)]
+        state: StateRoot,
+    },
+    /// Print a link that signs a browser in to the workspace's app
+    SignIn { workspace: String },
     /// Attach to the serial console (Ctrl-] quits)
     Console { workspace: String },
     /// Stop a workspace and delete its disk
@@ -53,6 +67,8 @@ enum Command {
     },
     /// Become the workspace's VM (internal: the unit's ExecStart)
     Run { workspace: String },
+    /// Let the web UI use the VM's sockets (internal: the unit's ExecStartPost)
+    ShareSockets { workspace: String },
     /// Power the VM off cleanly (internal: the unit's ExecStop)
     Shutdown {
         workspace: String,
@@ -84,6 +100,13 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct StateRoot {
+    /// Where workspace disks and stop markers live
+    #[arg(long = "state-root", default_value = "/var/lib/workbench")]
+    path: PathBuf,
+}
+
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(args) {
@@ -103,13 +126,23 @@ fn run(args: Args) -> anyhow::Result<()> {
         // Becomes cloud-hypervisor: no runtime threads left behind.
         Command::Run { workspace } => launch::run(&dirs, &workspace),
         Command::Console { workspace } => cli::console(&dirs, &workspace),
+        Command::ShareSockets { workspace } => {
+            rt()?.block_on(launch::share_sockets(&dirs, &workspace, Duration::from_secs(60)))
+        }
         Command::Shutdown { workspace, timeout } => {
             rt()?.block_on(launch::shutdown(&dirs, &workspace, Duration::from_secs(timeout)))
         }
         Command::Memory { status_file, behind, reserve_percent, reserve_min_gib } => rt()?
             .block_on(memoryd::run(memoryd::Options { dirs, status_file, behind, reserve_percent, reserve_min_gib })),
         Command::GuestAgent { config } => rt()?.block_on(agent::run(&config)),
-        Command::Pair { workspace, args } => rt()?.block_on(cli::pair(&dirs, &workspace, args)),
+        Command::Start { workspace, state } => {
+            rt()?.block_on(cli::control(&dirs, &state.path, Verb::Start, &workspace))
+        }
+        Command::Stop { workspace, state } => rt()?.block_on(cli::control(&dirs, &state.path, Verb::Stop, &workspace)),
+        Command::Restart { workspace, state } => {
+            rt()?.block_on(cli::control(&dirs, &state.path, Verb::Restart, &workspace))
+        }
+        Command::SignIn { workspace } => rt()?.block_on(cli::sign_in(&dirs, &workspace)),
         Command::Status { json, state_root } => {
             rt()?.block_on(cli::status(&mut std::io::stdout().lock(), &dirs, &state_root, json))
         }

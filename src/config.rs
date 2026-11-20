@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use vmkit::hostutil;
+pub use workbench_model::{is_user_name, is_workspace_name};
 
 /// Searched in order for `<workspace>.json`: the declarative configs Nix
 /// renders, then configs made at run time.
@@ -83,26 +84,10 @@ pub struct Config {
 
     pub control_port: i64,
     pub agent_port: i64,
-}
 
-/// Whether `name` is a workspace name: a DNS label of at most 28
-/// characters, lowercase.
-#[must_use]
-pub fn is_workspace_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    (1..=28).contains(&b.len())
-        && b[0].is_ascii_lowercase()
-        && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        && b[b.len() - 1] != b'-'
-}
-
-/// Whether `name` is a user name the guest and host accept.
-#[must_use]
-pub fn is_user_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    (1..=32).contains(&b.len())
-        && (b[0].is_ascii_lowercase() || b[0] == b'_')
-        && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-'))
+    /// When set, may use the VM's sockets: the web UI's group.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub socket_group: String,
 }
 
 fn is_mac(mac: &str) -> bool {
@@ -191,6 +176,11 @@ impl Config {
         }
         ensure!(port(self.app_port) && port(self.control_port) && port(self.agent_port), "invalid port");
         ensure!(self.control_port != self.agent_port, "controlPort and agentPort must differ");
+        ensure!(
+            self.socket_group.is_empty() || is_user_name(&self.socket_group),
+            "invalid socket group {:?}",
+            self.socket_group
+        );
         for (k, v) in &self.environment {
             ensure!(is_env_name(k) && !v.contains(['\n', '\0']), "invalid environment variable {k:?}");
         }
@@ -233,6 +223,13 @@ impl Config {
     #[must_use]
     pub fn serial(&self) -> PathBuf {
         self.vm_dir().join("serial.sock")
+    }
+
+    /// Records the app the running VM started with, to tell when the host
+    /// has a newer one.
+    #[must_use]
+    pub fn started_app(&self) -> PathBuf {
+        Path::new(&self.runtime_dir).join("app")
     }
 
     /// The host side of the guest's control port.
@@ -355,6 +352,7 @@ pub(crate) mod tests {
             secrets_dir: "/var/lib/workbench-secrets/alice-dev".into(),
             control_port: 5001,
             agent_port: 5002,
+            socket_group: String::new(),
         }
     }
 
@@ -393,6 +391,7 @@ pub(crate) mod tests {
             ("ubuntu without seed", |c| c.seed = String::new()),
             ("nixos with seed", |c| c.os = "nixos".into()),
             ("same vsock ports", |c| c.agent_port = c.control_port),
+            ("bad socket group", |c| c.socket_group = "wheel users".into()),
             ("port out of range", |c| c.app_port = 70000),
             ("env newline", |c| c.environment = [("A".into(), "x\nB=y".into())].into()),
             ("env name", |c| c.environment = [("A-B".into(), "x".into())].into()),
@@ -403,16 +402,6 @@ pub(crate) mod tests {
             let mut c = test_config();
             change(&mut c);
             assert!(c.validate().is_err(), "{name}: accepted");
-        }
-    }
-
-    #[test]
-    fn names() {
-        for ok in ["a", "ab", "a-b", "alice-dev", &"a".repeat(28)] {
-            assert!(is_workspace_name(ok), "{ok}");
-        }
-        for bad in ["", "-a", "a-", "1a", "A", "a_b", "a.b", &"a".repeat(29)] {
-            assert!(!is_workspace_name(bad), "{bad}");
         }
     }
 

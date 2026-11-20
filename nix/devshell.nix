@@ -6,6 +6,9 @@ pkgs.mkShell {
     rustc
     rustfmt
     rust-analyzer
+    # The web UI's WebAssembly.
+    lld
+    wasm-bindgen-cli_0_2_126
   ];
   env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
   # The crate builds against the vmkit the flake locks, as the package does:

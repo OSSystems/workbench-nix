@@ -108,7 +108,14 @@ let
       #!${pkgs.runtimeShell}
       exec ${exe} guest-agent --config=/run/workspace/config/workspace.json
       EOF
-      chmod +x $out/bin/serve $out/bin/workspace-agent
+      # The sign-in hook: one link that signs a browser in to T3 Code.
+      cat > $out/bin/sign-in-link <<EOF
+      #!${pkgs.runtimeShell}
+      set -eo pipefail
+      export T3CODE_HOME=\$HOME/.t3
+      ${t3} auth pairing create --base-url "\$WORKSPACE_URL" --label workbench --json | ${lib.getExe pkgs.jq} -er .pairUrl
+      EOF
+      chmod +x $out/bin/serve $out/bin/workspace-agent $out/bin/sign-in-link
     '';
 
   mountUnit = what: where: ''
@@ -314,6 +321,7 @@ let
       secretsDir = secretsDirOf name ws;
       inherit controlPort agentPort;
     }
+    // lib.optionalAttrs cfg.web.enable { socketGroup = "workbench"; }
     // (
       if ws.os == "ubuntu" then
         {
@@ -651,7 +659,8 @@ in
 
     systemd = {
       tmpfiles.rules = [
-        "d ${cfg.stateDir} 0711 root root -"
+        # The web UI's group lists it, for the disks of removed workspaces.
+        "d ${cfg.stateDir} ${if cfg.web.enable then "0751 root workbench" else "0711 root root"} -"
         "d /var/lib/workbench-secrets 0700 root root -"
       ]
       ++ lib.mapAttrsToList (name: ws: "d ${secretsDirOf name ws} 0700 root root -") cfg.workspaces;
@@ -661,8 +670,12 @@ in
           description = "Workspace VM %i";
           after = [ "systemd-networkd.service" ];
           restartIfChanged = false;
+          # `workbench stop` leaves this marker so a stopped workspace stays
+          # stopped across reboots; `workbench start` removes it.
+          unitConfig.ConditionPathExists = "!${cfg.stateDir}/.stopped/%i";
           serviceConfig = {
             ExecStart = "${exe} run %i";
+            ExecStartPost = "${exe} share-sockets %i";
             ExecStop = "${exe} shutdown %i";
             RuntimeDirectory = "workbench/%i";
             RuntimeDirectoryMode = "0711";

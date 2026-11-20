@@ -3,6 +3,7 @@
   imports = [
     inputs.vmkit.nixosModules.default
     ./workspaces.nix
+    ./web.nix
     (
       { lib, pkgs, ... }:
       {
