@@ -10,6 +10,8 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+pub mod self_service;
+
 /// A gibibyte.
 pub const GIB: i64 = 1 << 30;
 
@@ -89,6 +91,8 @@ impl fmt::Display for State {
 
 /// One workspace as `workbench status --json` and the web UI's
 /// `/api/workspaces` give it.
+// Independent facts of a status record, not states of one machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -131,6 +135,14 @@ pub struct Workspace {
     /// `up` or `down` while the VM runs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent: String,
+    /// Made at run time, by its owner: its owner reaches it only while in
+    /// a self-service group, and it may be destroyed from the web UI.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub self_service: bool,
+    /// Its owner left the self-service groups or the directory: it was
+    /// stopped, and its disk kept for an admin.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owner_left: bool,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -148,21 +160,34 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Who is asking: single sign-on names them, the configuration makes them
-/// an admin.
+/// Who is asking: single sign-on names them and their groups, which with
+/// the configuration make them an admin, or someone who makes their own
+/// workspaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Viewer {
     pub name: String,
     pub admin: bool,
+    /// May make workspaces of their own: in a self-service group, or an
+    /// admin.
+    #[serde(default)]
+    pub creates: bool,
 }
 
 impl Viewer {
     /// Whether the viewer sees and controls a workspace: its owner and the
-    /// admins do. A workspace removed from the configuration is the
+    /// admins do, the owner of one made at run time only while they may
+    /// make workspaces. A workspace removed from the configuration is the
     /// admins'.
     #[must_use]
     pub fn may(&self, ws: &Workspace) -> bool {
-        self.admin || (ws.configured && ws.owner == self.name)
+        self.admin || (ws.configured && self.may_use(&ws.owner, ws.self_service))
+    }
+
+    /// The owner rule, from what a workspace's config says: what the list
+    /// and nginx's access check both apply.
+    #[must_use]
+    pub fn may_use(&self, owner: &str, self_service: bool) -> bool {
+        self.admin || (owner == self.name && (!self_service || self.creates))
     }
 
     /// Whether the workspace is the viewer's own.
@@ -427,6 +452,16 @@ pub struct HostView {
     pub workspaces: Vec<Workspace>,
     /// When it was read, as a time of day.
     pub at: String,
+    /// People's quotas, when the host lets people make workspaces.
+    #[serde(default)]
+    pub quotas: Option<Quotas>,
+}
+
+/// The host page's quotas: the host's, and each person's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quotas {
+    pub default: u32,
+    pub people: Vec<self_service::QuotaRow>,
 }
 
 /// One memory pool on the host page.
@@ -470,18 +505,32 @@ mod tests {
         let rows = [ws("alice", "alice", State::Running), ws("bob", "bob", State::Stopped)];
         let mut removed = ws("old", "", State::Stopped);
         removed.ws.configured = false;
-        let alice = Snapshot::of(Viewer { name: "alice".into(), admin: false }, [rows[0].clone(), rows[1].clone()]);
+        let alice = Snapshot::of(
+            Viewer { name: "alice".into(), admin: false, creates: false },
+            [rows[0].clone(), rows[1].clone()],
+        );
         assert_eq!(alice.rows.len(), 1);
-        let carol = Viewer { name: "carol".into(), admin: true };
+        let carol = Viewer { name: "carol".into(), admin: true, creates: true };
         assert!(carol.may(&rows[1].ws) && carol.may(&removed.ws));
         let mut mallory = removed.clone();
         mallory.ws.owner = "mallory".into();
-        assert!(!Viewer { name: "mallory".into(), admin: false }.may(&mallory.ws), "a removed workspace is no one's");
+        assert!(
+            !Viewer { name: "mallory".into(), admin: false, creates: false }.may(&mallory.ws),
+            "a removed workspace is no one's"
+        );
+        let mut made = rows[0].clone();
+        made.ws.self_service = true;
+        let alice = |creates| Viewer { name: "alice".into(), admin: false, creates };
+        assert!(
+            alice(true).may(&made.ws) && !alice(false).may(&made.ws),
+            "a workspace made at run time needs the group"
+        );
+        assert!(alice(false).may(&rows[0].ws), "one from the configuration does not");
     }
 
     #[test]
     fn list_groups_and_selects() {
-        let viewer = Viewer { name: "alice".into(), admin: true };
+        let viewer = Viewer { name: "alice".into(), admin: true, creates: true };
         let snap = Snapshot::of(
             viewer,
             [

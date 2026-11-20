@@ -289,7 +289,34 @@ services.workbench.web = {
 The identity provider, Keycloak by default, needs a confidential OIDC
 client with the redirect URI `https://<domain>/oauth2/callback`, and its
 `preferred_username` claim must be the LDAP uid workspaces have as
-`owner`. The certificate must cover `<domain>` as well as `*.<domain>`.
+`owner`; a `groups` claim gives the roles below. One virtual host serves
+every workspace, so the certificate must be a wildcard for `*.<domain>`, as
+well as `<domain>`, given through `virtualHost` (such as `useACMEHost`).
+
+### Workspaces people make themselves
+
+With `web.selfService`, members of its groups make their own workspaces in
+the UI, within a quota admins change there, and destroy them:
+
+```nix
+services.workbench.web = {
+  adminGroups = [ "workbench-admins" ];
+  selfService = {
+    enable = true;
+    groups = [ "workbench" ];
+    # Prints the workspace's secret environment, the app's credential,
+    # for an owner; failing or printing nothing refuses the request.
+    environmentCommand = "/path/to/workspace-env";
+    # Exit 0 while an owner stays, 1 once they left the group or the
+    # directory; the timer then stops their workspaces and keeps the disks.
+    ownerCommand = "/path/to/workspace-owner";
+  };
+};
+```
+
+The UI stays unprivileged: it writes the request, and
+`workbench-create@<ws>.service` makes the workspace as root, with its VM
+user as a userdb record and its tap as systemd-networkd files.
 
 The UI is `workbench-web`, a Leptos app in Rust: the server renders the
 pages and the browser hydrates them with the same components compiled to

@@ -36,10 +36,8 @@ pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
     let vm_user = hostutil::lookup_account(&c.user).context("VM user")?;
     virtiofs::require_private_mounts()?;
-    fs::metadata(Path::new("/sys/class/net").join(&c.tap)).with_context(|| format!("tap {}", c.tap))?;
-    // Others may stat the disk, for its size, but not list or read it.
-    ensure_dir(Path::new(&c.state_dir), 0o711, &vm_user)?;
-    prepare_disk(&c, &vm_user).context("preparing disk")?;
+    wait_for_tap(&c.tap)?;
+    prepare_state(&c, &vm_user)?;
     for dir in [c.vm_dir(), c.shares_dir()] {
         match fs::remove_dir_all(&dir) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e).context(dir.display().to_string()),
@@ -88,6 +86,27 @@ pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let err =
         Command::new(&argv[0]).args(&argv[1..]).current_dir(c.vm_dir()).env_clear().env("PATH", "/var/empty").exec();
     Err(err).context("exec cloud-hypervisor")
+}
+
+/// Waits for the tap: systemd-networkd makes the tap of a workspace made
+/// at run time once its files are in, which may be just before the start.
+fn wait_for_tap(tap: &str) -> anyhow::Result<()> {
+    let dev = Path::new("/sys/class/net").join(tap);
+    for _ in 0..150 {
+        if dev.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    fs::metadata(&dev).with_context(|| format!("tap {tap}"))?;
+    Ok(())
+}
+
+/// Makes the state directory and the disk, as the VM user's. Others may
+/// stat the disk, for its size, but not list or read it.
+pub(crate) fn prepare_state(c: &Config, vm_user: &Account) -> anyhow::Result<()> {
+    ensure_dir(Path::new(&c.state_dir), 0o711, vm_user)?;
+    prepare_disk(c, vm_user).context("preparing disk")
 }
 
 /// Makes a directory with `mode`, owned by `owner`.

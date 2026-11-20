@@ -361,6 +361,82 @@ let
   configFile =
     name: ws: pkgs.writeText "workbench-${name}.json" (builtins.toJSON (workspaceConfig name ws));
 
+  # What every workspace made at run time shares: `workbench self-service`
+  # fills in the rest, as `workspaceConfig` would.
+  ss = cfg.web.selfService;
+  selfServiceTemplate =
+    let
+      app = guestApp "self-service" {
+        extraPackages = [ ];
+        appPort = 3773;
+      };
+      closure = pkgs.closureInfo { rootPaths = [ app ]; };
+      images = {
+        ubuntu = {
+          inherit (cfg) image imageFormat;
+          userData = userData "@name@" {
+            owner = "@owner@";
+            sshAuthorizedKeys = [ ];
+            sudo = true;
+          };
+        };
+        nixos = { inherit (cfg.nixos) image imageFormat; };
+      };
+    in
+    {
+      limits = {
+        inherit (ss)
+          os
+          quota
+          maxMemoryGiB
+          maxDiskGiB
+          ;
+        bootMemMiB = cfg.memory.bootMiB;
+      };
+      inherit (cfg) domain stateDir;
+      scheme = cfg.publicScheme;
+      secretsRoot = "/var/lib/workbench-secrets";
+      inherit (cfg.network) subnet nameservers;
+      appPort = 3773;
+      inherit controlPort agentPort;
+      cpus = 0;
+      cloudHypervisor = lib.getExe pkgs.cloud-hypervisor;
+      virtiofsd = lib.getExe pkgs.virtiofsd;
+      qemuImg = lib.getExe' pkgs.qemu-utils "qemu-img";
+      firmware = "${pkgs.OVMF-cloud-hypervisor.fd}/FV/CLOUDHV.fd";
+      closure = "${closure}/store-paths";
+      registration = "${closure}/registration";
+      app = "${app}";
+      inherit (cfg) environment;
+      environmentFiles = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
+      socketGroup = "workbench";
+      images = lib.getAttrs ss.os images;
+      mkfsVfat = "${pkgs.dosfstools}/bin/mkfs.vfat";
+      mcopy = "${pkgs.mtools}/bin/mcopy";
+      inherit (ss) environmentCommand;
+      ownerCommand = if ss.ownerCommand == null then "" else ss.ownerCommand;
+    };
+  selfServiceUnit = description: args: {
+    inherit description;
+    after = [
+      "systemd-networkd.service"
+      "systemd-userdbd.socket"
+    ];
+    path = [ config.systemd.package ];
+    serviceConfig = {
+      Type = "oneshot";
+      # The web UI waits a little longer for the outcome.
+      TimeoutStartSec = "10min";
+      ExecStart = lib.escapeShellArgs (
+        [
+          exe
+          "self-service"
+        ]
+        ++ args
+      );
+    };
+  };
+
   workspaceModule =
     { name, ... }:
     {
@@ -606,202 +682,254 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    assertions =
-      let
-        ips = lib.mapAttrsToList (_: ws: ws.ip) cfg.workspaces;
-        inSubnet =
-          ip:
+  config = lib.mkIf cfg.enable (
+    lib.mkMerge [
+      {
+        assertions =
           let
-            o = octets ip;
+            ips = lib.mapAttrsToList (_: ws: ws.ip) cfg.workspaces;
+            inSubnet =
+              ip:
+              let
+                o = octets ip;
+              in
+              lib.length o == 4
+              && lib.concatStringsSep "." (map toString (lib.take 3 o)) == cfg.network.subnet
+              && lib.elemAt o 3 >= 2
+              && lib.elemAt o 3 <= 254;
           in
-          lib.length o == 4
-          && lib.concatStringsSep "." (map toString (lib.take 3 o)) == cfg.network.subnet
-          && lib.elemAt o 3 >= 2
-          && lib.elemAt o 3 <= 254;
-      in
-      [
-        {
-          assertion = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
-          message = "services.workbench: only x86_64-linux hosts are supported.";
-        }
-        {
-          assertion = lib.length ips == lib.length (lib.unique ips);
-          message = "services.workbench.workspaces: every workspace needs a distinct ip.";
-        }
-      ]
-      ++ lib.mapAttrsToList (name: ws: {
-        assertion =
-          builtins.match "[a-z]([a-z0-9-]{0,26}[a-z0-9])?" name != null
-          && builtins.match "[a-z_][a-z0-9_.-]{0,31}" ws.owner != null
-          && ws.owner != "root"
-          && inSubnet ws.ip;
-        message = "services.workbench.workspaces.${name}: the name must be a DNS label of at most 28 characters, the owner a user name other than root, and ip an address in ${cfg.network.subnet}.2-254.";
-      }) cfg.workspaces
-      ++ lib.mapAttrsToList (name: ws: {
-        assertion = ws.os == "nixos" -> ws.sudo;
-        message = "services.workbench.workspaces.${name}: a NixOS workspace needs sudo; its owner rebuilds the system.";
-      }) cfg.workspaces;
+          [
+            {
+              assertion = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+              message = "services.workbench: only x86_64-linux hosts are supported.";
+            }
+            {
+              assertion = lib.length ips == lib.length (lib.unique ips);
+              message = "services.workbench.workspaces: every workspace needs a distinct ip.";
+            }
+          ]
+          ++ lib.mapAttrsToList (name: ws: {
+            assertion =
+              builtins.match "[a-z]([a-z0-9-]{0,26}[a-z0-9])?" name != null
+              && builtins.match "[a-z_][a-z0-9_.-]{0,31}" ws.owner != null
+              && ws.owner != "root"
+              && inSubnet ws.ip;
+            message = "services.workbench.workspaces.${name}: the name must be a DNS label of at most 28 characters, the owner a user name other than root, and ip an address in ${cfg.network.subnet}.2-254.";
+          }) cfg.workspaces
+          ++ lib.mapAttrsToList (name: ws: {
+            assertion = ws.os == "nixos" -> ws.sudo;
+            message = "services.workbench.workspaces.${name}: a NixOS workspace needs sudo; its owner rebuilds the system.";
+          }) cfg.workspaces;
 
-    environment.systemPackages = [ package ];
-    environment.etc = lib.mapAttrs' (
-      name: ws: lib.nameValuePair "workbench/${name}.json" { source = configFile name ws; }
-    ) cfg.workspaces;
+        environment.systemPackages = [ package ];
+        environment.etc = lib.mapAttrs' (
+          name: ws: lib.nameValuePair "workbench/${name}.json" { source = configFile name ws; }
+        ) cfg.workspaces;
 
-    users.users = lib.mapAttrs' (
-      name: _:
-      lib.nameValuePair (userOf name) {
-        isSystemUser = true;
-        group = "kvm";
-        description = "cloud-hypervisor of workspace ${name}";
-      }
-    ) cfg.workspaces;
+        users.users = lib.mapAttrs' (
+          name: _:
+          lib.nameValuePair (userOf name) {
+            isSystemUser = true;
+            group = "kvm";
+            description = "cloud-hypervisor of workspace ${name}";
+          }
+        ) cfg.workspaces;
 
-    systemd = {
-      tmpfiles.rules = [
-        # The web UI's group lists it, for the disks of removed workspaces.
-        "d ${cfg.stateDir} ${if cfg.web.enable then "0751 root workbench" else "0711 root root"} -"
-        "d /var/lib/workbench-secrets 0700 root root -"
-      ]
-      ++ lib.mapAttrsToList (name: ws: "d ${secretsDirOf name ws} 0700 root root -") cfg.workspaces;
+        systemd = {
+          tmpfiles.rules = [
+            # The web UI's group lists it, for the disks of removed workspaces.
+            "d ${cfg.stateDir} ${if cfg.web.enable then "0751 root workbench" else "0711 root root"} -"
+            "d /var/lib/workbench-secrets 0700 root root -"
+          ]
+          ++ lib.mapAttrsToList (name: ws: "d ${secretsDirOf name ws} 0700 root root -") cfg.workspaces;
 
-      services = {
-        "workbench@" = {
-          description = "Workspace VM %i";
-          after = [ "systemd-networkd.service" ];
-          restartIfChanged = false;
-          # `workbench stop` leaves this marker so a stopped workspace stays
-          # stopped across reboots; `workbench start` removes it.
-          unitConfig.ConditionPathExists = "!${cfg.stateDir}/.stopped/%i";
-          serviceConfig = {
-            ExecStart = "${exe} run %i";
-            ExecStartPost = "${exe} share-sockets %i";
-            ExecStop = "${exe} shutdown %i";
-            RuntimeDirectory = "workbench/%i";
-            RuntimeDirectoryMode = "0711";
-            PrivateMounts = true;
-            Restart = "always";
-            RestartSec = 5;
-            TimeoutStopSec = 120;
-            CPUAccounting = true;
-            MemoryAccounting = true;
+          services = {
+            "workbench@" = {
+              description = "Workspace VM %i";
+              after = [ "systemd-networkd.service" ];
+              restartIfChanged = false;
+              # `workbench stop` leaves this marker so a stopped workspace stays
+              # stopped across reboots; `workbench start` removes it.
+              unitConfig.ConditionPathExists = "!${cfg.stateDir}/.stopped/%i";
+              serviceConfig = {
+                ExecStart = "${exe} run %i";
+                ExecStartPost = "${exe} share-sockets %i";
+                ExecStop = "${exe} shutdown %i";
+                RuntimeDirectory = "workbench/%i";
+                RuntimeDirectoryMode = "0711";
+                PrivateMounts = true;
+                Restart = "always";
+                RestartSec = 5;
+                TimeoutStopSec = 120;
+                CPUAccounting = true;
+                MemoryAccounting = true;
+              };
+            };
+
+            workbench-memory = {
+              description = "Grow and shrink workspace memory";
+              wantedBy = [ "multi-user.target" ];
+              serviceConfig = {
+                ExecStart = lib.escapeShellArgs (
+                  [
+                    exe
+                    "memory"
+                    "--mem-reserve-percent=${toString cfg.memory.reservePercent}"
+                    "--mem-reserve-min-gib=${toString vmkit.memory.reserveMinGiB}"
+                    "--memory-status=${vmkit.memory.pools.${poolName}.statusFile}"
+                  ]
+                  ++ lib.mapAttrsToList (_: p: "--behind=${p.statusFile}=${toString p.guaranteedGiB}") behind
+                );
+                RuntimeDirectory = "workbench-memory";
+                RuntimeDirectoryPreserve = "restart";
+                Restart = "always";
+                RestartSec = 5;
+              };
+            };
+          }
+          // lib.mapAttrs' (
+            name: ws:
+            let
+              device = "sys-subsystem-net-devices-${tapOf ws}.device";
+            in
+            lib.nameValuePair "workbench@${name}" {
+              overrideStrategy = "asDropin";
+              wantedBy = [ "multi-user.target" ];
+              requires = [ device ];
+              after = [ device ];
+              restartIfChanged = false;
+            }
+          ) cfg.workspaces;
+
+          network = {
+            enable = true;
+            wait-online.enable = false;
+            config.networkConfig = {
+              ManageForeignRoutes = false;
+              ManageForeignRoutingPolicyRules = false;
+            };
+            netdevs = lib.mapAttrs' (
+              name: ws:
+              lib.nameValuePair "40-${tapOf ws}" {
+                netdevConfig = {
+                  Kind = "tap";
+                  Name = tapOf ws;
+                };
+                tapConfig = {
+                  User = userOf name;
+                  Group = "kvm";
+                  VNetHeader = true;
+                };
+              }
+            ) cfg.workspaces;
+            networks = lib.mapAttrs' (
+              name: ws:
+              lib.nameValuePair "40-${tapOf ws}" {
+                matchConfig.Name = tapOf ws;
+                address = [ "${hostAddress}/32" ];
+                routes = [ { Destination = "${ws.ip}/32"; } ];
+                networkConfig = {
+                  ConfigureWithoutCarrier = true;
+                  IgnoreCarrierLoss = true;
+                  LinkLocalAddressing = "no";
+                  IPv6AcceptRA = false;
+                };
+                linkConfig.RequiredForOnline = "no";
+              }
+            ) cfg.workspaces;
           };
         };
 
-        workbench-memory = {
-          description = "Grow and shrink workspace memory";
-          wantedBy = [ "multi-user.target" ];
-          serviceConfig = {
-            ExecStart = lib.escapeShellArgs (
-              [
-                exe
-                "memory"
-                "--mem-reserve-percent=${toString cfg.memory.reservePercent}"
-                "--mem-reserve-min-gib=${toString vmkit.memory.reserveMinGiB}"
-                "--memory-status=${vmkit.memory.pools.${poolName}.statusFile}"
-              ]
-              ++ lib.mapAttrsToList (_: p: "--behind=${p.statusFile}=${toString p.guaranteedGiB}") behind
-            );
-            RuntimeDirectory = "workbench-memory";
-            RuntimeDirectoryPreserve = "restart";
-            Restart = "always";
-            RestartSec = 5;
+        # Workspaces reach the internet and allowed endpoints only, and come
+        # first for memory on a shared host.
+        services.vmkit = {
+          inherit (cfg.network) externalInterface;
+          networks.${poolName} = {
+            inherit (cfg.network) subnet;
+            interface = "wb+";
+            chain = "wb";
+            inherit forwardRules;
+            blockIPv6 = true;
           };
+          memory.pools.${poolName}.rank = "first";
+        };
+
+        networking = {
+          networkmanager.unmanaged = lib.mkIf config.networking.networkmanager.enable [
+            "interface-name:wb*"
+          ];
+        };
+
+        # With the web UI, one virtual host of its serves every workspace.
+        services.nginx = {
+          enable = true;
+          recommendedProxySettings = true;
+          virtualHosts = lib.mkIf (!cfg.web.enable) (
+            lib.mapAttrs' (
+              name: ws:
+              lib.nameValuePair (hostFor name) (
+                cfg.virtualHost
+                // {
+                  locations."/" = {
+                    proxyPass = "http://${ws.ip}:${toString ws.appPort}";
+                    proxyWebsockets = true;
+                    extraConfig = ''
+                      proxy_read_timeout 1d;
+                      proxy_send_timeout 1d;
+                      client_max_body_size 64m;
+                    '';
+                  };
+                }
+              )
+            ) cfg.workspaces
+          );
         };
       }
-      // lib.mapAttrs' (
-        name: ws:
-        let
-          device = "sys-subsystem-net-devices-${tapOf ws}.device";
-        in
-        lib.nameValuePair "workbench@${name}" {
-          overrideStrategy = "asDropin";
-          wantedBy = [ "multi-user.target" ];
-          requires = [ device ];
-          after = [ device ];
-          restartIfChanged = false;
-        }
-      ) cfg.workspaces;
+      (lib.mkIf (cfg.web.enable && ss.enable) {
+        environment.etc."workbench-self-service.json".text = builtins.toJSON selfServiceTemplate;
 
-      network = {
-        enable = true;
-        wait-online.enable = false;
-        config.networkConfig = {
-          ManageForeignRoutes = false;
-          ManageForeignRoutingPolicyRules = false;
+        # The VMs' users of workspaces made at run time are userdb records.
+        services.userdbd = {
+          enable = true;
+          # It warns for systemd-homed's sake, which workspaces don't use.
+          silenceHighSystemUsers = lib.mkDefault true;
         };
-        netdevs = lib.mapAttrs' (
-          name: ws:
-          lib.nameValuePair "40-${tapOf ws}" {
-            netdevConfig = {
-              Kind = "tap";
-              Name = tapOf ws;
-            };
-            tapConfig = {
-              User = userOf name;
-              Group = "kvm";
-              VNetHeader = true;
-            };
-          }
-        ) cfg.workspaces;
-        networks = lib.mapAttrs' (
-          name: ws:
-          lib.nameValuePair "40-${tapOf ws}" {
-            matchConfig.Name = tapOf ws;
-            address = [ "${hostAddress}/32" ];
-            routes = [ { Destination = "${ws.ip}/32"; } ];
-            networkConfig = {
-              ConfigureWithoutCarrier = true;
-              IgnoreCarrierLoss = true;
-              LinkLocalAddressing = "no";
-              IPv6AcceptRA = false;
-            };
-            linkConfig.RequiredForOnline = "no";
-          }
-        ) cfg.workspaces;
-      };
-    };
 
-    # Workspaces reach the internet and allowed endpoints only, and come
-    # first for memory on a shared host.
-    services.vmkit = {
-      inherit (cfg.network) externalInterface;
-      networks.${poolName} = {
-        inherit (cfg.network) subnet;
-        interface = "wb+";
-        chain = "wb";
-        inherit forwardRules;
-        blockIPv6 = true;
-      };
-      memory.pools.${poolName}.rank = "first";
-    };
-
-    networking = {
-      networkmanager.unmanaged = lib.mkIf config.networking.networkmanager.enable [
-        "interface-name:wb*"
-      ];
-    };
-
-    services.nginx = {
-      enable = true;
-      recommendedProxySettings = true;
-      virtualHosts = lib.mapAttrs' (
-        name: ws:
-        lib.nameValuePair (hostFor name) (
-          cfg.virtualHost
-          // {
-            locations."/" = {
-              proxyPass = "http://${ws.ip}:${toString ws.appPort}";
-              proxyWebsockets = true;
-              extraConfig = ''
-                proxy_read_timeout 1d;
-                proxy_send_timeout 1d;
-                client_max_body_size 64m;
-              '';
+        systemd.services = {
+          "workbench-create@" = selfServiceUnit "Make workspace %i" [
+            "create"
+            "%i"
+          ];
+          "workbench-destroy@" = selfServiceUnit "Destroy workspace %i" [
+            "destroy"
+            "%i"
+          ];
+          workbench-self-service =
+            selfServiceUnit "Users, taps and starts of workspaces made at run time" [ "setup" ]
+            // {
+              wantedBy = [ "multi-user.target" ];
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                ExecStart = lib.escapeShellArgs [
+                  exe
+                  "self-service"
+                  "setup"
+                ];
+              };
             };
-          }
-        )
-      ) cfg.workspaces;
-    };
-  };
+          workbench-self-service-reconcile = selfServiceUnit "Stop the workspaces of owners who left" [
+            "reconcile"
+          ];
+        };
+        systemd.timers.workbench-self-service-reconcile = {
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnBootSec = "5min";
+            OnUnitActiveSec = ss.reconcileInterval;
+          };
+        };
+      })
+    ]
+  );
 }

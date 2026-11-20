@@ -1,7 +1,7 @@
-//! nginx's `auth_request` for every workspace: only its owner and the
-//! admins reach its app, and the app gets the browser's cookies without the
-//! single sign-on one, so code in a workspace cannot replay it against the
-//! UI or another workspace.
+//! nginx's `auth_request` for every workspace: only those the UI lets use
+//! it reach its app, at the address the answer names, and the app gets the
+//! browser's cookies without the single sign-on one, so code in a workspace
+//! cannot replay it against the UI or another workspace.
 
 use std::time::{Duration, Instant};
 
@@ -13,9 +13,10 @@ use http_body_util::Empty;
 use hyper::body::Bytes;
 use workbench_model::is_user_name;
 
-use super::{AppState, lock};
+use super::{AppState, Identity, lock};
 
-/// How long an answer about a cookie is reused.
+/// How long what oauth2-proxy said about a cookie is reused; the decision
+/// is made for every request.
 const CACHE_FOR: Duration = Duration::from_secs(10);
 
 /// `GET /authz`, with the workspace in `X-Workbench-Workspace`.
@@ -24,18 +25,21 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
     // An app's cookie may hold any byte: only the SSO cookie must be text.
     let cookie = headers.get(header::COOKIE).map_or(&[][..], HeaderValue::as_bytes);
     let sso = String::from_utf8_lossy(cookie);
-    let user = match whoami(&state, &sso).await {
-        Ok(user) => user,
+    let who = match whoami(&state, &sso).await {
+        Ok(who) => who,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
-    let Some(viewer) = state.viewer(&user) else { return StatusCode::UNAUTHORIZED.into_response() };
+    let Some(viewer) = state.viewer(&who.user, &who.groups) else { return StatusCode::UNAUTHORIZED.into_response() };
     let mut out = HeaderMap::new();
     if let Ok(v) = HeaderValue::from_str(&viewer.name) {
         out.insert("x-workbench-user", v);
     }
-    let allowed = state.backend.config(name).is_ok_and(|c| viewer.admin || c.owner == viewer.name);
-    if !allowed {
-        return (StatusCode::FORBIDDEN, out).into_response();
+    // The owner rule of the list, from the config alone: a workspace made
+    // at run time needs its owner still in a self-service group.
+    let config = state.backend.config(name).ok().filter(|c| viewer.may_use(&c.owner, c.self_service));
+    let Some(c) = config else { return (StatusCode::FORBIDDEN, out).into_response() };
+    if let Ok(v) = HeaderValue::from_str(&format!("{}:{}", c.ip, c.app_port)) {
+        out.insert("x-workbench-upstream", v);
     }
     if let Ok(v) = HeaderValue::from_bytes(&without_cookie(cookie, &state.opts.cookie_name)) {
         out.insert("x-workbench-cookie", v);
@@ -43,27 +47,33 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
     (StatusCode::OK, out).into_response()
 }
 
-/// Who a cookie header is signed in as, asked of oauth2-proxy at most
-/// every 10 s per cookie; empty for nobody.
-async fn whoami(state: &AppState, cookie: &str) -> anyhow::Result<String> {
+/// Who a cookie header is signed in as, and their groups, asked of
+/// oauth2-proxy at most every 10 s per cookie; no one has an empty name.
+async fn whoami(state: &AppState, cookie: &str) -> anyhow::Result<Identity> {
     if !cookie.contains(&state.opts.cookie_name) {
-        return Ok(String::new());
+        return Ok(Identity::default());
     }
-    if let Some((user, at)) = lock(&state.authz).get(cookie)
+    if let Some((who, at)) = lock(&state.authz).get(cookie)
         && at.elapsed() < CACHE_FOR
     {
-        return Ok(user.clone());
+        return Ok(who.clone());
     }
-    let user = state.backend.whoami(cookie).await?;
+    let who = state.backend.whoami(cookie).await?;
     let mut cache = lock(&state.authz);
     cache.retain(|_, (_, at)| at.elapsed() < CACHE_FOR);
-    cache.insert(cookie.to_owned(), (user.clone(), Instant::now()));
-    Ok(user)
+    cache.insert(cookie.to_owned(), (who.clone(), Instant::now()));
+    Ok(who)
 }
 
-/// Asks oauth2-proxy at `base` whose session a cookie holds; empty when
-/// none.
-pub async fn ask_oauth2_proxy(base: &str, cookie: &str) -> anyhow::Result<String> {
+/// The groups in oauth2-proxy's comma-separated header.
+#[must_use]
+pub fn groups(header: &str) -> Vec<String> {
+    header.split(',').map(str::trim).filter(|g| !g.is_empty()).map(str::to_owned).collect()
+}
+
+/// Asks oauth2-proxy at `base` whose session a cookie holds, and their
+/// groups; no one when none.
+pub async fn ask_oauth2_proxy(base: &str, cookie: &str) -> anyhow::Result<Identity> {
     let url: hyper::Uri = format!("{base}/oauth2/auth").parse().context("--oauth2-proxy")?;
     let authority = url.authority().context("--oauth2-proxy needs a host")?.clone();
     let ask = async {
@@ -87,9 +97,9 @@ pub async fn ask_oauth2_proxy(base: &str, cookie: &str) -> anyhow::Result<String
             if !is_user_name(&user) {
                 bail!("oauth2-proxy gave the user {user:?}");
             }
-            Ok(user)
+            Ok(Identity { user, groups: groups(&header("x-auth-request-groups")) })
         }
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Ok(String::new()),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Ok(Identity::default()),
         s => bail!("oauth2-proxy answered {s}"),
     }
 }

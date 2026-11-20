@@ -2,6 +2,7 @@
 //! stop and restart; and the app's sign-in link. The CLI and the web UI
 //! both call these.
 
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -154,6 +155,8 @@ async fn probe(dirs: &[PathBuf], state_root: &Path, name: String, u: UnitInfo) -
     let mut agent_up = false;
     if let Ok(c) = config::load(dirs, &name) {
         ws.configured = true;
+        ws.self_service = c.self_service;
+        ws.owner_left = crate::self_service::left_marker(state_root, &name).exists();
         ws.owner.clone_from(&c.owner);
         ws.url.clone_from(&c.url);
         ws.ip.clone_from(&c.ip);
@@ -215,7 +218,14 @@ pub async fn control(state_root: &Path, verb: Verb, name: &str, wait: bool) -> a
             if let Some(dir) = marker.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(&marker, "").with_context(|| marker.display().to_string())?;
+            // The directory is the web UI's: root never follows a link there.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+                .open(&marker)
+                .with_context(|| marker.display().to_string())?;
         }
     }
     let unit = unit_name(name);
