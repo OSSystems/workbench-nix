@@ -1,11 +1,13 @@
 //! Workspaces people make themselves: the name rule, the SSH keys they
-//! paste, the host's limits and quotas, and the request the web UI hands
-//! to the host. Both check a request with the same code.
+//! paste, the host's limits and quotas, and the requests the web UI hands
+//! to the host, to make one or change its apps. Both check a request with
+//! the same code.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::apps::AppInfo;
 use crate::is_workspace_name;
 
 /// The smallest disk a workspace made at run time gets.
@@ -101,6 +103,9 @@ pub struct Limits {
     pub max_disk_gib: i64,
     /// How many workspaces a person may make, unless an admin set theirs.
     pub quota: u32,
+    /// The apps offered, in the order the host gives them.
+    #[serde(default)]
+    pub apps: Vec<AppInfo>,
 }
 
 impl Limits {
@@ -108,6 +113,19 @@ impl Limits {
     #[must_use]
     pub fn min_memory_gib(&self) -> i64 {
         (self.boot_mem_mib + 1023) / 1024
+    }
+
+    /// Checks apps someone picked: offered ones, each once.
+    pub fn check_apps(&self, apps: &[String]) -> Result<(), String> {
+        for (i, id) in apps.iter().enumerate() {
+            if !self.apps.iter().any(|a| a.id == *id) {
+                return Err(format!("{id:?} isn't an app this host offers."));
+            }
+            if apps[..i].contains(id) {
+                return Err(format!("{id:?} is picked twice."));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -130,6 +148,9 @@ pub struct Request {
     pub max_memory_gib: i64,
     #[serde(rename = "diskGiB")]
     pub disk_gib: i64,
+    /// The apps it has, by id.
+    #[serde(default)]
+    pub apps: Vec<String>,
 }
 
 impl Request {
@@ -151,8 +172,17 @@ impl Request {
         if !(MIN_DISK_GIB..=limits.max_disk_gib).contains(&self.disk_gib) {
             return Err(format!("Disk must be from {MIN_DISK_GIB} to {} GiB.", limits.max_disk_gib));
         }
-        Ok(())
+        limits.check_apps(&self.apps)
     }
+}
+
+/// The apps someone wants a workspace made at run time to have: what the
+/// web UI writes and `workbench self-service apps` puts in its config. The
+/// VM boots with them at its next start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppsRequest {
+    pub apps: Vec<String>,
 }
 
 /// How a request ended, for the web UI to say.
@@ -219,8 +249,14 @@ mod tests {
 
     #[test]
     fn requests_within_the_limits() {
-        let limits =
-            Limits { os: vec!["ubuntu".into()], boot_mem_mib: 2048, max_memory_gib: 16, max_disk_gib: 128, quota: 1 };
+        let limits = Limits {
+            os: vec!["ubuntu".into()],
+            boot_mem_mib: 2048,
+            max_memory_gib: 16,
+            max_disk_gib: 128,
+            quota: 1,
+            apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into() }],
+        };
         let ok = Request {
             name: "alice".into(),
             owner: "alice".into(),
@@ -228,8 +264,10 @@ mod tests {
             ssh_authorized_keys: vec![KEY.into()],
             max_memory_gib: 8,
             disk_gib: 64,
+            apps: vec!["t3code".into()],
         };
         assert_eq!(ok.check(&limits), Ok(()));
+        assert_eq!(Request { apps: vec![], ..ok.clone() }.check(&limits), Ok(()), "no app at all");
         for bad in [
             Request { os: "nixos".into(), ..ok.clone() },
             Request { max_memory_gib: 1, ..ok.clone() },
@@ -238,6 +276,8 @@ mod tests {
             Request { disk_gib: 129, ..ok.clone() },
             Request { name: "bob".into(), ..ok.clone() },
             Request { ssh_authorized_keys: vec![format!("{KEY}\n{KEY}")], ..ok.clone() },
+            Request { apps: vec!["herdr".into()], ..ok.clone() },
+            Request { apps: vec!["t3code".into(), "t3code".into()], ..ok.clone() },
         ] {
             assert!(bad.check(&limits).is_err(), "{bad:?}");
         }

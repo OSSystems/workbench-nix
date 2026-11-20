@@ -22,9 +22,10 @@ use leptos::config::LeptosOptions;
 use leptos::prelude::*;
 use workbench::config::{self, Config};
 use workbench::self_service::Paths;
-use workbench::state::{self, SignInError};
+use workbench::state::{self, OpenLinkError};
+use workbench_model::apps::{BootApp, DeviceLink};
 use workbench_model::self_service::Limits;
-use workbench_model::{HostView, Snapshot, State, Verb, Viewer, Workspace, is_user_name};
+use workbench_model::{HostView, OpenBlocker, Snapshot, State, Verb, Viewer, Workspace, is_user_name};
 
 pub use routes::{authz_router, ui_router};
 pub use self_service::CreateForm;
@@ -41,8 +42,11 @@ pub trait Backend: Send + Sync + 'static {
     fn control<'a>(&'a self, verb: Verb, name: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
     /// A workspace's config.
     fn config(&self, name: &str) -> anyhow::Result<Config>;
-    /// The app's sign-in link.
-    fn sign_in(&self, c: Config) -> BoxFuture<'_, Result<String, SignInError>>;
+    /// The apps a browser may reach now: the config's, and those the VM
+    /// that runs still has.
+    fn reachable(&self, c: &Config) -> Vec<BootApp>;
+    /// A link that signs a browser in to an app.
+    fn open_link(&self, c: Config, app: String) -> BoxFuture<'_, Result<String, OpenLinkError>>;
     /// Who a browser's cookies are signed in as, and their groups; no one
     /// has an empty name.
     fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>>;
@@ -117,8 +121,12 @@ impl Backend for HostBackend {
         config::load(&self.opts.dirs, name)
     }
 
-    fn sign_in(&self, c: Config) -> BoxFuture<'_, Result<String, SignInError>> {
-        Box::pin(async move { state::sign_in_link(&c).await })
+    fn reachable(&self, c: &Config) -> Vec<BootApp> {
+        state::reachable_apps(c)
+    }
+
+    fn open_link(&self, c: Config, app: String) -> BoxFuture<'_, Result<String, OpenLinkError>> {
+        Box::pin(async move { state::open_link(&c, &app).await })
     }
 
     fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>> {
@@ -291,15 +299,27 @@ impl AppState {
         cache.all.clone().map_err(anyhow::Error::msg)
     }
 
+    /// Shows a workspace as restarting until it is up again, after asking
+    /// for its restart.
+    async fn restarted(&self, name: &str) {
+        self.cache.lock().await.restarts.insert(name.to_owned(), Instant::now());
+        self.forget().await;
+    }
+
     /// Forgets the collected state, after an action changed it.
     async fn forget(&self) {
         self.cache.lock().await.at = None;
     }
 
-    /// What `viewer` sees.
+    /// What `viewer` sees, and the apps a workspace made at run time may
+    /// have.
     pub async fn snapshot_for(&self, viewer: &Viewer) -> anyhow::Result<Snapshot> {
         let all = self.all().await?;
-        Ok(Snapshot::of(viewer.clone(), all.into_iter().map(view::row)))
+        let mut snap = Snapshot::of(viewer.clone(), all.into_iter().map(view::row));
+        if let Some(ss) = &self.opts.self_service {
+            snap.apps.clone_from(&ss.limits.apps);
+        }
+        Ok(snap)
     }
 
     /// The host page.
@@ -345,62 +365,112 @@ impl AppState {
             }
             return Err(ServerFnError::new(detail));
         }
-        {
-            let mut cache = self.cache.lock().await;
-            if verb == Verb::Restart {
-                cache.restarts.insert(name.to_owned(), Instant::now());
-            } else {
-                cache.restarts.remove(name);
-            }
+        if verb == Verb::Restart {
+            self.restarted(name).await;
+        } else {
+            self.cache.lock().await.restarts.remove(name);
+            self.forget().await;
         }
-        self.forget().await;
         if !stay {
             see_other(&format!("/?w={name}"));
         }
         Ok(())
     }
 
-    /// The `sign_in` server function: a `303` to the app's link, which is
-    /// never shown or logged, or to the sign-in page with why not.
-    pub async fn sign_in_action(&self, viewer: &Viewer, name: &str) -> Result<(), ServerFnError> {
+    /// An app's link, for a workspace `viewer` may use: one that opens now
+    /// and has a sign-in hook. Otherwise, why not, as the open page names
+    /// it, and what to show of it.
+    async fn link(
+        &self,
+        viewer: &Viewer,
+        name: &str,
+        app: &str,
+    ) -> Result<Result<String, (&'static str, String)>, ServerFnError> {
         let ws = self.find(viewer, name).await?;
-        let page = format!("/w/{name}/sign-in");
-        if ws.sign_in_blocker().is_some() {
-            see_other(&page);
-            return Ok(());
+        let why = match ws.open_blocker(app) {
+            Some(OpenBlocker::Unknown) => "unknown",
+            Some(OpenBlocker::Stopped) => "stopped",
+            Some(OpenBlocker::Starting) => "starting",
+            Some(OpenBlocker::Coming) => "coming",
+            None if !ws.app(app).is_some_and(|a| a.open_link) => "no-hook",
+            None => "",
+        };
+        if !why.is_empty() {
+            return Ok(Err((why, String::new())));
         }
         let c =
             self.backend.config(name).map_err(|e| refuse(&format!("{e:#}"), axum::http::StatusCode::BAD_GATEWAY))?;
-        match self.backend.sign_in(c).await {
+        Ok(self.backend.open_link(c, app.to_owned()).await.map_err(|e| {
+            let (kind, detail) = match e {
+                OpenLinkError::Starting(_) => ("starting", String::new()),
+                OpenLinkError::Timeout => ("timeout", String::new()),
+                OpenLinkError::NotALink => ("not-a-link", String::new()),
+                OpenLinkError::Failed { exit_code: 0, detail } => ("failed", detail),
+                OpenLinkError::Failed { exit_code, detail } => ("failed", format!("exit status {exit_code}\n{detail}")),
+            };
+            (kind, detail.chars().take(2000).collect())
+        }))
+    }
+
+    /// The `open` server function: a `303` to the app's one-time link,
+    /// which is never shown or logged, or to its open page with why not.
+    pub async fn open_action(&self, viewer: &Viewer, name: &str, app: &str) -> Result<(), ServerFnError> {
+        let page = format!("/w/{name}/open/{}", encode(app));
+        match self.link(viewer, name, app).await? {
             Ok(link) => {
-                if let Some(res) = use_context::<leptos_axum::ResponseOptions>() {
-                    res.insert_header(
-                        axum::http::header::CACHE_CONTROL,
-                        axum::http::HeaderValue::from_static("no-store"),
-                    );
-                    res.insert_header(
-                        axum::http::header::REFERRER_POLICY,
-                        axum::http::HeaderValue::from_static("no-referrer"),
-                    );
-                }
+                no_store();
                 see_other(&link);
             }
-            Err(e) => {
-                let (kind, detail) = match &e {
-                    SignInError::Starting(_) => ("starting", String::new()),
-                    SignInError::Timeout => ("timeout", String::new()),
-                    SignInError::NotALink => ("not-a-link", String::new()),
-                    SignInError::Failed { exit_code: 0, detail } => ("failed", detail.clone()),
-                    SignInError::Failed { exit_code, detail } => {
-                        ("failed", format!("exit status {exit_code}\n{detail}"))
-                    }
-                };
-                let detail: String = detail.chars().take(2000).collect();
-                see_other(&format!("{page}?error={kind}&detail={}", encode(&detail)));
-            }
+            // The page says these itself, from the workspace's state.
+            Err(("stopped" | "starting" | "coming" | "no-hook" | "unknown", _)) => see_other(&page),
+            Err((kind, detail)) => see_other(&format!("{page}?error={kind}&detail={}", encode(&detail))),
         }
         Ok(())
     }
+
+    /// The `device_link` server function: the link itself and its QR code,
+    /// for another device to open the app with.
+    pub async fn device_link_action(
+        &self,
+        viewer: &Viewer,
+        name: &str,
+        app: &str,
+    ) -> Result<DeviceLink, ServerFnError> {
+        match self.link(viewer, name, app).await? {
+            Ok(link) => {
+                no_store();
+                let (size, qr) =
+                    qr_path(&link).map_err(|e| refuse(&e, axum::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+                Ok(DeviceLink { link, size, qr })
+            }
+            Err((kind, detail)) => {
+                status(axum::http::StatusCode::CONFLICT);
+                Err(ServerFnError::new(if detail.is_empty() { kind.to_owned() } else { format!("{kind}: {detail}") }))
+            }
+        }
+    }
+}
+
+/// Keeps a response with a link in it out of every cache and referrer.
+fn no_store() {
+    if let Some(res) = use_context::<leptos_axum::ResponseOptions>() {
+        res.insert_header(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+        res.insert_header(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    }
+}
+
+/// A QR code of `text` as one SVG path, a unit square per dark module, and
+/// the side of its grid: the code and a quiet zone of 4 around it.
+fn qr_path(text: &str) -> Result<(u32, String), String> {
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| e.to_string())?;
+    let width = code.width();
+    let mut d = String::new();
+    for (i, c) in code.to_colors().iter().enumerate() {
+        if *c == qrcode::Color::Dark {
+            let _ = write!(d, "M{} {}h1v1h-1z", i % width + 4, i / width + 4);
+        }
+    }
+    Ok((u32::try_from(width + 8).unwrap_or(0), d))
 }
 
 /// Percent-encodes a query value.

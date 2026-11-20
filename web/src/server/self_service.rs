@@ -1,5 +1,5 @@
 //! What people do with workspaces of their own: the New workspace page,
-//! creating, destroying, and the admins' quotas. The UI has no privilege:
+//! creating, changing their apps, destroying, and the admins' quotas. The UI has no privilege:
 //! it writes the request, then starts the unit that makes or destroys the
 //! workspace as root, and reads how it went.
 
@@ -9,8 +9,8 @@ use axum::http::StatusCode;
 use leptos::prelude::ServerFnError;
 use vmkit::hostutil;
 use workbench::self_service::read_quotas;
-use workbench_model::self_service::{NewView, Outcome, QuotaRow, Request, parse_ssh_keys, quota_of, slug};
-use workbench_model::{Quotas, Viewer, Workspace, is_user_name};
+use workbench_model::self_service::{AppsRequest, NewView, Outcome, QuotaRow, Request, parse_ssh_keys, quota_of, slug};
+use workbench_model::{Quotas, State, Verb, Viewer, Workspace, is_user_name};
 
 use super::{AppState, SelfService, encode, refuse, see_other, status};
 
@@ -27,6 +27,7 @@ pub struct CreateForm {
     pub ssh_keys: String,
     pub memory_gib: String,
     pub disk_gib: String,
+    pub apps: Vec<String>,
 }
 
 impl CreateForm {
@@ -35,13 +36,15 @@ impl CreateForm {
     fn back(&self, error: &str) -> String {
         let keys = encode(&self.ssh_keys);
         let keys = if keys.len() <= MAX_KEYS_BACK { keys } else { String::new() };
+        let apps: Vec<&str> = self.apps.iter().take(16).map(String::as_str).collect();
         format!(
-            "/new?error={}&name={}&os={}&memory={}&disk={}&keys={keys}",
+            "/new?error={}&name={}&os={}&memory={}&disk={}&apps={}&keys={keys}",
             encode(error),
             encode(&self.name.chars().take(64).collect::<String>()),
             encode(&self.os.chars().take(16).collect::<String>()),
             encode(&self.memory_gib.chars().take(8).collect::<String>()),
             encode(&self.disk_gib.chars().take(8).collect::<String>()),
+            encode(&apps.join(",").chars().take(256).collect::<String>()),
         )
     }
 }
@@ -103,6 +106,7 @@ impl AppState {
             ssh_authorized_keys: keys,
             max_memory_gib: memory,
             disk_gib: disk,
+            apps: form.apps.clone(),
         };
         if let Err(e) = r.check(&ss.limits) {
             return refused(&e);
@@ -144,6 +148,77 @@ impl AppState {
                 |e| format!("The host hasn't finished it, or couldn't: {e:#}. If it shows up in the list, it's yours."),
             )),
         }
+    }
+
+    /// The `apps` server function: gives a workspace made at run time the
+    /// apps picked, through the unit that changes its config as root, and
+    /// with `restart` restarts it into them. Then the list with it
+    /// selected, or the apps page with why not.
+    pub async fn apps_action(
+        &self,
+        viewer: &Viewer,
+        name: &str,
+        apps: Vec<String>,
+        restart: bool,
+    ) -> Result<(), ServerFnError> {
+        let ss = self.self_service()?;
+        let ws = self.find(viewer, name).await?;
+        if !ws.self_service {
+            return Err(refuse("only the Nix configuration changes this workspace's apps", StatusCode::FORBIDDEN));
+        }
+        let back = format!("/w/{name}/apps");
+        let refused = |msg: &str, code: StatusCode| {
+            status(code);
+            see_other(&format!("{back}?error={}", encode(msg)));
+            Err(ServerFnError::new(msg))
+        };
+        if let Err(e) = ss.limits.check_apps(&apps) {
+            return refused(&e, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        // Another request would join this one's run, which takes only one.
+        // Held until the unit is done, even if the browser goes away.
+        let Some(changing) = Making::start(self, &format!("{name}/apps")) else {
+            return refused(&format!("{name}'s apps are being changed just now: try again."), StatusCode::CONFLICT);
+        };
+        let request = ss.paths.apps_request(name);
+        let written = (|| {
+            std::fs::create_dir_all(request.parent().unwrap_or(&ss.paths.dir()))?;
+            hostutil::atomic_write(&request, &serde_json::to_vec(&AppsRequest { apps })?, 0o640)?;
+            anyhow::Ok(())
+        })();
+        if let Err(e) = written {
+            return refused(&format!("The host couldn't take the request: {e:#}"), StatusCode::BAD_GATEWAY);
+        }
+        // On the clock the outcome is stamped with.
+        let asked = std::fs::metadata(&request).and_then(|m| m.modified()).ok();
+        let unit = format!("workbench-apps@{name}.service");
+        let run = {
+            let state = self.clone();
+            tokio::spawn(async move {
+                let _changing = changing;
+                state.backend.run_unit(&unit).await
+            })
+        };
+        let ran = run.await.unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+        self.forget().await;
+        // The unit writes its outcome anew; one from before this request
+        // says nothing of it.
+        match (ran, asked.and_then(|at| read_outcome_since(&ss.paths.apps_outcome(name), at))) {
+            (_, Some(o)) if !o.ok => return refused(&o.error, StatusCode::UNPROCESSABLE_ENTITY),
+            (Ok(()), Some(_)) => {}
+            (Err(e), _) => return refused(&format!("{e:#}"), StatusCode::BAD_GATEWAY),
+            (Ok(()), None) => return refused("The host said nothing of it.", StatusCode::BAD_GATEWAY),
+        }
+        // A stopped VM boots with them anyway; one on its way somewhere is
+        // left alone.
+        if restart && !ws.state.changing() && ws.state != State::Stopped {
+            if let Err(e) = self.backend.control(Verb::Restart, name).await {
+                return refused(&format!("Saved, but the restart failed: {e:#}"), StatusCode::BAD_GATEWAY);
+            }
+            self.restarted(name).await;
+        }
+        see_other(&format!("/?w={name}"));
+        Ok(())
     }
 
     /// The `destroy` server function: a workspace made at run time, by its
@@ -229,16 +304,23 @@ fn read_outcome(path: &std::path::Path) -> Option<Outcome> {
     serde_json::from_slice(&raw).ok()
 }
 
-/// A name being made, until the request is answered.
-struct Making<'a>(&'a AppState, String);
+/// An outcome written at `since` or after.
+fn read_outcome_since(path: &std::path::Path, since: std::time::SystemTime) -> Option<Outcome> {
+    let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    (at >= since).then(|| read_outcome(path)).flatten()
+}
 
-impl<'a> Making<'a> {
-    fn start(state: &'a AppState, name: &str) -> Option<Self> {
-        super::lock(&state.making).insert(name.to_owned()).then(|| Making(state, name.to_owned()))
+/// A name being made, or `<name>/apps` its apps being changed, until the
+/// request is answered.
+struct Making(AppState, String);
+
+impl Making {
+    fn start(state: &AppState, name: &str) -> Option<Self> {
+        super::lock(&state.making).insert(name.to_owned()).then(|| Making(state.clone(), name.to_owned()))
     }
 }
 
-impl Drop for Making<'_> {
+impl Drop for Making {
     fn drop(&mut self) {
         super::lock(&self.0.making).remove(&self.1);
     }

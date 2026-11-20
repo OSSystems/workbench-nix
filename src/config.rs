@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use vmkit::hostutil;
+use workbench_model::apps::{Boot, BootApp, is_app_id};
 pub use workbench_model::{is_user_name, is_workspace_name};
 
 /// Searched in order for `<workspace>.json`: the declarative configs Nix
@@ -67,7 +68,6 @@ pub struct Config {
     pub ip: String,
     pub gateway: String,
     pub nameservers: Vec<String>,
-    pub app_port: i64,
 
     pub ssh_authorized_keys: Vec<String>,
 
@@ -75,8 +75,16 @@ pub struct Config {
     pub closure: String,
     /// Their validity, for a guest that copies them into a store of its own.
     pub registration: String,
-    /// What the guest starts from.
-    pub app: String,
+    /// The workspace's packages and its agent, which the guest finds at
+    /// `config/app`, the name it had when it was the one app.
+    #[serde(alias = "app")]
+    pub packages: String,
+    /// The apps it runs, each at `<name>--<id>.<domain>`.
+    pub apps: Vec<BootApp>,
+    /// Only in a config from before apps, whose one app listened here: the
+    /// host turns it into one with apps.
+    #[serde(rename = "appPort", skip_serializing)]
+    pub legacy_app_port: i64,
 
     pub environment: BTreeMap<String, String>,
     pub environment_files: Vec<String>,
@@ -144,7 +152,7 @@ impl Config {
             ("image", &self.image),
             ("closure", &self.closure),
             ("registration", &self.registration),
-            ("app", &self.app),
+            ("packages", &self.packages),
             ("secretsDir", &self.secrets_dir),
         ] {
             ensure!(is_clean_path(path), "{field} must be a clean absolute path without commas");
@@ -187,7 +195,21 @@ impl Config {
         for key in &self.ssh_authorized_keys {
             ensure!(!key.is_empty() && !key.contains(['\n', '\r', '\0']), "an SSH key must be one nonempty line");
         }
-        ensure!(port(self.app_port) && port(self.control_port) && port(self.agent_port), "invalid port");
+        ensure!(port(self.control_port) && port(self.agent_port), "invalid port");
+        for (i, app) in self.apps.iter().enumerate() {
+            ensure!(is_app_id(&app.id), "invalid app id {:?}", app.id);
+            ensure!(
+                !app.name.trim().is_empty() && !app.name.contains(char::is_control),
+                "app {} needs a name on one line",
+                app.id
+            );
+            ensure!(app.port != 0 && is_clean_path(&app.bundle), "app {} needs a port and a clean bundle path", app.id);
+            ensure!(
+                self.apps[..i].iter().all(|a| a.id != app.id && a.port != app.port),
+                "app {} repeats another's id or port",
+                app.id
+            );
+        }
         ensure!(self.control_port != self.agent_port, "controlPort and agentPort must differ");
         ensure!(
             self.socket_group.is_empty() || is_user_name(&self.socket_group),
@@ -238,11 +260,17 @@ impl Config {
         self.vm_dir().join("serial.sock")
     }
 
-    /// Records the app the running VM started with, to tell when the host
-    /// has a newer one.
+    /// Records what the running VM booted with, to tell what its next
+    /// start changes.
     #[must_use]
-    pub fn started_app(&self) -> PathBuf {
-        Path::new(&self.runtime_dir).join("app")
+    pub fn booted(&self) -> PathBuf {
+        Path::new(&self.runtime_dir).join("booted.json")
+    }
+
+    /// What the next start boots.
+    #[must_use]
+    pub fn boot(&self) -> Boot {
+        Boot { packages: self.packages.clone(), apps: self.apps.clone() }
     }
 
     /// The host side of the guest's control port.
@@ -361,11 +389,17 @@ pub(crate) mod tests {
             ip: "10.232.0.10".into(),
             gateway: "10.232.0.1".into(),
             nameservers: vec!["1.1.1.1".into()],
-            app_port: 3773,
             ssh_authorized_keys: vec!["ssh-ed25519 AAAA alice@laptop".into()],
             closure: "/nix/store/x-closure/store-paths".into(),
             registration: "/nix/store/x-closure/registration".into(),
-            app: "/nix/store/x-app".into(),
+            packages: "/nix/store/x-packages".into(),
+            apps: vec![BootApp {
+                id: "t3code".into(),
+                name: "T3 Code".into(),
+                port: 3773,
+                bundle: "/nix/store/x-t3code-app".into(),
+            }],
+            legacy_app_port: 0,
             environment: [("LLM_URL".to_owned(), "https://llm.example".to_owned())].into(),
             environment_files: vec![],
             secrets_dir: "/var/lib/workbench-secrets/alice-dev".into(),
@@ -413,7 +447,12 @@ pub(crate) mod tests {
             ("nixos with seed", |c| c.os = "nixos".into()),
             ("same vsock ports", |c| c.agent_port = c.control_port),
             ("bad socket group", |c| c.socket_group = "wheel users".into()),
-            ("port out of range", |c| c.app_port = 70000),
+            ("app id", |c| c.apps[0].id = "t3-code".into()),
+            ("app port 0", |c| c.apps[0].port = 0),
+            ("app bundle", |c| c.apps[0].bundle = "x".into()),
+            ("app name", |c| c.apps[0].name = String::new()),
+            ("app twice", |c| c.apps.push(BootApp { port: 1, ..c.apps[0].clone() })),
+            ("port twice", |c| c.apps.push(BootApp { id: "other".into(), ..c.apps[0].clone() })),
             ("env newline", |c| c.environment = [("A".into(), "x\nB=y".into())].into()),
             ("env name", |c| c.environment = [("A-B".into(), "x".into())].into()),
             ("relative env file", |c| c.environment_files = vec!["keys.env".into()]),
@@ -424,6 +463,22 @@ pub(crate) mod tests {
             change(&mut c);
             assert!(c.validate().is_err(), "{name}: accepted");
         }
+    }
+
+    /// A config written before apps: its app and port, and nothing else,
+    /// which the host's self-service setup turns into one with apps.
+    #[test]
+    fn configs_from_before_apps() {
+        let mut v = serde_json::to_value(test_config()).unwrap();
+        let m = v.as_object_mut().unwrap();
+        m.remove("apps");
+        let packages = m.remove("packages").unwrap();
+        m.insert("app".into(), packages);
+        m.insert("appPort".into(), 3773.into());
+        let c = parse(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!((c.packages.as_str(), c.apps.len(), c.legacy_app_port), ("/nix/store/x-packages", 0, 3773));
+        let again = serde_json::to_value(&c).unwrap();
+        assert!(again.get("appPort").is_none() && again.get("app").is_none(), "{again}");
     }
 
     #[test]

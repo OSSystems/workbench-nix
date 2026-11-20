@@ -4,7 +4,7 @@
 use jiff::{SignedDuration, Timestamp, ZonedDateTime, tz::TimeZone};
 use vmkit::hostutil;
 use vmkit::memory::{self, Status};
-use workbench_model::{HostView, PoolView, Row, State, Workspace};
+use workbench_model::{HostView, PoolView, Row, Stage, State, Workspace};
 
 use super::Options;
 
@@ -21,7 +21,7 @@ fn note(ws: &Workspace, since: &str) -> String {
     match ws.state {
         _ if !ws.configured => "removed from the configuration · disk kept".into(),
         State::Stopped if ws.owner_left => "owner left · disk kept".into(),
-        State::Running => ws.host().to_owned(),
+        State::Running => apps_note(ws),
         State::Starting => "booting".into(),
         State::Restarting => "restarting · shutting down the guest".into(),
         State::Stopping => "stopping · shutting down the guest".into(),
@@ -30,6 +30,22 @@ fn note(ws: &Workspace, since: &str) -> String {
         State::Stopped if !since.is_empty() => format!("since {since}"),
         State::Stopped => String::new(),
     }
+}
+
+/// A running workspace's apps, and those that wait for a restart.
+fn apps_note(ws: &Workspace) -> String {
+    if ws.apps.is_empty() {
+        return "no apps".into();
+    }
+    let names: Vec<String> = ws
+        .apps
+        .iter()
+        .map(|a| match ws.stage(&a.id) {
+            Stage::Coming => format!("{} after a restart", a.name),
+            _ => a.name.clone(),
+        })
+        .collect();
+    names.join(" · ")
 }
 
 fn local(t: Timestamp) -> ZonedDateTime {
@@ -127,7 +143,12 @@ mod tests {
             state: State::Running,
             ..Workspace::default()
         };
-        assert_eq!(note(&ws, ""), "alice.ws.test");
+        assert_eq!(note(&ws, ""), "no apps");
+        let app =
+            |id: &str, name: &str| workbench_model::App { id: id.into(), name: name.into(), ..Default::default() };
+        ws.apps = vec![app("t3code", "T3 Code"), app("herdr", "herdr")];
+        ws.changes = vec![workbench_model::Change::AppAdded { app: "herdr".into() }];
+        assert_eq!(note(&ws, ""), "T3 Code · herdr after a restart");
         ws.state = State::Failing;
         ws.restarts = 6;
         assert_eq!(note(&ws, ""), "restarted 6 times");

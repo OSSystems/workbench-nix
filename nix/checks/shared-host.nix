@@ -29,6 +29,11 @@ let
             enable = true;
             domain = "ws.example.com";
             network.externalInterface = "eth0";
+            apps.hello = {
+              name = "Hello";
+              port = 8080;
+              serve = "exec ${pkgs.python3}/bin/python3 -m http.server \"$APP_PORT\"";
+            };
             workspaces = {
               alice-main = {
                 owner = "alice";
@@ -38,6 +43,11 @@ let
                 owner = "alice";
                 ip = "10.232.0.11";
                 sudo = false;
+              };
+              alice-bare = {
+                owner = "alice";
+                ip = "10.232.0.12";
+                apps = [ ];
               };
             };
           };
@@ -108,8 +118,9 @@ let
     {
       ok =
         config.environment.etc ? "workbench/alice-main.json"
-        && config.services.nginx.virtualHosts ? "alice-scratch.ws.example.com";
-      msg = "every workspace gets a config and a virtual host";
+        && config.services.nginx.virtualHosts ? "alice-scratch--hello.ws.example.com"
+        && lib.all (h: !lib.hasPrefix "alice-bare" h) (lib.attrNames config.services.nginx.virtualHosts);
+      msg = "every workspace gets a config, and each of its apps a virtual host";
     }
   ];
 in
