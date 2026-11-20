@@ -1,7 +1,7 @@
 //! The agent inside the guest, and the host's side of it. The agent sets
-//! memory hotplug up, reports memory on the control port and answers the
-//! host on the agent port, which only the host reaches. Its requests and
-//! replies are a contract: see `docs/contracts.md`.
+//! memory hotplug up, starts the apps, reports memory on the control port
+//! and answers the host on the agent port, which only the host reaches. Its
+//! requests and replies are a contract: see `docs/contracts.md`.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -13,20 +13,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use vmkit::{control, hostutil, vsock};
 
 use crate::config::Config;
-use crate::launch::GuestConfig;
+use crate::launch::{GuestApp, GuestConfig};
 
-/// Where the guest mounts the app bundle.
-pub const GUEST_APP: &str = "/run/workspace/config/app";
-/// The app's optional sign-in hook: run as the owner, it prints one URL
-/// that signs a browser in to the app, and nothing else.
-pub const SIGN_IN_HOOK: &str = "/run/workspace/config/app/bin/sign-in-link";
+/// Where the guest mounts the workspace's packages.
+pub const GUEST_PACKAGES: &str = "/run/workspace/config/app";
+/// Where the guest mounts the apps' bundles, each at its id. One runs its
+/// `bin/serve`, and may have `bin/open-link`, a hook that, run as the owner,
+/// prints one URL that signs a browser in to the app, and nothing else.
+pub const GUEST_APPS: &str = "/run/workspace/config/apps";
 /// The largest request the agent reads.
 const MAX_REQUEST: u64 = 64 << 10;
 /// The largest reply the host reads.
 const MAX_REPLY: u64 = 1 << 20;
 /// How long a host request may take to arrive.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the app's sign-in hook may run.
+/// How long an app's sign-in hook may run.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 /// The most of a hook's stdout and stderr each kept.
 const MAX_OUTPUT: u64 = 64 << 10;
@@ -46,9 +47,9 @@ pub struct Request {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reply {
-    /// In a ping's answer: the app has a sign-in hook.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub sign_in: bool,
+    /// In a ping's answer: the apps with a sign-in hook.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_links: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stdout: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -74,6 +75,7 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     let agent_port = u32::try_from(gc.agent_port).context("agentPort")?;
     tokio::spawn(report_stats(control_port));
     let listener = vsock::listen(agent_port)?;
+    start_apps(&gc).await;
     loop {
         match listener.accept().await {
             Ok((conn, _)) => {
@@ -88,6 +90,69 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Starts each app as a unit of its own, as the owner, the way one of the
+/// guest's services would run: systemd keeps it up and its journal is the
+/// app's. A unit an agent that ran before started stays as it is.
+async fn start_apps(gc: &GuestConfig) {
+    for app in &gc.apps {
+        let argv = app_unit_argv(gc, app, &home_of(&gc.owner));
+        let out = tokio::process::Command::new("systemd-run")
+            .args(&argv)
+            .env_clear()
+            .env("PATH", "/run/current-system/sw/bin:/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => eprintln!("started {}", app.id),
+            Ok(o) => eprintln!("starting {}: {}", app.id, String::from_utf8_lossy(&o.stderr).trim()),
+            Err(e) => eprintln!("starting {}: systemd-run: {e}", app.id),
+        }
+    }
+}
+
+/// The owner's home, or where it will be: a NixOS guest makes the owner
+/// after the agent starts.
+fn home_of(owner: &str) -> String {
+    match nix::unistd::User::from_name(owner) {
+        Ok(Some(u)) => u.dir.to_string_lossy().into_owned(),
+        _ => format!("/home/{owner}"),
+    }
+}
+
+/// `systemd-run`'s arguments for an app's unit, `workspace-app-<id>`: its
+/// bundle's `bin/serve`, as the owner in their home, with the workspace's
+/// environment and secrets, and `APP_PORT` and `APP_URL`.
+pub(crate) fn app_unit_argv(gc: &GuestConfig, app: &GuestApp, home: &str) -> Vec<String> {
+    let path = format!(
+        "{GUEST_PACKAGES}/sw/bin:{home}/.nix-profile/bin:/etc/profiles/per-user/{owner}/bin:/run/wrappers/bin:\
+         /run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin",
+        owner = gc.owner
+    );
+    let mut argv: Vec<String> = [
+        format!("--unit=workspace-app-{}", app.id),
+        format!("--description=Workspace app {}", app.name),
+        format!("--uid={}", gc.owner),
+        "--no-block".into(),
+        "--property=WorkingDirectory=~".into(),
+        "--property=After=workspace-init.service network-online.target".into(),
+        "--property=Wants=network-online.target".into(),
+        "--property=Restart=always".into(),
+        "--property=RestartSec=5".into(),
+        "--property=StartLimitIntervalSec=0".into(),
+        "--property=KillMode=mixed".into(),
+        "--property=EnvironmentFile=/run/workspace/config/environment".into(),
+        "--property=EnvironmentFile=-/run/workspace/secrets/environment".into(),
+        format!("--setenv=PATH={path}"),
+        format!("--setenv=APP_PORT={}", app.port),
+        format!("--setenv=APP_URL={}", app.url),
+        format!("--setenv=WORKSPACE_URL={}", gc.url),
+    ]
+    .into();
+    argv.push(format!("{GUEST_APPS}/{}/bin/serve", app.id));
+    argv
 }
 
 /// Onlines memory the host plugs as movable, so it can be unplugged again.
@@ -124,7 +189,7 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(conn: S, gc: &Guest
         Ok(Err(e)) => Reply::error(e.to_string()),
         Ok(Ok(line)) => match serde_json::from_slice::<Request>(&line) {
             Err(_) => Reply::error("invalid JSON"),
-            Ok(req) => answer(req, gc, Path::new(SIGN_IN_HOOK)).await,
+            Ok(req) => answer(req, gc, Path::new(GUEST_APPS)).await,
         },
     };
     let Ok(mut raw) = serde_json::to_vec(&reply) else { return };
@@ -134,21 +199,42 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(conn: S, gc: &Guest
     let _ = conn.shutdown().await;
 }
 
-async fn answer(req: Request, gc: &GuestConfig, hook: &Path) -> Reply {
+/// An app's sign-in hook, in the bundles at `apps`.
+fn open_link_hook(apps: &Path, id: &str) -> std::path::PathBuf {
+    apps.join(id).join("bin/open-link")
+}
+
+async fn answer(req: Request, gc: &GuestConfig, apps: &Path) -> Reply {
     match req.op.as_str() {
-        "ping" => Reply { sign_in: hook.exists(), ..Reply::default() },
-        "sign-in" if !hook.exists() => Reply::error("the app has no sign-in hook"),
-        "sign-in" => {
+        "ping" => Reply {
+            open_links: gc.apps.iter().filter(|a| open_link_hook(apps, &a.id).exists()).map(|a| a.id.clone()).collect(),
+            ..Reply::default()
+        },
+        "open-link" => {
+            // Only an app the VM booted with: the id never makes a path.
+            let Some(app) = req.args.first().and_then(|id| gc.app(id)) else {
+                return Reply::error("no such app");
+            };
+            let hook = open_link_hook(apps, &app.id);
+            if !hook.exists() {
+                return Reply::error("the app has no sign-in hook");
+            }
             let argv = [hook.to_string_lossy().into_owned()];
-            run_as_owner(gc, &argv, HOOK_TIMEOUT).await.unwrap_or_else(|e| Reply::error(format!("{e:#}")))
+            run_as_owner(gc, Some(app), &argv, HOOK_TIMEOUT).await.unwrap_or_else(|e| Reply::error(format!("{e:#}")))
         }
         _ => Reply::error("unknown op"),
     }
 }
 
 /// Runs a command as the owner, in their home, with the workspace's URL in
-/// `WORKSPACE_URL`, and keeps the start of what it prints.
-pub(crate) async fn run_as_owner(gc: &GuestConfig, argv: &[String], timeout: Duration) -> anyhow::Result<Reply> {
+/// `WORKSPACE_URL` and the app's in `APP_URL`, and keeps the start of what
+/// it prints.
+pub(crate) async fn run_as_owner(
+    gc: &GuestConfig,
+    app: Option<&GuestApp>,
+    argv: &[String],
+    timeout: Duration,
+) -> anyhow::Result<Reply> {
     let user = nix::unistd::User::from_name(&gc.owner)?.ok_or_else(|| anyhow!("unknown user {:?}", gc.owner))?;
     let home = user.dir.to_string_lossy().into_owned();
     let mut cmd = tokio::process::Command::new(&argv[0]);
@@ -161,7 +247,9 @@ pub(crate) async fn run_as_owner(gc: &GuestConfig, argv: &[String], timeout: Dur
         .env("WORKSPACE_URL", &gc.url)
         .env(
             "PATH",
-            format!("{GUEST_APP}/sw/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin"),
+            format!(
+                "{GUEST_PACKAGES}/sw/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin"
+            ),
         )
         // Supplementary groups are dropped along with root.
         .uid(user.uid.as_raw())
@@ -170,6 +258,9 @@ pub(crate) async fn run_as_owner(gc: &GuestConfig, argv: &[String], timeout: Dur
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(app) = app {
+        cmd.env("APP_URL", &app.url).env("APP_PORT", app.port.to_string());
+    }
     let mut child = cmd.spawn().with_context(|| argv[0].clone())?;
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let run = async {
@@ -259,18 +350,41 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     use tokio::net::UnixListener;
 
-    /// The ping says whether the app has the hook; sign-in needs it.
+    /// The ping names the apps with a hook; a link needs one, of an app
+    /// the VM booted with.
     #[tokio::test]
-    async fn sign_in_needs_the_hook() {
+    async fn open_link_needs_the_hook() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = dir.path().join("sign-in-link");
+        let apps = dir.path();
         let ping = Request { op: "ping".into(), args: vec![] };
-        let gc = GuestConfig::default();
-        assert!(!answer(ping.clone(), &gc, &hook).await.sign_in);
-        let reply = answer(Request { op: "sign-in".into(), args: vec![] }, &gc, &hook).await;
-        assert_eq!(reply.error, "the app has no sign-in hook");
-        std::fs::write(&hook, "").unwrap();
-        assert!(answer(ping, &gc, &hook).await.sign_in);
+        let gc = GuestConfig::of(&test_config());
+        assert!(answer(ping.clone(), &gc, apps).await.open_links.is_empty());
+        let open = |id: &str| Request { op: "open-link".into(), args: vec![id.into()] };
+        assert_eq!(answer(open("t3code"), &gc, apps).await.error, "the app has no sign-in hook");
+        std::fs::create_dir_all(apps.join("t3code/bin")).unwrap();
+        std::fs::write(apps.join("t3code/bin/open-link"), "").unwrap();
+        assert_eq!(answer(ping, &gc, apps).await.open_links, ["t3code"]);
+        std::fs::create_dir_all(apps.join("other/bin")).unwrap();
+        std::fs::write(apps.join("other/bin/open-link"), "").unwrap();
+        for id in ["other", "../t3code", ""] {
+            assert_eq!(answer(open(id), &gc, apps).await.error, "no such app", "{id}");
+        }
+    }
+
+    #[test]
+    fn app_units() {
+        let gc = GuestConfig::of(&test_config());
+        let argv = app_unit_argv(&gc, &gc.apps[0], "/home/alice");
+        assert_eq!(argv[0], "--unit=workspace-app-t3code");
+        assert_eq!(argv.last().unwrap(), "/run/workspace/config/apps/t3code/bin/serve");
+        for want in [
+            "--uid=alice",
+            "--setenv=APP_PORT=3773",
+            "--setenv=APP_URL=https://alice-dev--t3code.ws.test",
+            "--property=EnvironmentFile=-/run/workspace/secrets/environment",
+        ] {
+            assert!(argv.iter().any(|a| a == want), "{want} missing from {argv:?}");
+        }
     }
 
     #[tokio::test]
@@ -332,7 +446,9 @@ mod tests {
         assert_eq!(reply.exit_code, 2);
         assert_eq!(serde_json::to_string(&reply).unwrap(), r#"{"stdout":"x\n","exitCode":2}"#);
         assert_eq!(serde_json::to_string(&Reply::default()).unwrap(), r#"{"exitCode":0}"#);
-        let ping = Reply { sign_in: true, ..Reply::default() };
-        assert_eq!(serde_json::to_string(&ping).unwrap(), r#"{"signIn":true,"exitCode":0}"#);
+        let ping = Reply { open_links: vec!["t3code".into()], ..Reply::default() };
+        assert_eq!(serde_json::to_string(&ping).unwrap(), r#"{"openLinks":["t3code"],"exitCode":0}"#);
+        let old: Reply = serde_json::from_str(r#"{"signIn":true,"exitCode":0}"#).unwrap();
+        assert!(old.open_links.is_empty(), "an agent from before apps names none");
     }
 }

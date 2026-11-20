@@ -4,6 +4,7 @@
 
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
+use workbench_model::apps::DeviceLink;
 use workbench_model::self_service::NewView;
 use workbench_model::{HostView, Snapshot};
 
@@ -36,12 +37,33 @@ pub async fn control(ws: String, action: String, #[server(default)] stay: bool) 
     state.control_action(&viewer, &ws, &action, stay).await
 }
 
-/// Signs a browser in to a workspace's app: the answer sends it to the
-/// app's one-time link, or to the sign-in page with why there is none.
-#[server(prefix = "/api", endpoint = "sign-in")]
-pub async fn sign_in(ws: String) -> Result<(), ServerFnError> {
+/// Opens an app of a workspace in a browser it signs in: the answer sends
+/// it to the app's one-time link, or to the app's open page with why there
+/// is none.
+#[server(prefix = "/api", endpoint = "open")]
+pub async fn open(ws: String, app: String) -> Result<(), ServerFnError> {
     let (state, viewer) = crate::server::request()?;
-    state.sign_in_action(&viewer, &ws).await
+    state.open_action(&viewer, &ws, &app).await
+}
+
+/// A one-time link to an app, and its QR code, for another device.
+#[server(prefix = "/api", endpoint = "device-link")]
+pub async fn make_device_link(ws: String, app: String) -> Result<DeviceLink, ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    state.device_link_action(&viewer, &ws, &app).await
+}
+
+/// Gives a workspace made at run time the apps picked, and with `restart`
+/// restarts it into them. A form comes back to the list with it selected,
+/// or to its apps page with why not.
+#[server(prefix = "/api", endpoint = "apps")]
+pub async fn set_apps(
+    ws: String,
+    #[server(default)] apps: Vec<String>,
+    #[server(default)] restart: bool,
+) -> Result<(), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    state.apps_action(&viewer, &ws, apps, restart).await
 }
 
 /// What the New workspace page offers the viewer.
@@ -62,9 +84,10 @@ pub async fn create(
     #[server(default)] ssh_keys: String,
     memory_gib: String,
     disk_gib: String,
+    #[server(default)] apps: Vec<String>,
 ) -> Result<(), ServerFnError> {
     let (state, viewer) = crate::server::request()?;
-    let form = crate::server::CreateForm { name, os, ssh_keys, memory_gib, disk_gib };
+    let form = crate::server::CreateForm { name, os, ssh_keys, memory_gib, disk_gib, apps };
     state.create_action(&viewer, form).await
 }
 

@@ -85,38 +85,121 @@ let
     max = (if ws.memory.maxGiB != null then ws.memory.maxGiB else cfg.memory.maxGiB) * 1024;
   };
 
-  guestApp =
-    name: ws:
+  # A workspace's packages, those of its apps among them, and its agent:
+  # what the guest finds at config/app. Guests set up before apps were apps
+  # run its `bin/serve` as the owner; it only waits, as the agent runs the
+  # apps now.
+  packagesOf =
+    name: extraPackages: apps:
     let
       sw = pkgs.buildEnv {
         name = "workbench-${name}-sw";
-        paths = [ cfg.package ] ++ cfg.extraPackages ++ ws.extraPackages;
+        paths = cfg.extraPackages ++ extraPackages ++ lib.concatMap (id: cfg.apps.${id}.packages) apps;
       };
-      t3 = lib.getExe' cfg.package "t3";
     in
-    pkgs.runCommand "workbench-${name}-app" { } ''
+    pkgs.runCommand "workbench-${name}-packages" { } ''
       mkdir -p $out/bin
       ln -s ${sw} $out/sw
-      ln -s ${t3} $out/bin/t3
-      cat > $out/bin/serve <<EOF
-      #!${pkgs.runtimeShell}
-      export PATH=${sw}/bin:\$PATH
-      export T3CODE_HOME=\$HOME/.t3
-      exec ${t3} serve --host 0.0.0.0 --port ${toString ws.appPort}
-      EOF
       cat > $out/bin/workspace-agent <<EOF
       #!${pkgs.runtimeShell}
       exec ${exe} guest-agent --config=/run/workspace/config/workspace.json
       EOF
-      # The sign-in hook: one link that signs a browser in to T3 Code.
-      cat > $out/bin/sign-in-link <<EOF
+      cat > $out/bin/serve <<EOF
       #!${pkgs.runtimeShell}
-      set -eo pipefail
-      export T3CODE_HOME=\$HOME/.t3
-      ${t3} auth pairing create --base-url "\$WORKSPACE_URL" --label workbench --json | ${lib.getExe pkgs.jq} -er .pairUrl
+      exec ${pkgs.coreutils}/bin/sleep infinity
       EOF
-      chmod +x $out/bin/serve $out/bin/workspace-agent $out/bin/sign-in-link
+      chmod +x $out/bin/workspace-agent $out/bin/serve
     '';
+
+  # An app's bundle, which the guest finds at config/apps/<id>: its
+  # `bin/serve`, and `bin/open-link` if it signs browsers in.
+  appBundles = lib.mapAttrs (
+    id: app:
+    pkgs.runCommand "workbench-app-${id}" { } ''
+      mkdir -p $out/bin
+      ln -s ${pkgs.writeShellScript "${id}-serve" app.serve} $out/bin/serve
+      ${lib.optionalString (app.openLink != null) ''
+        ln -s ${pkgs.writeShellScript "${id}-open-link" app.openLink} $out/bin/open-link
+      ''}
+    ''
+  ) cfg.apps;
+  appConfig = id: {
+    inherit id;
+    inherit (cfg.apps.${id}) name port;
+    bundle = "${appBundles.${id}}";
+  };
+
+  # T3 Code, from `package`.
+  t3 = lib.getExe' cfg.package "t3";
+  t3code = {
+    name = lib.mkDefault "T3 Code";
+    port = lib.mkDefault 3773;
+    packages = [ cfg.package ];
+    serve = ''
+      export T3CODE_HOME=$HOME/.t3
+      exec ${t3} serve --host 0.0.0.0 --port "$APP_PORT"
+    '';
+    openLink = ''
+      set -eo pipefail
+      export T3CODE_HOME=$HOME/.t3
+      ${t3} auth pairing create --base-url "$APP_URL" --label workbench --json | ${lib.getExe pkgs.jq} -er .pairUrl
+    '';
+  };
+
+  appModule = {
+    options = {
+      name = mkOption {
+        type = types.str;
+        example = "T3 Code";
+        description = "What people call it.";
+      };
+      port = mkOption {
+        type = types.port;
+        example = 3773;
+        description = "The port it listens on in the guest; `serve` gets it in `APP_PORT`.";
+      };
+      serve = mkOption {
+        type = types.lines;
+        description = ''
+          Shell script run at every boot as the owner, in their home, that
+          serves the app on `$APP_PORT`; systemd restarts it when it ends.
+          It has the workspace's environment and secrets, the workspace's
+          packages on its PATH, and the app's address in `APP_URL`.
+        '';
+      };
+      openLink = mkOption {
+        type = types.nullOr types.lines;
+        default = null;
+        description = ''
+          Shell script run as the owner that prints one URL on `$APP_URL`,
+          the app's address, that signs a browser in to it, and nothing
+          else. Null for an app without a sign-in of its own: opening it is
+          all it takes.
+        '';
+      };
+      packages = mkOption {
+        type = types.listOf types.package;
+        default = [ ];
+        description = "Packages on the PATH of the workspaces that have the app.";
+      };
+    };
+  };
+
+  # An app's own virtual host, without the web UI.
+  vhostOf =
+    ip: port:
+    cfg.virtualHost
+    // {
+      locations."/" = {
+        proxyPass = "http://${ip}:${toString port}";
+        proxyWebsockets = true;
+        extraConfig = ''
+          proxy_read_timeout 1d;
+          proxy_send_timeout 1d;
+          client_max_body_size 64m;
+        '';
+      };
+    };
 
   mountUnit = what: where: ''
     [Unit]
@@ -138,7 +221,6 @@ let
   userData =
     name: ws:
     let
-      home = "/home/${ws.owner}";
       shares = "nix-store.mount run-workspace-config.mount run-workspace-secrets.mount";
     in
     "#cloud-config\n"
@@ -158,6 +240,7 @@ let
       ssh_pwauth = false;
       ssh_deletekeys = false;
       package_update = false;
+      # The agent runs the apps.
       write_files = [
         {
           path = "/etc/systemd/system/nix-store.mount";
@@ -185,7 +268,7 @@ let
           path = "/etc/systemd/system/workspace-agent.service";
           content = ''
             [Unit]
-            Description=Workspace agent: memory reports and host requests
+            Description=Workspace agent: memory reports, apps and host requests
             Requires=${shares}
             After=${shares}
 
@@ -193,30 +276,6 @@ let
             ExecStart=/run/workspace/config/app/bin/workspace-agent
             Restart=always
             RestartSec=2
-
-            [Install]
-            WantedBy=multi-user.target
-          '';
-        }
-        {
-          path = "/etc/systemd/system/workspace-app.service";
-          content = ''
-            [Unit]
-            Description=Workspace app
-            Requires=${shares}
-            After=${shares} network-online.target
-            Wants=network-online.target
-
-            [Service]
-            User=${ws.owner}
-            WorkingDirectory=${home}
-            Environment=HOME=${home}
-            EnvironmentFile=/run/workspace/config/environment
-            EnvironmentFile=-/run/workspace/secrets/environment
-            ExecStart=/run/workspace/config/app/bin/serve
-            Restart=always
-            RestartSec=5
-            KillMode=mixed
 
             [Install]
             WantedBy=multi-user.target
@@ -236,7 +295,6 @@ let
           "run-workspace-config.mount"
           "run-workspace-secrets.mount"
           "workspace-agent.service"
-          "workspace-app.service"
         ]
       ];
     };
@@ -286,8 +344,8 @@ let
   workspaceConfig =
     name: ws:
     let
-      app = guestApp name ws;
-      closure = pkgs.closureInfo { rootPaths = [ app ]; };
+      packages = packagesOf name ws.extraPackages ws.apps;
+      closure = pkgs.closureInfo { rootPaths = [ packages ] ++ map (id: appBundles.${id}) ws.apps; };
       mem = memMiB ws;
     in
     {
@@ -308,11 +366,11 @@ let
       mac = macOf ws;
       gateway = hostAddress;
       inherit (cfg.network) nameservers;
-      inherit (ws) appPort;
       sshAuthorizedKeys = map lib.strings.trim ws.sshAuthorizedKeys;
       closure = "${closure}/store-paths";
       registration = "${closure}/registration";
-      app = "${app}";
+      packages = "${packages}";
+      apps = map appConfig ws.apps;
       environment = cfg.environment // ws.environment;
       environmentFiles = lib.filter (f: f != null) [
         cfg.environmentFile
@@ -366,11 +424,8 @@ let
   ss = cfg.web.selfService;
   selfServiceTemplate =
     let
-      app = guestApp "self-service" {
-        extraPackages = [ ];
-        appPort = 3773;
-      };
-      closure = pkgs.closureInfo { rootPaths = [ app ]; };
+      packages = packagesOf "self-service" [ ] ss.apps;
+      closure = pkgs.closureInfo { rootPaths = [ packages ] ++ map (id: appBundles.${id}) ss.apps; };
       images = {
         ubuntu = {
           inherit (cfg) image imageFormat;
@@ -397,7 +452,6 @@ let
       scheme = cfg.publicScheme;
       secretsRoot = "/var/lib/workbench-secrets";
       inherit (cfg.network) subnet nameservers;
-      appPort = 3773;
       inherit controlPort agentPort;
       cpus = 0;
       cloudHypervisor = lib.getExe pkgs.cloud-hypervisor;
@@ -406,7 +460,8 @@ let
       firmware = "${pkgs.OVMF-cloud-hypervisor.fd}/FV/CLOUDHV.fd";
       closure = "${closure}/store-paths";
       registration = "${closure}/registration";
-      app = "${app}";
+      packages = "${packages}";
+      apps = map appConfig ss.apps;
       inherit (cfg) environment;
       environmentFiles = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
       socketGroup = "workbench";
@@ -441,6 +496,16 @@ let
     { name, ... }:
     {
       options = {
+        apps = mkOption {
+          type = types.listOf types.str;
+          default = lib.attrNames cfg.apps;
+          defaultText = lib.literalExpression "lib.attrNames config.services.workbench.apps";
+          example = [ "t3code" ];
+          description = ''
+            The apps it runs, by id, each at `<name>--<id>.<domain>`. A change
+            takes effect when the VM next starts.
+          '';
+        };
         owner = mkOption {
           type = types.str;
           example = "alice";
@@ -496,11 +561,6 @@ let
           default = [ ];
           description = "SSH keys of the owner in the guest. Only the host reaches the guest's SSH server.";
         };
-        appPort = mkOption {
-          type = types.port;
-          default = 3773;
-          description = "Port the app listens on in the guest.";
-        };
         environment = mkOption {
           type = types.attrsOf types.str;
           default = { };
@@ -545,13 +605,24 @@ in
       description = "vmkit's source, which workbench builds against; `nixosModules.default` sets it.";
     };
     package = mkOption {
-      type = types.package;
-      description = "T3 Code package run in every workspace.";
+      type = types.nullOr types.package;
+      default = null;
+      description = "T3 Code: when set, the app `t3code`, which every workspace has unless it says otherwise.";
+    };
+    apps = mkOption {
+      type = types.attrsOf (types.submodule appModule);
+      default = { };
+      description = ''
+        What workspaces run and people open from a browser, by id: a
+        lowercase letter, then lowercase letters and digits, at most 16.
+        Each app of a workspace is at `<name>--<id>.<domain>`, an origin of
+        its own. `package` adds `t3code`.
+      '';
     };
     domain = mkOption {
       type = types.str;
       example = "ws.example.com";
-      description = "Each workspace is served at `<workspace>.<domain>`; one wildcard certificate covers them all.";
+      description = "A workspace's apps are served at `<workspace>--<app>.<domain>`; one wildcard certificate covers them all.";
     };
     publicScheme = mkOption {
       type = types.enum [
@@ -708,18 +779,32 @@ in
               message = "services.workbench.workspaces: every workspace needs a distinct ip.";
             }
           ]
+          ++ lib.mapAttrsToList (id: _: {
+            assertion = builtins.match "[a-z][a-z0-9]{0,15}" id != null;
+            message = "services.workbench.apps.${id}: an app's id is a lowercase letter, then lowercase letters and digits, at most 16.";
+          }) cfg.apps
+          ++ lib.mapAttrsToList (name: ws: {
+            assertion =
+              lib.all (id: cfg.apps ? ${id}) ws.apps
+              && lib.allUnique ws.apps
+              && lib.allUnique (map (id: cfg.apps.${id}.port) ws.apps);
+            message = "services.workbench.workspaces.${name}.apps: each must be one of services.workbench.apps, once, on a port of its own.";
+          }) cfg.workspaces
           ++ lib.mapAttrsToList (name: ws: {
             assertion =
               builtins.match "[a-z]([a-z0-9-]{0,26}[a-z0-9])?" name != null
+              && !lib.hasInfix "--" name
               && builtins.match "[a-z_][a-z0-9_.-]{0,31}" ws.owner != null
               && ws.owner != "root"
               && inSubnet ws.ip;
-            message = "services.workbench.workspaces.${name}: the name must be a DNS label of at most 28 characters, the owner a user name other than root, and ip an address in ${cfg.network.subnet}.2-254.";
+            message = "services.workbench.workspaces.${name}: the name must be a DNS label of at most 28 characters without `--`, the owner a user name other than root, and ip an address in ${cfg.network.subnet}.2-254.";
           }) cfg.workspaces
           ++ lib.mapAttrsToList (name: ws: {
             assertion = ws.os == "nixos" -> ws.sudo;
             message = "services.workbench.workspaces.${name}: a NixOS workspace needs sudo; its owner rebuilds the system.";
           }) cfg.workspaces;
+
+        services.workbench.apps.t3code = lib.mkIf (cfg.package != null) t3code;
 
         environment.systemPackages = [ package ];
         environment.etc = lib.mapAttrs' (
@@ -860,28 +945,22 @@ in
           ];
         };
 
-        # With the web UI, one virtual host of its serves every workspace.
+        # With the web UI, one virtual host of its serves every app.
         services.nginx = {
           enable = true;
           recommendedProxySettings = true;
           virtualHosts = lib.mkIf (!cfg.web.enable) (
-            lib.mapAttrs' (
-              name: ws:
-              lib.nameValuePair (hostFor name) (
-                cfg.virtualHost
-                // {
-                  locations."/" = {
-                    proxyPass = "http://${ws.ip}:${toString ws.appPort}";
-                    proxyWebsockets = true;
-                    extraConfig = ''
-                      proxy_read_timeout 1d;
-                      proxy_send_timeout 1d;
-                      client_max_body_size 64m;
-                    '';
-                  };
-                }
+            lib.listToAttrs (
+              lib.concatLists (
+                lib.mapAttrsToList (
+                  name: ws:
+                  map (id: {
+                    name = "${name}--${id}.${cfg.domain}";
+                    value = vhostOf ws.ip cfg.apps.${id}.port;
+                  }) ws.apps
+                ) cfg.workspaces
               )
-            ) cfg.workspaces
+            )
           );
         };
       }
@@ -904,10 +983,16 @@ in
             "destroy"
             "%i"
           ];
+          "workbench-apps@" = selfServiceUnit "Change the apps of workspace %i" [
+            "apps"
+            "%i"
+          ];
           workbench-self-service =
             selfServiceUnit "Users, taps and starts of workspaces made at run time" [ "setup" ]
             // {
               wantedBy = [ "multi-user.target" ];
+              # A new template makes every config again.
+              restartTriggers = [ (builtins.toJSON selfServiceTemplate) ];
               serviceConfig = {
                 Type = "oneshot";
                 RemainAfterExit = true;

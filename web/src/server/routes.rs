@@ -18,6 +18,7 @@ use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list, handle_server_fns_with_context};
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
+use workbench_model::apps::is_app_id;
 use workbench_model::{Viewer, is_workspace_name};
 
 use super::{AppState, authz, console, csp};
@@ -145,16 +146,23 @@ async fn events(State(state): State<AppState>, axum::Extension(viewer): axum::Ex
     )
 }
 
-/// `GET /denied?ws=<name>`: the page nginx shows at a workspace's address
-/// when it isn't the viewer's, styled from the UI's origin.
+/// `GET /denied?ws=<name>&app=<id>`: the page nginx shows at an app's
+/// address when the workspace isn't the viewer's or hasn't the app, styled
+/// from the UI's origin.
 async fn denied(
     State(state): State<AppState>,
     axum::Extension(viewer): axum::Extension<Viewer>,
     query: axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let ws = query.get("ws").filter(|n| is_workspace_name(n)).cloned();
+    let app = query.get("app").filter(|a| is_app_id(a)).cloned().unwrap_or_default();
     let origin = state.opts.origin.clone();
     let domain = state.opts.domain().to_owned();
+    let theirs =
+        ws.as_ref().and_then(|n| state.backend.config(n).ok()).filter(|c| viewer.may_use(&c.owner, c.self_service));
+    if let (Some(c), false) = (theirs, app.is_empty()) {
+        return no_app(&state, &c.name, &app);
+    }
     let what = ws.map_or_else(|| "This workspace".to_owned(), |n| format!("{n}.{domain}"));
     let page = view! {
         <!DOCTYPE html>
@@ -195,4 +203,40 @@ async fn denied(
     .to_html();
     let policy = format!("default-src 'none'; style-src {origin}; img-src {origin}; frame-ancestors 'none'");
     (StatusCode::FORBIDDEN, [(header::CONTENT_SECURITY_POLICY, policy)], Html(page)).into_response()
+}
+
+/// The page at the address of an app a workspace of the viewer's hasn't.
+fn no_app(state: &AppState, name: &str, app: &str) -> Response {
+    let origin = state.opts.origin.clone();
+    let page = view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
+                <meta name="color-scheme" content="light dark" />
+                <title>"No such app · workbench"</title>
+                <link rel="icon" href=format!("{origin}{}", asset(&state.leptos, "mark.svg")) type="image/svg+xml" />
+                <link rel="stylesheet" href=format!("{origin}{}", asset(&state.leptos, "app.css")) />
+            </head>
+            <body>
+                <div class="app">
+                    <main class="solo">
+                        <div class="card">
+                            <h1><span class="mono">{name.to_owned()}</span>" has no app " <span class="mono">{app.to_owned()}</span></h1>
+                            <p>"Its apps, and how to add one, are on its panel."</p>
+                            <div class="acts">
+                                <a class="btn p" href=format!("{origin}/?w={name}")>
+                                    {format!("Open {name}'s panel")}
+                                </a>
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            </body>
+        </html>
+    }
+    .to_html();
+    let policy = format!("default-src 'none'; style-src {origin}; img-src {origin}; frame-ancestors 'none'");
+    (StatusCode::NOT_FOUND, [(header::CONTENT_SECURITY_POLICY, policy)], Html(page)).into_response()
 }

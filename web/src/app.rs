@@ -9,12 +9,14 @@ use leptos_meta::{MetaTags, Title, provide_meta_context};
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::{SsrMode, path};
+use workbench_model::apps::AppInfo;
 use workbench_model::self_service::{MIN_DISK_GIB, NewView};
 use workbench_model::{
-    Filter, HostView, List, Quotas, Row, SignInBlocker, Snapshot, State, Verb, Viewer, Workspace, gib, pct,
+    App, Change, Filter, HostView, List, OpenBlocker, Quotas, Row, Snapshot, Stage, State, Verb, Viewer, Workspace,
+    gib, pct,
 };
 
-use crate::api::{self, Control};
+use crate::api::{self, Control, MakeDeviceLink};
 
 /// An asset's URL with the build's version in it, which `site_pkg_dir`
 /// carries as `pkg/<version>`: a browser never keeps one from an older
@@ -53,7 +55,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
-    provide_context(SignedIn(RwSignal::new(HashSet::new())));
+    provide_context(Opened(RwSignal::new(HashSet::new())));
     view! {
         <Router>
             <Routes fallback=|| view! { <Forbidden viewer=None /> }>
@@ -61,27 +63,29 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/host") view=HostPage ssr=SsrMode::Async />
                 <Route path=path!("/new") view=NewPage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/console") view=ConsolePage ssr=SsrMode::Async />
+                <Route path=path!("/w/:ws/open/:app") view=OpenPage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/:action") view=ActionPage ssr=SsrMode::Async />
             </Routes>
         </Router>
     }
 }
 
-/// The workspaces this browser has signed in to the app of, from
-/// `localStorage`: their primary action is just Open.
+/// The apps this browser opened with a one-time link, as
+/// `<workspace>/<app>`, from `localStorage`: opening them again is just
+/// their address.
 #[derive(Clone, Copy)]
-struct SignedIn(RwSignal<HashSet<String>>);
+struct Opened(RwSignal<HashSet<String>>);
 
-const SIGNED_KEY: &str = "workbench.signedIn";
+const OPENED_KEY: &str = "workbench.opened";
 
 fn local_storage() -> Option<web_sys::Storage> {
     window().local_storage().ok().flatten()
 }
 
-impl SignedIn {
+impl Opened {
     fn load(self) {
         let names = local_storage()
-            .and_then(|s| s.get_item(SIGNED_KEY).ok().flatten())
+            .and_then(|s| s.get_item(OPENED_KEY).ok().flatten())
             .and_then(|raw| serde_json::from_str::<HashSet<String>>(&raw).ok())
             .unwrap_or_default();
         self.0.set(names);
@@ -92,7 +96,7 @@ impl SignedIn {
             s.insert(name.to_owned());
         });
         if let (Some(store), Ok(raw)) = (local_storage(), serde_json::to_string(&self.0.get_untracked())) {
-            let _ = store.set_item(SIGNED_KEY, &raw);
+            let _ = store.set_item(OPENED_KEY, &raw);
         }
     }
 
@@ -121,7 +125,12 @@ fn Icon(d: &'static str) -> impl IntoView {
 
 const ICON_BACK: &str = "m14 6-6 6 6 6";
 const ICON_OUT: &str = "M7 17 17 7M9 7h8v8";
-const ICON_SIGN_IN: &str = "M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l4-4-4-4M14 12H4";
+const ICON_PHONE: &str = "M9 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM11 17.5h2";
+const ICON_COPY: &str = "M10 8h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2ZM16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2";
+const ICON_LINK: &str =
+    "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1";
+const ICON_PLUS: &str = "M12 5v14M5 12h14";
+const ICON_DOTS: &str = "M6 12h.01M12 12h.01M18 12h.01";
 const ICON_CONSOLE: &str = "m5 8 4 4-4 4M12 16h7";
 const ICON_RESTART: &str = "M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6";
 const ICON_STOP: &str = "M12 3v8M6.6 6.6a8 8 0 1 0 10.8 0";
@@ -320,12 +329,12 @@ fn Live(initial: Snapshot) -> impl IntoView {
         let selected = query.with(|q| q.get("w").unwrap_or_default());
         find.with(|f| snap.with(|s| List::build(s, filter.get(), &selected, f)))
     });
-    let signed = expect_context::<SignedIn>();
+    let opened = expect_context::<Opened>();
     let viewer = snap.with_untracked(|s| s.viewer.clone());
 
-    // In the browser: remembered sign-ins, live updates and the keys.
+    // In the browser: apps opened before, live updates and the keys.
     Effect::new(move |_| {
-        signed.load();
+        opened.load();
         follow_events(snap, lost, filter.get_untracked());
     });
     let navigate = leptos_router::hooks::use_navigate();
@@ -357,7 +366,7 @@ fn Live(initial: Snapshot) -> impl IntoView {
                             <div>
                                 <h2>"You don't have a workspace yet"</h2>
                                 <p>
-                                    "A workspace is a VM of your own on this host, with the app in it and a disk that stays."
+                                    "A workspace is a VM of your own on this host, with a disk that stays and the apps you open in the browser."
                                     {move || {
                                         if snap.with(|s| s.viewer.creates) {
                                             " You can make one yourself."
@@ -416,7 +425,6 @@ fn Live(initial: Snapshot) -> impl IntoView {
                         <p class="hint">
                             <span><kbd>"J"</kbd><kbd>"K"</kbd>" move"</span>
                             <span><kbd>"↵"</kbd>" open"</span>
-                            <span><kbd>"S"</kbd>" sign in"</span>
                             <span><kbd>"C"</kbd>" console"</span>
                             <span><kbd>"R"</kbd>" restart"</span>
                         </p>
@@ -576,70 +584,93 @@ fn ControlForm(
     }
 }
 
-/// A form that signs a browser in to the app, in a new tab.
+/// Opens an app in a new tab: the first time in this browser through a
+/// one-time link that signs it in, if the app makes them, then at its
+/// address.
 #[component]
-fn SignInForm(ws: String, #[prop(optional, into)] class: String, children: Children) -> impl IntoView {
-    let signed = expect_context::<SignedIn>();
-    let (name, data) = (ws.clone(), ws.clone());
+fn OpenButton(
+    ws: String,
+    app: App,
+    #[prop(optional, into)] class: String,
+    #[prop(optional)] key: Option<&'static str>,
+    children: ChildrenFn,
+) -> impl IntoView {
+    let opened = expect_context::<Opened>();
+    let id = format!("{ws}/{}", app.id);
+    if !app.open_link {
+        return view! {
+            <a class=format!("btn {class}") href=app.url target="_blank" rel="noopener" data-key=key title=app.name>
+                {children()}
+            </a>
+        }
+        .into_any();
+    }
+    let known = {
+        let id = id.clone();
+        Signal::derive(move || opened.has(&id))
+    };
     view! {
         <form
             method="post"
-            action="/api/sign-in"
+            action="/api/open"
             target="_blank"
-            class=class
-            data-ws=data
-            on:submit=move |_| signed.remember(&name)
+            class="open"
+            hidden=known
+            on:submit=move |_| opened.remember(&id)
         >
             <input type="hidden" name="ws" value=ws />
-            {children()}
+            <input type="hidden" name="app" value=app.id.clone() />
+            <button class=format!("btn {class}") data-key=key title=app.name.clone()>{children()}</button>
         </form>
+        <a
+            class=format!("btn {class}")
+            href=app.url
+            target="_blank"
+            rel="noopener"
+            data-key=key
+            title=app.name
+            hidden=move || !known.get()
+        >
+            {children()}
+        </a>
     }
+    .into_any()
 }
 
-/// A row's one primary action.
+/// A row's one primary action: open its first app, or else what the
+/// workspace needs.
 #[component]
 fn Primary(ws: Workspace) -> impl IntoView {
-    let signed = expect_context::<SignedIn>();
     if !ws.configured {
         return view! { <span class="wait">"workbench destroy"</span> }.into_any();
     }
-    match ws.state {
-        State::Running if ws.sign_in => {
-            let name = ws.name.clone();
-            let opened = Signal::derive(move || signed.has(&name));
-            view! {
-                <SignInForm ws=ws.name.clone() class="signin">
-                    <button class="btn" data-key="enter" hidden=opened>
-                        "Open and sign in"
-                    </button>
-                </SignInForm>
-                <a
-                    class="btn opened"
-                    href=ws.url.clone()
-                    target="_blank"
-                    rel="noopener"
-                    data-key="enter"
-                    hidden=move || !opened.get()
-                >
-                    "Open"
-                </a>
-            }
-            .into_any()
+    let first = ws.running_apps().next().cloned();
+    let console = |name: &str| {
+        view! {
+            <a class="btn" href=format!("/w/{name}/console") rel="external" data-key="enter">
+                "Console"
+            </a>
         }
-        State::Running | State::Starting => view! {
-            <a class="btn" href=ws.url.clone() target="_blank" rel="noopener" data-key="enter">
+        .into_any()
+    };
+    match (ws.state, first) {
+        (State::Running, Some(app)) => view! {
+            <OpenButton ws=ws.name.clone() app key="enter">
+                "Open"
+            </OpenButton>
+        }
+        .into_any(),
+        (State::Starting, Some(app)) => view! {
+            <a class="btn" href=app.url target="_blank" rel="noopener" data-key="enter" title=app.name>
                 "Open"
             </a>
         }
         .into_any(),
-        State::Stopped => view! { <ControlForm ws=ws.name.clone() verb=Verb::Start>"Start"</ControlForm> }.into_any(),
-        State::Failing => view! {
-            <a class="btn" href=format!("/w/{}/console", ws.name) rel="external" data-key="enter">
-                "Console"
-            </a>
+        (State::Running | State::Starting | State::Failing, _) => console(&ws.name),
+        (State::Stopped, _) => {
+            view! { <ControlForm ws=ws.name.clone() verb=Verb::Start>"Start"</ControlForm> }.into_any()
         }
-        .into_any(),
-        State::Stopping | State::Restarting => view! { <span class="wait">"up to 2 min"</span> }.into_any(),
+        (State::Stopping | State::Restarting, _) => view! { <span class="wait">"up to 2 min"</span> }.into_any(),
     }
 }
 
@@ -677,7 +708,7 @@ fn RestartText(name: String) -> impl IntoView {
             <dt>"Keeps"</dt>
             <dd>"Everything on its disk."</dd>
             <dt>"Brings"</dt>
-            <dd>"The app and system now on the host."</dd>
+            <dd>"The apps and packages it has now, as the host has them."</dd>
         </dl>
     }
 }
@@ -688,7 +719,7 @@ fn StopText(name: String) -> impl IntoView {
         <h2 id=format!("stop-{name}-h")>"Stop " <span class="mono">{name.clone()}</span> "?"</h2>
         <dl>
             <dt>"Stops"</dt>
-            <dd>"The VM and the app."</dd>
+            <dd>"The VM and its apps."</dd>
             <dt>"Keeps"</dt>
             <dd>"Everything on its disk."</dd>
             <dt>"Lasts"</dt>
@@ -737,6 +768,23 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
     };
     let configured = Memo::new(move |_| row.with(|r| r.as_ref().is_some_and(|r| r.ws.configured)));
     let state = Memo::new(move |_| row.with(|r| r.as_ref().map_or(State::Stopped, |r| r.ws.state)));
+    // Another device's link: which app it is for, and making it.
+    let make = ServerAction::<MakeDeviceLink>::new();
+    let for_app = RwSignal::new(String::new());
+    let device = {
+        let name = name.clone();
+        Callback::new(move |(id, app_name): (String, String)| {
+            for_app.set(app_name);
+            make.dispatch(MakeDeviceLink { ws: name.clone(), app: id });
+            if let Some(d) = document()
+                .get_element_by_id(&format!("device-{name}"))
+                .and_then(|el| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlDialogElement>(el).ok())
+            {
+                let _ = d.show_modal();
+            }
+        })
+    };
+    let make = (make, for_app);
     let ws = move || row.with(|r| r.as_ref().map(|r| r.ws.clone()).unwrap_or_default());
     let head = move || {
         row.get().map(|r| {
@@ -751,15 +799,7 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                         {(!r.since.is_empty()).then(|| format!(" since {}", r.since))}
                     </div>
                 </div>
-                {(ws.app_update && st != State::Restarting)
-                    .then(|| {
-                        view! {
-                            <div class="note">
-                                <b>"Update"</b>
-                                " A new app version is on the host. Restart to use it."
-                            </div>
-                        }
-                    })}
+                {(!ws.changes.is_empty() && st != State::Restarting).then(|| view! { <PendingNote ws=ws.clone() /> })}
                 {(st == State::Failing)
                     .then(|| {
                         view! {
@@ -783,7 +823,6 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                     })}
                 <dl class="kv">
                     {(!ws.owner.is_empty()).then(|| view! { <dt>"Owner"</dt><dd>{ws.owner.clone()}</dd> })}
-                    {(!ws.url.is_empty()).then(|| view! { <dt>"Address"</dt><dd class="mono clip" title=ws.host().to_owned()>{ws.host().to_owned()}</dd> })}
                     {(!ws.ip.is_empty()).then(|| view! { <dt>"IP"</dt><dd class="mono">{ws.ip.clone()}</dd> })}
                     {(!ws.os.is_empty()).then(|| view! { <dt>"System"</dt><dd>{os_name(&ws.os)}</dd> })}
                     {(ws.max_memory_bytes > 0)
@@ -822,15 +861,8 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
             return None;
         }
         let name = ws.name.clone();
-        let open = matches!(st, State::Running | State::Starting).then(|| {
-            let label = format!("Open {name}");
-            view! {
-                <a class="btn p" href=ws.url.clone() target="_blank" rel="noopener">
-                    <span>{label} <Icon d=ICON_OUT /></span>
-                    <kbd>"↵"</kbd>
-                </a>
-            }
-        });
+        let offered = snap.with(|s| s.apps.clone());
+        let apps = view! { <AppsSection ws=ws.clone() offered device /> };
         let start = (st == State::Stopped).then(|| {
             let label = format!("Start {name}");
             view! {
@@ -838,16 +870,6 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                     <span>{label}</span>
                     <kbd>"↵"</kbd>
                 </ControlForm>
-            }
-        });
-        let sign_in = (ws.sign_in && st == State::Running).then(|| {
-            view! {
-                <SignInForm ws=name.clone() class="signin-any">
-                    <button class="btn" data-key="s">
-                        <span><Icon d=ICON_SIGN_IN /> "Sign in to app"</span>
-                        <kbd>"S"</kbd>
-                    </button>
-                </SignInForm>
             }
         });
         let console = (st != State::Stopped).then(|| {
@@ -858,12 +880,14 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                 </a>
             }
         });
+        // What waits for a restart makes it the next thing to do.
+        let restart_class = if ws.changes.is_empty() { "btn" } else { "btn p" };
         let restart = (st != State::Stopped && !st.changing()).then(|| {
             let id = format!("restart-{name}");
             let click = id.clone();
             view! {
                 <a
-                    class="btn"
+                    class=restart_class
                     href=format!("/w/{name}/restart")
                     data-dialog=id
                     data-key="r"
@@ -899,16 +923,46 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
         });
         let foot = (stop.is_some() || destroy.is_some()).then(|| view! { <div class="foot">{stop} {destroy}</div> });
         Some(view! {
-            <div class="stack">{open} {start} {sign_in} {console} {restart}</div>
+            {apps}
+            <div class="stack">{start} {console} {restart}</div>
             {foot}
         })
     };
     // The dialogs stay put while the panel changes, so live updates never
     // close one someone is reading.
+    let editable = row.with_untracked(|r| r.as_ref().is_some_and(|r| r.ws.self_service))
+        && snap.with_untracked(|s| !s.apps.is_empty());
+    // The apps dialog follows what its form shows, whether the VM runs and
+    // the apps its config has, and nothing else, so an update that changes
+    // neither leaves the boxes someone is ticking alone.
+    let form_of = Memo::new(move |_| {
+        row.with(|r| {
+            r.as_ref().map(|r| {
+                let ws = &r.ws;
+                let has: Vec<String> =
+                    ws.apps.iter().filter(|a| ws.stage(&a.id) != Stage::Going).map(|a| a.id.clone()).collect();
+                (ws.state == State::Stopped, has)
+            })
+        })
+    });
     let dialogs = configured.get_untracked().then(|| {
+        let offered = snap.with_untracked(|s| s.apps.clone());
         view! {
             <ConfirmDialog name=name.clone() verb=Verb::Restart />
             <ConfirmDialog name=name.clone() verb=Verb::Stop />
+            <DeviceDialog name=name.clone() make />
+            {editable
+                .then(|| {
+                    view! {
+                        <dialog id=format!("apps-{name}") class="dlg" aria-labelledby=format!("apps-{name}-h")>
+                            {move || {
+                                form_of.track();
+                                let ws = row.with_untracked(|r| r.as_ref().map(|r| r.ws.clone()).unwrap_or_default());
+                                view! { <AppsForm ws offered=offered.clone() dialog=true /> }
+                            }}
+                        </dialog>
+                    }
+                })}
         }
     });
     view! {
@@ -921,6 +975,318 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
             {actions}
             {dialogs}
         </aside>
+    }
+}
+
+/// What waits for a restart, said as what the next one brings.
+#[component]
+fn PendingNote(ws: Workspace) -> impl IntoView {
+    let name_of = |id: &str| ws.app(id).map_or_else(|| id.to_owned(), |a| a.name.clone());
+    let parts: Vec<String> = ws
+        .changes
+        .iter()
+        .map(|c| match c {
+            Change::AppAdded { app } => format!("{} comes", name_of(app)),
+            Change::AppRemoved { app } => format!("{} goes", name_of(app)),
+            Change::AppUpdated { app } => format!("a new version of {} comes", name_of(app)),
+            Change::Packages => "new packages come".into(),
+        })
+        .collect();
+    let said = match parts.as_slice() {
+        [one] => format!("{} with the next restart.", capitalized(one)),
+        [rest @ .., last] => format!("With the next restart, {} and {last}.", rest.join(", ")),
+        [] => String::new(),
+    };
+    view! {
+        <div class="note">
+            <b>{said}</b>
+            " The VM runs what it booted with."
+        </div>
+    }
+}
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// A workspace's apps on its panel: each opens, and one made at run time
+/// changes its apps here.
+#[component]
+fn AppsSection(ws: Workspace, offered: Vec<AppInfo>, device: Callback<(String, String)>) -> impl IntoView {
+    let name = ws.name.clone();
+    let editable = ws.self_service && !offered.is_empty();
+    let dialog = format!("apps-{name}");
+    let edit = editable.then(|| {
+        let id = dialog.clone();
+        view! {
+            <a href=format!("/w/{name}/apps") rel="external" on:click=move |ev| open_dialog(&ev, &id)>
+                "Edit…"
+            </a>
+        }
+    });
+    let head = view! { <div class="apps-h"><span>"Apps"</span>{(!ws.apps.is_empty()).then_some(edit)}</div> };
+    if ws.apps.is_empty() {
+        let add = editable.then(|| {
+            let id = dialog.clone();
+            view! {
+                <a class="btn" href=format!("/w/{name}/apps") rel="external" on:click=move |ev| open_dialog(&ev, &id)>
+                    <Icon d=ICON_PLUS />
+                    "Add an app…"
+                </a>
+            }
+        });
+        let text = if editable {
+            "Add one to use this workspace from the browser. Until then, its console is the way in."
+        } else {
+            "Its console is the way in."
+        };
+        return view! {
+            {head}
+            <div class="none"><b>{if editable { "No apps yet" } else { "No apps" }}</b>{text}{add}</div>
+        }
+        .into_any();
+    }
+    let first = ws.apps.iter().position(|a| ws.open_blocker(&a.id).is_none());
+    let rows = ws
+        .apps
+        .iter()
+        .enumerate()
+        .map(|(i, app)| view! { <AppRow ws=ws.clone() app=app.clone() first=first == Some(i) device /> })
+        .collect_view();
+    view! { {head} <div class="apps">{rows}</div> }.into_any()
+}
+
+/// One app on a panel: Open, and the other ways to it, or why it doesn't
+/// open now.
+#[component]
+fn AppRow(ws: Workspace, app: App, first: bool, device: Callback<(String, String)>) -> impl IntoView {
+    let stage = ws.stage(&app.id);
+    let until = (stage == Stage::Going).then_some(" · until a restart");
+    let dot = if ws.state == State::Running { "dot on" } else { "dot go" };
+    match ws.open_blocker(&app.id) {
+        None => {
+            let label = format!("Open {}", app.name);
+            let class = if first { "p" } else { "" };
+            view! {
+                <div class="appo">
+                    <OpenButton ws=ws.name.clone() app=app.clone() class=class>
+                        <span><span class=dot></span>{label.clone()}{until}<Icon d=ICON_OUT /></span>
+                        {first.then(|| view! { <kbd>"↵"</kbd> })}
+                    </OpenButton>
+                    <MoreMenu ws=ws.name.clone() app device />
+                </div>
+            }
+            .into_any()
+        }
+        Some(OpenBlocker::Starting) => view! {
+            <div class="appo">
+                <a class="btn" href=app.url.clone() target="_blank" rel="noopener" title="Still starting">
+                    <span><span class="dot go"></span>{format!("Open {}", app.name)}<Icon d=ICON_OUT /></span>
+                </a>
+            </div>
+        }
+        .into_any(),
+        Some(why) => {
+            let label = match why {
+                OpenBlocker::Coming => format!("{} · after a restart", app.name),
+                _ => app.name.clone(),
+            };
+            view! {
+                <div class="appo">
+                    <span class="btn" aria-disabled="true"><span><span class="dot off"></span>{label}</span></span>
+                </div>
+            }
+            .into_any()
+        }
+    }
+}
+
+/// An app's other ways in: on another device, with a new link, and its
+/// address to copy.
+#[component]
+fn MoreMenu(ws: String, app: App, device: Callback<(String, String)>) -> impl IntoView {
+    let copied = RwSignal::new(false);
+    let url = app.url.clone();
+    let page = format!("/w/{ws}/open/{}", app.id);
+    let close = |ev: &leptos::ev::MouseEvent| {
+        let menu = ev
+            .target()
+            .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
+            .and_then(|el| el.closest("details").ok().flatten());
+        if let Some(m) = menu {
+            let _ = m.remove_attribute("open");
+        }
+    };
+    let link = app.open_link.then(|| {
+        let (id, name) = (app.id.clone(), app.name.clone());
+        view! {
+            <a
+                href=page.clone()
+                rel="external"
+                on:click=move |ev| {
+                    ev.prevent_default();
+                    close(&ev);
+                    device.run((id.clone(), name.clone()));
+                }
+            >
+                <Icon d=ICON_PHONE />
+                "Open on another device…"
+            </a>
+            <form method="post" action="/api/open" target="_blank">
+                <input type="hidden" name="ws" value=ws.clone() />
+                <input type="hidden" name="app" value=app.id.clone() />
+                <button>
+                    <Icon d=ICON_LINK />
+                    "Open with a new link"
+                </button>
+            </form>
+        }
+    });
+    view! {
+        <details class="more">
+            <summary class="btn" aria-label=format!("More for {}", app.name)>
+                <Icon d=ICON_DOTS />
+            </summary>
+            <div class="pop">
+                {link}
+                <button
+                    type="button"
+                    on:click=move |ev| {
+                        let _ = window().navigator().clipboard().write_text(&url);
+                        copied.set(true);
+                        close(&ev);
+                    }
+                >
+                    <Icon d=ICON_COPY />
+                    {move || if copied.get() { "Address copied" } else { "Copy address" }}
+                </button>
+            </div>
+        </details>
+    }
+}
+
+/// The dialog with a one-time link to an app for another device, and its
+/// QR code.
+#[component]
+fn DeviceDialog(name: String, make: (ServerAction<MakeDeviceLink>, RwSignal<String>)) -> impl IntoView {
+    let (make, app) = make;
+    let body = move || {
+        if make.pending().get() {
+            return view! { <p class="small">"Making a link…"</p> }.into_any();
+        }
+        match make.value().get() {
+            Some(Ok(d)) => {
+                let link = d.link.clone();
+                view! {
+                    <div class="qr">
+                        <svg viewBox=format!("0 0 {0} {0}", d.size) role="img" aria-label="QR code of the link">
+                            <path d=d.qr />
+                        </svg>
+                    </div>
+                    <div class="linkrow">
+                        <input readonly aria-label="Link" value=d.link.clone() />
+                        <button
+                            type="button"
+                            class="btn"
+                            on:click=move |_| {
+                                let _ = window().navigator().clipboard().write_text(&link);
+                            }
+                        >
+                            <Icon d=ICON_COPY />
+                            "Copy"
+                        </button>
+                    </div>
+                }
+                .into_any()
+            }
+            Some(Err(e)) => view! {
+                <div class="err">
+                    <b>"No link came back."</b>
+                    {e.to_string()}
+                </div>
+            }
+            .into_any(),
+            None => ().into_any(),
+        }
+    };
+    view! {
+        <dialog id=format!("device-{name}") class="dlg" aria-labelledby=format!("device-{name}-h")>
+            <h2 id=format!("device-{name}-h")>"Open " {move || app.get()} " on another device"</h2>
+            <p class="small">
+                "Scan it with your phone, or send the link to yourself. It opens "
+                {move || app.get()}
+                " in "
+                <span class="mono">{name.clone()}</span>
+                " once, and whoever has it gets in."
+            </p>
+            {body}
+            <div class="acts">
+                <button class="btn q" type="button" on:click=move |ev| close_dialog(&ev)>
+                    "Done"
+                </button>
+            </div>
+        </dialog>
+    }
+}
+
+/// The apps a workspace made at run time has, as checkboxes: in its dialog
+/// on the panel, or on its own page.
+#[component]
+fn AppsForm(
+    ws: Workspace,
+    offered: Vec<AppInfo>,
+    #[prop(optional)] dialog: bool,
+    #[prop(optional)] error: String,
+) -> impl IntoView {
+    let name = ws.name.clone();
+    // What its config has: not an app that goes with the next start.
+    let has: Vec<String> = ws.apps.iter().filter(|a| ws.stage(&a.id) != Stage::Going).map(|a| a.id.clone()).collect();
+    let boxes = offered
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let url = workbench_model::apps::app_url(&ws.url, &a.id);
+            let host = url.split_once("://").map_or(url.clone(), |(_, h)| h.to_owned());
+            view! {
+                <label class="check">
+                    <input type="checkbox" name=format!("apps[{i}]") value=a.id.clone() checked=has.contains(&a.id) />
+                    <span><b>{a.name.clone()}</b></span>
+                    <small>"Opens in the browser at " <span class="mono">{host}</span> "."</small>
+                </label>
+            }
+        })
+        .collect_view();
+    let stopped = ws.state == State::Stopped;
+    let cancel = if dialog {
+        view! { <button type="button" class="btn q" on:click=move |ev| close_dialog(&ev)>"Cancel"</button> }.into_any()
+    } else {
+        view! { <a class="btn q" href=format!("/?w={name}")>"Cancel"</a> }.into_any()
+    };
+    let save = if stopped {
+        view! { <button class="btn p">"Save"</button> }.into_any()
+    } else {
+        view! {
+            <button class="btn">"Save"</button>
+            <button class="btn p" name="restart" value="true">"Save and restart"</button>
+        }
+        .into_any()
+    };
+    view! {
+        <h2 id=format!("apps-{name}-h")>"Apps in " <span class="mono">{name.clone()}</span></h2>
+        {(!error.is_empty()).then(|| view! { <div class="err"><b>{error.clone()}</b></div> })}
+        <form class="form" method="post" action="/api/apps">
+            <input type="hidden" name="ws" value=name.clone() />
+            {boxes}
+            <p class="small">
+                {if stopped {
+                    "It boots with the apps it has. Nothing on its disk changes."
+                } else {
+                    "The VM boots with the apps it has; a change takes effect when it restarts. Nothing on its disk changes."
+                }}
+            </p>
+            <div class="acts">{cancel} {save}</div>
+        </form>
     }
 }
 
@@ -951,8 +1317,8 @@ fn follow_events(snap: RwSignal<Snapshot>, lost: RwSignal<Option<String>>, filte
     on_lost.forget();
 }
 
-/// The list's keys: `J`/`K` move, `↵` opens, `S` signs in, `C` opens the
-/// console, `R` restarts, `/` or `Ctrl K` finds. They press the buttons a
+/// The list's keys: `J`/`K` move, `↵` opens, `C` opens the console, `R`
+/// restarts, `/` or `Ctrl K` finds. They press the buttons a
 /// click would, so they never act on their own.
 fn keys(list: Memo<List>, snap: RwSignal<Snapshot>, find: RwSignal<String>, select: Callback<String>) {
     use wasm_bindgen::JsCast;
@@ -1022,7 +1388,6 @@ fn keys(list: Memo<List>, snap: RwSignal<Snapshot>, find: RwSignal<String>, sele
             "Enter" if target.as_ref().is_some_and(|t| t.tag_name() == "BODY") => {
                 press(doc.query_selector(".r.sel .act").ok().flatten(), "enter");
             }
-            "s" => press(peek, "s"),
             "c" => press(peek, "c"),
             "r" => press(peek, "r"),
             _ => {}
@@ -1206,8 +1571,8 @@ fn Host(snap: Snapshot, host: HostView) -> impl IntoView {
     }
 }
 
-/// The confirmation pages of start, stop and restart, and the sign-in
-/// page, at `/w/<ws>/<action>`.
+/// The confirmation pages of start, stop, restart and destroy, and the
+/// apps page, at `/w/<ws>/<action>`.
 #[component]
 fn ActionPage() -> impl IntoView {
     let params = use_params_map();
@@ -1221,8 +1586,11 @@ fn ActionPage() -> impl IntoView {
         let Some(ws) = snap.find(&name).map(|r| r.ws.clone()).filter(|ws| ws.configured) else {
             return view! { <Forbidden viewer=Some(viewer) /> }.into_any();
         };
-        let body = if action == "sign-in" {
-            view! { <SignInPage ws error detail /> }.into_any()
+        let body = if action == "apps" && ws.self_service && !snap.apps.is_empty() {
+            if !error.is_empty() {
+                set_status(422);
+            }
+            view! { <AppsForm ws offered=snap.apps.clone() error /> }.into_any()
         } else if action == "destroy" && ws.self_service {
             view! { <DestroyPage ws error detail /> }.into_any()
         } else if let Ok(verb) = action.parse::<Verb>() {
@@ -1230,8 +1598,8 @@ fn ActionPage() -> impl IntoView {
         } else {
             return view! { <Forbidden viewer=Some(viewer) /> }.into_any();
         };
-        let title = if action == "sign-in" {
-            format!("Sign in to {name} · workbench")
+        let title = if action == "apps" {
+            format!("Apps in {name} · workbench")
         } else if action == "destroy" {
             format!("Destroy {name} · workbench")
         } else {
@@ -1295,17 +1663,58 @@ fn ConfirmPage(ws: Workspace, verb: Verb, error: String, detail: String) -> impl
     }
 }
 
+/// An app's open page, at `/w/<ws>/open/<app>`: it opens the app with a
+/// one-time link, or says why it doesn't open.
 #[component]
-fn SignInPage(ws: Workspace, error: String, detail: String) -> impl IntoView {
+fn OpenPage() -> impl IntoView {
+    let params = use_params_map();
+    let query = use_query_map();
+    with_snapshot(move |snap| {
+        let get = |k: &str| params.with_untracked(|p| p.get(k).unwrap_or_default());
+        let (name, id) = (get("ws"), get("app"));
+        let (error, detail) =
+            query.with_untracked(|q| (q.get("error").unwrap_or_default(), q.get("detail").unwrap_or_default()));
+        let viewer = snap.viewer.clone();
+        let Some(ws) = snap.find(&name).map(|r| r.ws.clone()).filter(|ws| ws.configured) else {
+            return view! { <Forbidden viewer=Some(viewer) /> }.into_any();
+        };
+        let title = ws.app(&id).map_or_else(|| id.clone(), |a| a.name.clone());
+        let body = if let Some(app) = ws.app(&id).cloned() {
+            view! { <OpenBody ws app error detail /> }.into_any()
+        } else {
+            set_status(404);
+            view! {
+                <h1><span class="mono">{name.clone()}</span>" has no app " <span class="mono">{id.clone()}</span></h1>
+                <p>"Its apps are on its panel."</p>
+                <div class="acts"><a class="btn p" href=format!("/?w={name}")>"Back to workspaces"</a></div>
+            }
+            .into_any()
+        };
+        view! {
+            <Title text=format!("Open {title} · workbench") />
+            <div class="app">
+                <Top viewer />
+                <main class="solo">
+                    <div class="card">{body}</div>
+                </main>
+            </div>
+        }
+        .into_any()
+    })
+}
+
+#[component]
+fn OpenBody(ws: Workspace, app: App, error: String, detail: String) -> impl IntoView {
     let name = ws.name.clone();
-    let blocker = ws.sign_in_blocker();
-    let again = format!("/w/{name}/sign-in");
+    let page = format!("/w/{name}/open/{}", app.id);
     let console = format!("/w/{name}/console");
     let kind = if error.is_empty() {
-        match blocker {
-            Some(SignInBlocker::Stopped) => "stopped",
-            Some(SignInBlocker::Starting) => "starting",
-            Some(SignInBlocker::NoHook) => "no-hook",
+        match ws.open_blocker(&app.id) {
+            Some(OpenBlocker::Stopped) => "stopped",
+            Some(OpenBlocker::Starting) => "starting",
+            Some(OpenBlocker::Coming) => "coming",
+            Some(OpenBlocker::Unknown) => "unknown",
+            None if !app.open_link => "no-hook",
             None => "",
         }
         .to_owned()
@@ -1313,64 +1722,91 @@ fn SignInPage(ws: Workspace, error: String, detail: String) -> impl IntoView {
         error
     };
     let mono = |s: String| view! { <span class="mono">{s}</span> };
+    let an = app.name.clone();
+    let back = view! { <a class="btn q" href=format!("/?w={name}")>"Back to workspaces"</a> };
     let body = match kind.as_str() {
         "" => view! {
-            <p>"The app in " {mono(name.clone())} " has a sign-in of its own. This makes a one-time link for this browser and opens the app with it."</p>
-            <SignInForm ws=name.clone() class="acts">
-                <button class="btn p">"Open and sign in" <Icon d=ICON_OUT /></button>
-                <a class="btn q" href="/">"Back to workspaces"</a>
-            </SignInForm>
+            <p>{format!("{an} has a sign-in of its own. This makes a one-time link for this browser and opens {an} with it.")}</p>
+            <div class="acts">
+                <form method="post" action="/api/open">
+                    <input type="hidden" name="ws" value=name.clone() />
+                    <input type="hidden" name="app" value=app.id.clone() />
+                    <button class="btn p">{format!("Open {an}")} <Icon d=ICON_OUT /></button>
+                </form>
+                {back}
+            </div>
+        }
+        .into_any(),
+        "no-hook" => view! {
+            <p>{format!("{an} has no sign-in of its own: opening it is all it takes.")}</p>
+            <div class="acts"><a class="btn p" href=app.url.clone()>{format!("Open {an}")} <Icon d=ICON_OUT /></a>{back}</div>
         }
         .into_any(),
         "stopped" => view! {
-            <div class="err"><b>{mono(name.clone())} " is stopped."</b>"Start it, then sign in."</div>
+            <div class="err"><b>{mono(name.clone())} " is stopped."</b>{format!("Start it, then open {an}.")}</div>
             <div class="acts">
                 <ControlForm ws=name.clone() verb=Verb::Start class="p">{format!("Start {name}")}</ControlForm>
-                <a class="btn q" href="/">"Back to workspaces"</a>
+                {back}
             </div>
         }
         .into_any(),
         "starting" => view! {
             <div class="err">
-                <b>{mono(name.clone())} " is still starting."</b>
-                "Its agent isn't answering yet."
+                <b>{format!("{an} isn't answering in ")} {mono(name.clone())} " yet."</b>
+                "The workspace may still be starting."
                 {(ws.os == "nixos").then_some(" A NixOS workspace takes longer on its first boot after an update.")}
             </div>
-            <div class="acts"><a class="btn p" href=again rel="external">"Try again"</a><a class="btn q" href="/">"Back to workspaces"</a></div>
+            <div class="acts">
+                <a class="btn p" href=page rel="external">"Try again"</a>
+                <a class="btn" href=console rel="external">"Console"</a>
+                {back}
+            </div>
         }
         .into_any(),
-        "no-hook" => view! {
-            <p>"The app in " {mono(name.clone())} " has no sign-in of its own: opening it is all it takes."</p>
-            <div class="acts"><a class="btn p" href=ws.url.clone()>{format!("Open {name}")}</a></div>
+        "coming" => view! {
+            <div class="err">
+                <b>{format!("{an} comes with the next restart of ")} {mono(name.clone())} "."</b>
+                "The VM runs what it booted with."
+            </div>
+            <div class="acts">
+                <a class="btn p" href=format!("/w/{name}/restart")>{format!("Restart {name}…")}</a>
+                {back}
+            </div>
         }
         .into_any(),
         "timeout" => view! {
-            <div class="err"><b>"The app took too long to answer."</b>"No link came back within 90 seconds."</div>
-            <div class="acts"><a class="btn p" href=again rel="external">"Try again"</a><a class="btn" href=console rel="external">"Console"</a></div>
+            <div class="err"><b>{format!("{an} took too long to answer.")}</b>"No link came back within 90 seconds."</div>
+            <div class="acts">
+                <a class="btn p" href=page rel="external">"Try again"</a>
+                <a class="btn" href=console rel="external">"Console"</a>
+            </div>
         }
         .into_any(),
         "not-a-link" => view! {
             <div class="err">
-                <b>"The app answered something that isn't a link to " {mono(name.clone())} "."</b>
-                "Its sign-in hook must print one URL on " {mono(ws.host().to_owned())} "."
+                <b>{format!("{an} answered something that isn't a link to it.")}</b>
+                "Its sign-in hook must print one URL on " {mono(app.url.clone())} "."
             </div>
-            <div class="acts"><a class="btn p" href=again rel="external">"Try again"</a></div>
+            <div class="acts"><a class="btn p" href=page rel="external">"Try again"</a></div>
         }
         .into_any(),
         _ => view! {
             <div class="err">
-                <b>"The app couldn't make a sign-in link."</b>
+                <b>{format!("{an} couldn't make a sign-in link.")}</b>
                 {(!detail.is_empty()).then(|| view! { <details open><summary>"Details"</summary><pre>{detail.clone()}</pre></details> })}
             </div>
-            <div class="acts"><a class="btn p" href=again rel="external">"Try again"</a><a class="btn" href=console rel="external">"Console"</a></div>
+            <div class="acts">
+                <a class="btn p" href=page rel="external">"Try again"</a>
+                <a class="btn" href=console rel="external">"Console"</a>
+            </div>
         }
         .into_any(),
     };
     if !kind.is_empty() && kind != "no-hook" {
-        set_status(if matches!(kind.as_str(), "stopped" | "starting") { 409 } else { 502 });
+        set_status(if matches!(kind.as_str(), "stopped" | "starting" | "coming") { 409 } else { 502 });
     }
     view! {
-        <h1>"Sign in to " <span class="mono">{name.clone()}</span></h1>
+        <h1>{format!("Open {} in ", app.name)} <span class="mono">{name.clone()}</span></h1>
         {body}
     }
 }
@@ -1464,6 +1900,7 @@ fn NewPage() -> impl IntoView {
                             memory: get("memory"),
                             disk: get("disk"),
                             keys: get("keys"),
+                            apps: query.with_untracked(|q| q.get("apps")),
                         };
                         view! { <NewForm viewer=snap.viewer new filled /> }.into_any()
                     }
@@ -1484,6 +1921,8 @@ struct Filled {
     memory: String,
     disk: String,
     keys: String,
+    /// The apps picked, by id and comma: none when the form wasn't sent.
+    apps: Option<String>,
 }
 
 #[component]
@@ -1499,6 +1938,31 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
         l.os.iter()
             .map(|os| view! { <option value=os.clone() selected=*os == chosen>{os_name(os)}</option> })
             .collect_view();
+    // Every app, unless a refused form picked others.
+    let picked = |id: &str| filled.apps.as_ref().is_none_or(|p| p.split(',').any(|a| a == id));
+    let apps = (!l.apps.is_empty()).then(|| {
+        let boxes = l
+            .apps
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                view! {
+                    <label class="check">
+                        <input type="checkbox" name=format!("apps[{i}]") value=a.id.clone() checked=picked(&a.id) />
+                        <span><b>{a.name.clone()}</b></span>
+                        <small>"Opens in the browser at " <span class="mono">{format!("<name>--{}.<domain>", a.id)}</span> "."</small>
+                    </label>
+                }
+            })
+            .collect_view();
+        view! {
+            <fieldset>
+                <legend>"Apps"</legend>
+                {boxes}
+                <small>"What you open from the list. With none, the console is the way in; you can add one later."</small>
+            </fieldset>
+        }
+    });
     if !filled.error.is_empty() {
         set_status(422);
     }
@@ -1519,7 +1983,7 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
             <main class="solo">
                 <form class="card form" method="post" action="/api/create">
                     <h1>"New workspace"</h1>
-                    <p>"A VM of your own, with the app in it and a disk that stays. It boots once it's made."</p>
+                    <p>"A VM of your own, with a disk that stays and the apps you pick. It boots once it's made."</p>
                     {quota}
                     {(!filled.error.is_empty()).then(|| view! { <div class="err"><b>{filled.error.clone()}</b></div> })}
                     <label>
@@ -1531,6 +1995,7 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
                         <span>"System"</span>
                         <select name="os">{systems}</select>
                     </label>
+                    {apps}
                     <label>
                         <span>"SSH keys"</span>
                         <textarea name="ssh_keys" class="mono" rows="3" spellcheck="false" placeholder="ssh-ed25519 AAAA… you@laptop">

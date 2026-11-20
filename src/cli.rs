@@ -1,5 +1,5 @@
 //! The ops commands on the host: `status`, `start`, `stop`, `restart`,
-//! `sign-in`, `console` and `destroy`. Only start, stop, restart and
+//! `open-link`, `console` and `destroy`. Only start, stop, restart and
 //! destroy change a VM; the others talk to it through its sockets.
 
 use std::fmt::Write as _;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use vmkit::hostutil;
 use vmkit::memory::GIB;
-use workbench_model::Verb;
+use workbench_model::{Change, Stage, Verb, Workspace};
 
 use crate::config::{self, is_workspace_name};
 use crate::state::{self, unit_name};
@@ -27,12 +27,42 @@ impl std::fmt::Display for ExitCode {
 
 impl std::error::Error for ExitCode {}
 
-/// Prints a link that signs a browser in to the workspace's app.
-pub async fn sign_in(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
+/// Prints a link that signs a browser in to an app of the workspace: the
+/// one named, or its only one.
+pub async fn open_link(dirs: &[PathBuf], name: &str, app: Option<&str>) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
-    let link = state::sign_in_link(&c).await?;
+    let ids: Vec<&str> = c.apps.iter().map(|a| a.id.as_str()).collect();
+    let app = match (app, ids.as_slice()) {
+        (Some(app), _) => app,
+        (None, [only]) => only,
+        (None, []) => bail!("{name} has no app"),
+        (None, _) => bail!("{name} has several apps; name one of {}", ids.join(", ")),
+    };
+    let link = state::open_link(&c, app).await?;
     println!("{link}");
     Ok(())
+}
+
+/// The apps column: each app, and what the next start changes, `+` for
+/// one it brings, `-` for one it leaves out, `*` for a newer one.
+fn apps_cell(ws: &Workspace) -> String {
+    let mut cells: Vec<String> = ws
+        .apps
+        .iter()
+        .map(|a| {
+            let mark = match ws.stage(&a.id) {
+                Stage::Coming => "+",
+                Stage::Going => "-",
+                Stage::Updating => "*",
+                Stage::Ready => "",
+            };
+            format!("{mark}{}", a.id)
+        })
+        .collect();
+    if ws.changes.contains(&Change::Packages) {
+        cells.push("*packages".into());
+    }
+    if cells.is_empty() { "-".into() } else { cells.join(",") }
 }
 
 /// Starts, stops or restarts a workspace and waits for systemd to finish.
@@ -53,7 +83,7 @@ pub async fn status(w: &mut impl Write, dirs: &[PathBuf], state_root: &Path, jso
         return Ok(());
     }
     let mut rows = vec![
-        ["WORKSPACE", "OWNER", "IP", "STATE", "UNIT", "VM", "MEMORY", "DISK USED/SIZE", "AGENT", "URL"]
+        ["WORKSPACE", "OWNER", "IP", "STATE", "UNIT", "VM", "MEMORY", "DISK USED/SIZE", "AGENT", "APPS", "URL"]
             .map(String::from),
     ];
     for s in &all {
@@ -79,6 +109,7 @@ pub async fn status(w: &mut impl Write, dirs: &[PathBuf], state_root: &Path, jso
             mem,
             disk,
             or_dash(&s.agent),
+            apps_cell(s),
             url,
         ]);
     }

@@ -1,8 +1,9 @@
 //! Workspaces made at run time: `workbench self-service create` makes one
-//! from a request the web UI wrote, `destroy` takes it away, `setup` puts
-//! back at boot what `/run` lost, and `reconcile` stops the workspaces of
-//! owners who left. They run as root; the web UI only writes requests and
-//! starts their units.
+//! from a request the web UI wrote, `apps` changes its apps, `destroy`
+//! takes it away, `setup` puts back at boot what `/run` lost and brings
+//! every config up to the host's template, and `reconcile` stops the
+//! workspaces of owners who left. They run as root; the web UI only writes
+//! requests and starts their units.
 //!
 //! A workspace made at run time is what the Nix module would declare: a
 //! config in `<stateDir>/configs`, the VM's user, as a userdb record, its
@@ -22,7 +23,8 @@ use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use vmkit::hostutil::{self, Account};
-use workbench_model::self_service::{Limits, Outcome, Request, quota_of};
+use workbench_model::apps::{AppInfo, BootApp};
+use workbench_model::self_service::{AppsRequest, Limits, Outcome, Request, quota_of};
 use workbench_model::{Verb, is_user_name, is_workspace_name};
 
 use crate::config::{self, Config};
@@ -59,7 +61,6 @@ pub struct Template {
     /// The first three octets of the workspaces' /24; the host is `.1`.
     pub subnet: String,
     pub nameservers: Vec<String>,
-    pub app_port: i64,
     pub control_port: i64,
     pub agent_port: i64,
     pub cpus: i64,
@@ -69,7 +70,10 @@ pub struct Template {
     pub firmware: String,
     pub closure: String,
     pub registration: String,
-    pub app: String,
+    /// The packages every such workspace has, and its agent.
+    pub packages: String,
+    /// The apps offered, in order: the closure has every one of them.
+    pub apps: Vec<BootApp>,
     pub environment: BTreeMap<String, String>,
     pub environment_files: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -99,9 +103,19 @@ pub struct Image {
 }
 
 impl Template {
+    /// Reads the template; its limits offer its apps.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = hostutil::read_bounded(path, MAX_FILE).with_context(|| path.display().to_string())?;
-        serde_json::from_slice(&raw).with_context(|| path.display().to_string())
+        let mut t: Template = serde_json::from_slice(&raw).with_context(|| path.display().to_string())?;
+        t.limits.apps = t.apps.iter().map(|a| AppInfo { id: a.id.clone(), name: a.name.clone() }).collect();
+        Ok(t)
+    }
+
+    /// The offered apps `ids` name, in that order.
+    pub fn apps_of(&self, ids: &[String]) -> anyhow::Result<Vec<BootApp>> {
+        ids.iter()
+            .map(|id| self.apps.iter().find(|a| a.id == *id).cloned().with_context(|| format!("no app {id:?} offered")))
+            .collect()
     }
 
     #[must_use]
@@ -137,6 +151,17 @@ impl Paths {
     #[must_use]
     pub fn outcome(&self, name: &str) -> PathBuf {
         self.dir().join("results").join(format!("{name}.json"))
+    }
+
+    /// A request to change a workspace's apps, and how it went.
+    #[must_use]
+    pub fn apps_request(&self, name: &str) -> PathBuf {
+        self.dir().join("requests").join(format!("{name}.apps.json"))
+    }
+
+    #[must_use]
+    pub fn apps_outcome(&self, name: &str) -> PathBuf {
+        self.dir().join("results").join(format!("{name}.apps.json"))
     }
 
     /// The config of a workspace being made or taken away, root's: if the
@@ -269,11 +294,12 @@ pub fn config_of(t: &Template, r: &Request, ip: &str, uid: u32) -> anyhow::Resul
         ip: ip.to_owned(),
         gateway: format!("{}.1", t.subnet),
         nameservers: t.nameservers.clone(),
-        app_port: t.app_port,
         ssh_authorized_keys: r.ssh_authorized_keys.clone(),
         closure: t.closure.clone(),
         registration: t.registration.clone(),
-        app: t.app.clone(),
+        packages: t.packages.clone(),
+        apps: t.apps_of(&r.apps)?,
+        legacy_app_port: 0,
         environment: t.environment.clone(),
         environment_files: t.environment_files.clone(),
         secrets_dir: format!("{}/{}", t.secrets_root, r.name),
@@ -285,6 +311,32 @@ pub fn config_of(t: &Template, r: &Request, ip: &str, uid: u32) -> anyhow::Resul
     };
     c.validate()?;
     Ok(c)
+}
+
+/// A workspace's config made again from the template as it is now: its
+/// own settings, address and VM user stay, the host's paths are the new
+/// ones. Apps the host no longer offers go. One from before apps gets
+/// every app offered, which then was the one.
+pub fn refreshed(t: &Template, c: &Config) -> anyhow::Result<Config> {
+    let mut apps: Vec<String> =
+        c.apps.iter().filter(|a| t.apps.iter().any(|o| o.id == a.id)).map(|a| a.id.clone()).collect();
+    if c.apps.is_empty() && c.legacy_app_port != 0 {
+        apps = t.apps.iter().map(|a| a.id.clone()).collect();
+    }
+    let r = Request {
+        name: c.name.clone(),
+        owner: c.owner.clone(),
+        os: c.os.clone(),
+        ssh_authorized_keys: c.ssh_authorized_keys.clone(),
+        max_memory_gib: c.max_mem_mib / 1024,
+        disk_gib: c.disk_gib,
+        apps,
+    };
+    let mut fresh = config_of(t, &r, &c.ip, c.uid)?;
+    // Not what the template says now: what the disk was made from.
+    fresh.image.clone_from(&c.image);
+    fresh.image_format.clone_from(&c.image_format);
+    Ok(fresh)
 }
 
 /// The VM user's userdb record: a locked system user whose primary group
@@ -435,6 +487,7 @@ fn host_files(paths: &Paths, c: &Config) -> Vec<PathBuf> {
         PathBuf::from(&c.secrets_dir),
         seed.with_extension("d"),
         seed.with_extension("new"),
+        seed.with_extension("instance"),
         seed,
         state::stop_marker(root, &c.name),
         left_marker(root, &c.name),
@@ -514,10 +567,39 @@ async fn run_tool(tool: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A seed's instance id, from what it says, as the Nix module makes it:
+/// cloud-init sets the guest up again, its network included, when it
+/// changes, and only then.
+pub fn seed_instance(user_data: &str, c: &Config) -> anyhow::Result<String> {
+    use sha2::Digest as _;
+    let [(_, user), (_, network), _] = seed_files(user_data, c, "")?;
+    let digest = sha2::Sha256::digest(format!("{user}{network}").as_bytes());
+    Ok(digest.iter().take(6).fold(String::new(), |mut s, b| {
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+        s
+    }))
+}
+
+/// Writes a workspace's seed again when what it says changed, such as the
+/// nameservers or the SSH keys: its guest takes it at its next boot.
+async fn refresh_seed(t: &Template, c: &Config) -> anyhow::Result<()> {
+    let Some(image) = t.images.get(&c.os).filter(|i| !i.user_data.is_empty()) else { return Ok(()) };
+    if c.seed.is_empty() {
+        return Ok(());
+    }
+    let at = PathBuf::from(&c.seed);
+    let instance = seed_instance(&image.user_data, c)?;
+    let known = at.with_extension("instance");
+    if at.exists() && fs::read_to_string(&known).is_ok_and(|k| k.trim() == instance) {
+        return Ok(());
+    }
+    write_seed(t, &image.user_data, c, &at).await
+}
+
 /// Builds an Ubuntu seed as the Nix module does: a FAT image labelled
-/// `CIDATA`.
+/// `CIDATA`, and records its instance id next to it.
 async fn write_seed(t: &Template, user_data: &str, c: &Config, at: &Path) -> anyhow::Result<()> {
-    let instance = jiff::Timestamp::now().as_second().to_string();
+    let instance = seed_instance(user_data, c)?;
     let files = seed_files(user_data, c, &instance)?;
     let dir = at.with_extension("d");
     let img = at.with_extension("new");
@@ -539,6 +621,7 @@ async fn write_seed(t: &Template, user_data: &str, c: &Config, at: &Path) -> any
         run_tool(&t.mcopy, &args).await?;
         fs::set_permissions(&img, fs::Permissions::from_mode(0o644))?;
         fs::rename(&img, at)?;
+        hostutil::atomic_write(at.with_extension("instance"), instance.as_bytes(), 0o600)?;
         anyhow::Ok(())
     }
     .await;
@@ -554,24 +637,65 @@ pub async fn create(dirs: &[PathBuf], t: &Template, name: &str) -> anyhow::Resul
     let paths = t.paths();
     remove(&paths.outcome(name))?;
     let result = make(dirs, t, &paths, name).await;
-    let outcome = match &result {
-        Ok(()) => Outcome { ok: true, error: String::new() },
-        Err(e) => Outcome {
-            ok: false,
-            error: e
-                .downcast_ref::<Refused>()
-                .map_or_else(|| format!("The host couldn't make it: {e:#}"), |r| r.0.clone()),
-        },
-    };
-    write_outcome(&paths, name, &outcome)?;
+    write_outcome(&paths, name, &outcome_of(&result, "The host couldn't make it"))?;
     let _ = fs::remove_file(paths.request(name));
     result
 }
 
 fn write_outcome(paths: &Paths, name: &str, outcome: &Outcome) -> anyhow::Result<()> {
-    let out = paths.outcome(name);
+    write_outcome_at(&paths.outcome(name), outcome)
+}
+
+fn write_outcome_at(out: &Path, outcome: &Outcome) -> anyhow::Result<()> {
     fs::create_dir_all(out.parent().context("outcome")?)?;
-    hostutil::atomic_write(&out, &serde_json::to_vec(outcome)?, 0o644)?;
+    hostutil::atomic_write(out, &serde_json::to_vec(outcome)?, 0o644)?;
+    Ok(())
+}
+
+/// What a request's result says, for the web UI.
+fn outcome_of(result: &anyhow::Result<()>, failed: &str) -> Outcome {
+    match result {
+        Ok(()) => Outcome { ok: true, error: String::new() },
+        Err(e) => Outcome {
+            ok: false,
+            error: e.downcast_ref::<Refused>().map_or_else(|| format!("{failed}: {e:#}"), |r| r.0.clone()),
+        },
+    }
+}
+
+/// `workbench self-service apps <ws>`: gives a workspace made at run time
+/// the apps the web UI asked for, in its config. The VM boots with them at
+/// its next start; whether that is now is the UI's to ask.
+pub async fn apps(t: &Template, name: &str) -> anyhow::Result<()> {
+    ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
+    let paths = t.paths();
+    remove(&paths.apps_outcome(name))?;
+    let result = change_apps(t, &paths, name).await;
+    write_outcome_at(&paths.apps_outcome(name), &outcome_of(&result, "The host couldn't change them"))?;
+    let _ = fs::remove_file(paths.apps_request(name));
+    result
+}
+
+async fn change_apps(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
+    let raw = read_theirs(&paths.apps_request(name)).context("the request")?;
+    let r: AppsRequest = serde_json::from_slice(&raw).context("the request")?;
+    t.limits.check_apps(&r.apps).map_err(refuse)?;
+    let _lock = paths.lock()?;
+    finish_pending(paths).await?;
+    let Some(c) = config::load(&[paths.configs()], name).ok().filter(|c| c.self_service) else {
+        bail!(Refused(format!("{name} wasn't made at run time: its apps are in the Nix configuration.")));
+    };
+    let mut next = c;
+    next.apps = t.apps_of(&r.apps)?;
+    next.validate()?;
+    write_config(paths, &next)
+}
+
+/// Writes a workspace's config where the host reads it after the Nix ones.
+fn write_config(paths: &Paths, c: &Config) -> anyhow::Result<()> {
+    fs::create_dir_all(paths.configs())?;
+    let file = paths.configs().join(format!("{}.json", c.name));
+    hostutil::atomic_write(&file, &serde_json::to_vec_pretty(c)?, 0o644)?;
     Ok(())
 }
 
@@ -636,9 +760,7 @@ async fn make(dirs: &[PathBuf], t: &Template, paths: &Paths, name: &str) -> anyh
         hostutil::atomic_write(secrets.join("environment"), env.as_bytes(), 0o600)?;
         let vm_user = wait_for_user(&c.user).await?;
         launch::prepare_state(&c, &vm_user)?;
-        fs::create_dir_all(paths.configs())?;
-        let file = paths.configs().join(format!("{name}.json"));
-        hostutil::atomic_write(&file, &serde_json::to_vec_pretty(&c)?, 0o644)?;
+        write_config(paths, &c)?;
         anyhow::Ok(())
     }
     .await;
@@ -674,10 +796,8 @@ pub async fn destroy(t: &Template, name: &str) -> anyhow::Result<()> {
     let paths = t.paths();
     remove(&paths.outcome(name))?;
     let result = take_away(&paths, name).await;
-    if let Err(e) = &result {
-        let error =
-            e.downcast_ref::<Refused>().map_or_else(|| format!("The host couldn't destroy it: {e:#}"), |r| r.0.clone());
-        write_outcome(&paths, name, &Outcome { ok: false, error })?;
+    if result.is_err() {
+        write_outcome(&paths, name, &outcome_of(&result, "The host couldn't destroy it"))?;
     }
     result
 }
@@ -707,9 +827,11 @@ fn remove(p: &Path) -> io::Result<()> {
     }
 }
 
-/// `workbench self-service setup`, at boot: the user records and network
-/// files of every workspace made at run time again, then the ones neither
-/// stopped nor left start.
+/// `workbench self-service setup`, at boot and with every new template:
+/// each config of a workspace made at run time made again from the
+/// template, their user records and network files again, then the ones
+/// neither stopped nor left start. A VM that runs keeps what it booted
+/// with until its next start.
 pub async fn setup(t: &Template) -> anyhow::Result<()> {
     let paths = t.paths();
     let _lock = paths.lock()?;
@@ -718,7 +840,23 @@ pub async fn setup(t: &Template) -> anyhow::Result<()> {
     if let Err(e) = finish_pending(&paths).await {
         failed.push(format!("{e:#}"));
     }
+    for c in made(&paths) {
+        let fresh = refreshed(t, &c).and_then(|fresh| {
+            if fresh != c {
+                write_config(&paths, &fresh)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = fresh {
+            failed.push(format!("{}: keeping its config: {e:#}", c.name));
+        }
+    }
     let made = made(&paths);
+    for c in &made {
+        if let Err(e) = refresh_seed(t, c).await {
+            failed.push(format!("{}: its seed: {e:#}", c.name));
+        }
+    }
     let kvm = kvm_gid()?;
     let mut ready = Vec::new();
     for c in &made {
@@ -809,6 +947,7 @@ pub(crate) mod tests {
                 max_memory_gib: 16,
                 max_disk_gib: 128,
                 quota: 1,
+                apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into() }],
             },
             domain: "ws.test".into(),
             scheme: "https".into(),
@@ -816,7 +955,6 @@ pub(crate) mod tests {
             secrets_root: "/var/lib/workbench-secrets".into(),
             subnet: "10.232.0".into(),
             nameservers: vec!["1.1.1.1".into()],
-            app_port: 3773,
             control_port: 5001,
             agent_port: 5002,
             cpus: 0,
@@ -826,7 +964,13 @@ pub(crate) mod tests {
             firmware: "/nix/store/x-ovmf/FV/CLOUDHV.fd".into(),
             closure: "/nix/store/x-closure/store-paths".into(),
             registration: "/nix/store/x-closure/registration".into(),
-            app: "/nix/store/x-app".into(),
+            packages: "/nix/store/x-packages".into(),
+            apps: vec![BootApp {
+                id: "t3code".into(),
+                name: "T3 Code".into(),
+                port: 3773,
+                bundle: "/nix/store/x-t3code-app".into(),
+            }],
             environment: BTreeMap::new(),
             environment_files: vec![],
             socket_group: "workbench".into(),
@@ -865,6 +1009,7 @@ pub(crate) mod tests {
             ssh_authorized_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbJhk5H0h7O me@laptop".into()],
             max_memory_gib: 8,
             disk_gib: 64,
+            apps: vec!["t3code".into()],
         }
     }
 
@@ -878,8 +1023,39 @@ pub(crate) mod tests {
         assert_eq!(c.seed, "/var/lib/workbench/.seeds/samuel-silva-data.img");
         assert_eq!((c.max_mem_mib, c.boot_mem_mib, c.disk_gib), (8192, 2048, 64));
         assert!(c.self_service && c.uid == 60_600);
+        assert_eq!(c.apps, t.apps);
+        let bare = config_of(&t, &Request { apps: vec![], ..request("ubuntu") }, "10.232.0.11", 60_600).unwrap();
+        assert!(bare.apps.is_empty(), "a workspace with no app");
         let nixos = config_of(&t, &request("nixos"), "10.232.0.12", 60_601).unwrap();
         assert!(nixos.seed.is_empty(), "NixOS takes no seed");
+    }
+
+    /// Every config is made again from a new template: the host's paths
+    /// change, the workspace's own settings don't, and one from before
+    /// apps gets the app it had.
+    #[test]
+    fn configs_follow_the_template() {
+        let t = template();
+        let c = config_of(&t, &request("ubuntu"), "10.232.0.130", 60_601).unwrap();
+        assert_eq!(refreshed(&t, &c).unwrap(), c, "nothing changed, nothing to write");
+        let mut newer = template();
+        newer.packages = "/nix/store/y-packages".into();
+        newer.apps[0].bundle = "/nix/store/y-t3code-app".into();
+        newer.images.get_mut("ubuntu").unwrap().image = "/nix/store/y-ubuntu.img".into();
+        let fresh = refreshed(&newer, &c).unwrap();
+        assert_eq!(
+            (fresh.packages.as_str(), fresh.apps[0].bundle.as_str()),
+            ("/nix/store/y-packages", "/nix/store/y-t3code-app")
+        );
+        assert_eq!((fresh.ip.as_str(), fresh.uid, fresh.max_mem_mib), (c.ip.as_str(), c.uid, c.max_mem_mib));
+        assert_eq!(fresh.image, c.image, "the image a disk was made from stays");
+        let mut old = c.clone();
+        old.apps.clear();
+        old.legacy_app_port = 3773;
+        assert_eq!(refreshed(&t, &old).unwrap().apps, t.apps);
+        let mut gone = template();
+        gone.apps.clear();
+        assert!(refreshed(&gone, &c).unwrap().apps.is_empty(), "an app no longer offered goes");
     }
 
     #[test]
@@ -915,6 +1091,14 @@ pub(crate) mod tests {
         let network: serde_json::Value = serde_json::from_str(&network).unwrap();
         assert_eq!(network["ethernets"]["uplink"]["match"]["macaddress"], "02:00:0a:e8:00:0b");
         assert!(meta.contains("samuel-silva-data-1"));
+        let id = seed_instance(&t.images["ubuntu"].user_data, &c).unwrap();
+        assert_eq!((id.len(), seed_instance(&t.images["ubuntu"].user_data, &c).unwrap()), (12, id.clone()));
+        let other = Config { nameservers: vec!["192.168.150.13".into()], ..c };
+        assert_ne!(
+            seed_instance(&t.images["ubuntu"].user_data, &other).unwrap(),
+            id,
+            "new nameservers, a new instance"
+        );
     }
 
     #[test]

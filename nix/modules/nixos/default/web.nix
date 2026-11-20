@@ -35,9 +35,11 @@ let
     return 302 https://$host/oauth2/start?rd=https://$host$request_uri;
   '';
 
-  # Every workspace is served by one virtual host: the access check names
-  # who may use it and the app's address, so a workspace made at run time
-  # needs no reload. The app gets the browser's cookies without the SSO one.
+  # Every app of every workspace is served by one virtual host, at
+  # `<workspace>--<app>.<domain>`: the access check names who may use it and
+  # the app's address, so a workspace made at run time needs no reload. An
+  # app gets the browser's cookies without the SSO one. A workspace's own
+  # name leads to its panel.
   escapedDomain = lib.replaceStrings [ "." ] [ "\\." ] cfg.domain;
   workspaceLocations = {
     "/oauth2/" = oauth2Location;
@@ -50,14 +52,16 @@ let
         proxy_set_header Content-Length "";
         proxy_set_header Cookie $http_cookie;
         proxy_set_header X-Workbench-Workspace $workbench_ws;
+        proxy_set_header X-Workbench-App $workbench_app;
       '';
     };
     "@workbench_sign_in".extraConfig = signInLocation;
     "@workbench_denied" = {
       proxyPass = "http://unix:${run}/ui.sock";
       extraConfig = ''
-        rewrite ^ /denied?ws=$workbench_ws? break;
+        rewrite ^ /denied?ws=$workbench_ws&app=$workbench_app? break;
         proxy_set_header X-Workbench-User $workbench_user;
+        proxy_set_header X-Workbench-Groups $workbench_groups;
       '';
     };
     "/" = {
@@ -66,6 +70,7 @@ let
       extraConfig = ''
         auth_request /_workbench/authz;
         auth_request_set $workbench_user $upstream_http_x_workbench_user;
+        auth_request_set $workbench_groups $upstream_http_x_workbench_groups;
         auth_request_set $workbench_cookie $upstream_http_x_workbench_cookie;
         auth_request_set $workbench_upstream $upstream_http_x_workbench_upstream;
         error_page 401 = @workbench_sign_in;
@@ -147,6 +152,12 @@ in
         type = types.ints.positive;
         default = 128;
         description = "The largest disk people may ask for; at least 16 GiB.";
+      };
+      apps = mkOption {
+        type = types.listOf types.str;
+        default = lib.attrNames cfg.apps;
+        defaultText = lib.literalExpression "lib.attrNames config.services.workbench.apps";
+        description = "The apps, of `services.workbench.apps`, people may give the workspaces they make, in the order offered.";
       };
       environmentCommand = mkOption {
         type = types.str;
@@ -281,6 +292,15 @@ in
         assertion = ss.enable -> ss.maxDiskGiB >= 16;
         message = "services.workbench.web.selfService.maxDiskGiB: at least 16.";
       }
+      {
+        assertion =
+          ss.enable
+          ->
+            lib.all (id: cfg.apps ? ${id}) ss.apps
+            && lib.allUnique ss.apps
+            && lib.allUnique (map (id: cfg.apps.${id}.port) ss.apps);
+        message = "services.workbench.web.selfService.apps: each must be one of services.workbench.apps, once, on a port of its own.";
+      }
     ];
 
     services.redis.servers.workbench-oauth2 = {
@@ -308,6 +328,10 @@ in
 
     systemd.services.workbench-web = {
       description = "workbench web UI";
+      # It reads the template, with the apps it offers, when it starts.
+      restartTriggers =
+        lib.optional ss.enable
+          config.environment.etc."workbench-self-service.json".source;
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       path = [ config.systemd.package ];
@@ -371,7 +395,7 @@ in
             return polkit.Result.YES;
           }
           ${lib.optionalString ss.enable ''
-            if (/^workbench-(create|destroy)@[a-z][a-z0-9-]*\.service$/.test(unit) && verb == "start") {
+            if (/^workbench-(create|destroy|apps)@[a-z][a-z0-9-]*\.service$/.test(unit) && verb == "start") {
               return polkit.Result.YES;
             }
           ''}
@@ -474,8 +498,13 @@ in
           };
         };
         workbench-workspaces = cfg.virtualHost // {
-          serverName = "~^(?<workbench_ws>[a-z][a-z0-9-]*)\\.${escapedDomain}$";
+          serverName = "~^(?<workbench_ws>[a-z][a-z0-9-]*?)(?:--(?<workbench_app>[a-z][a-z0-9]*))?\\.${escapedDomain}$";
           locations = workspaceLocations;
+          extraConfig = (cfg.virtualHost.extraConfig or "") + ''
+            if ($workbench_app = "") {
+              return 302 ${origin}/?w=$workbench_ws;
+            }
+          '';
         };
       };
     };

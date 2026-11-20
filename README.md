@@ -2,11 +2,12 @@
 
 **Persistent, isolated per-person workspaces** on NixOS: one long-lived
 [cloud-hypervisor](https://www.cloudhypervisor.org/) VM each, an Ubuntu
-24.04 or NixOS guest the person owns, running the web app they open at
-`https://<workspace>.<domain>`. A person may have several.
+24.04 or NixOS guest the person owns, running the apps they open in the
+browser, each at `https://<workspace>--<app>.<domain>`. A person may have
+several workspaces.
 
-The host owns everything around the app: the VM, its disk, network
-isolation, secrets, tools and memory. The app is what the person opens in
+The host owns everything around the apps: the VM, its disk, network
+isolation, secrets, tools and memory. The apps are what the person opens in
 the browser; see [Apps](#apps).
 
 Built on [vmkit-nix](https://github.com/OSSystems/vmkit-nix): workspaces share a
@@ -76,21 +77,21 @@ memory pools.
   systems](#guest-operating-systems). The owner may change the guest
   freely; what matters for security is enforced on the host.
 - **Tools from the host, read-only.** The guest is shared only the closure
-  of its app (the app plus `extraPackages`), bind-mounted path by path in
+  of its packages and apps (`extraPackages` and the apps' bundles), bind-mounted path by path in
   the unit's private mount namespace and served over virtiofs; it never sees
   the rest of the host store.
 - **Secrets stay out of the store.** `secretsDir` (default
   `/var/lib/workbench-secrets/<name>`, fill it with sops-nix or similar)
   is copied read-only to `/run/workspace/secrets` at every start. Its
   `environment` file, followed by the global and per-workspace
-  `environmentFile`, is the app's secret environment; the
+  `environmentFile`, is the apps' secret environment; the
   `environment` options are the non-secret one.
 - **Network.** Each workspace has its own tap and a static `/32` route
   (`network.subnet`, default `10.232.0`; the host is `.1`). Guests reach the
   internet, but not the host, private ranges or each other, except for the
   global and per-workspace `allowedEndpoints`; a guest can only send from
-  its own address. nginx on the host proxies `<workspace>.<domain>` to the
-  guest's app port, with websockets and day-long timeouts.
+  its own address. nginx on the host proxies `<workspace>--<app>.<domain>`
+  to the app's port in the guest, with websockets and day-long timeouts.
 - **Memory.** Workspaces boot with `memory.bootMiB` and grow through
   virtio-mem up to `memory.maxGiB` under pressure, with free page reporting.
   They are a `first` pool in vmkit's `services.vmkit.memory.pools`: on a
@@ -101,7 +102,7 @@ Day to day, on the host:
 
 ```sh
 sudo workbench status
-sudo workbench restart alice        # with the host's app and system now
+sudo workbench restart alice        # with the host's apps and packages now
 sudo workbench stop alice           # stays stopped, also across reboots
 sudo workbench start alice
 sudo workbench console alice        # serial console, Ctrl-] quits
@@ -114,8 +115,8 @@ Only x86_64 hosts are supported for now.
 
 `os` picks a workspace's guest, `ubuntu` by default. Both get the same from
 the host, and the host enforces the same on both: the network, the
-secrets, the memory and the app's version. They differ in who sets the guest
-up and where the app's closure lives.
+secrets, the memory and the apps' versions. They differ in who sets the guest
+up and where the apps' closure lives.
 
 | | Ubuntu | NixOS |
 |---|---|---|
@@ -208,15 +209,15 @@ workspace; the menu waits `boot.loader.timeout`, one second by default.
   `/run/workspace/host/nix/store`, all read-only;
 - configures the address, the route through the host, DNS and the hostname
   from `workspace.json`, with systemd-networkd;
-- copies the app's closure into `/nix/store`, only the paths the store lacks,
-  registers them and keeps them alive with the GC root
-  `/nix/var/nix/gcroots/workspace-app`;
+- copies the closure of the packages and apps into `/nix/store`, only the
+  paths the store lacks, registers them and keeps them alive with the GC
+  roots `/nix/var/nix/gcroots/workspace-app` and `workspace-app-<id>`;
 - creates the owner's account in `wheel` if it does not exist yet, and
   writes `/etc/nixos` on a new disk;
 - lets sshd read the owner's keys from the config share, with passwords off;
-- starts `workspace-agent.service` (memory reports, sign-in) and
-  `workspace-app.service`, the app as the owner with the workspace's
-  environment;
+- starts `workspace-agent.service`, which reports memory, makes sign-in
+  links and runs each app as the owner with the workspace's environment, as
+  `workspace-app-<id>.service`;
 - prepends the host's tools (`extraPackages`) to every login's `PATH`;
 - leaves the guest firewall off, enables flakes and lets `wheel` use sudo
   without a password.
@@ -246,7 +247,7 @@ as long as copying them, and each NixOS workspace keeps the closure on its
 disk: about 5 GiB for T3 Code, which counts against `diskGiB`. Old versions
 go when the owner collects garbage.
 
-**Versions.** The host decides the app's version, as for Ubuntu; the owner
+**Versions.** The host decides the apps' versions, as for Ubuntu; the owner
 decides the system's, including the version of `nixosModules.guest`
 through the flake's `workbench` input. What the module reads from the host
 is listed below; it changes with care, so a guest a few releases behind
@@ -256,8 +257,9 @@ keeps working.
 
 | Path in the guest | What |
 |---|---|
-| `/run/workspace/config/workspace.json` | `name`, `owner`, `url`, `ip`, `gateway`, `nameservers`, `appPort`, `controlPort`, `agentPort` |
-| `/run/workspace/config/app` | The app bundle: `bin/serve` starts the app, `bin/workspace-agent` the agent, `sw/bin` holds `extraPackages` |
+| `/run/workspace/config/workspace.json` | `name`, `owner`, `url`, `ip`, `gateway`, `nameservers`, `appPort`, `controlPort`, `agentPort`, `apps` |
+| `/run/workspace/config/app` | The packages: `bin/workspace-agent` the agent, `sw/bin` holds `extraPackages` and the apps' packages |
+| `/run/workspace/config/apps/<id>` | An app's bundle: `bin/serve`, and `bin/open-link` if it signs browsers in |
 | `/run/workspace/config/environment` | The non-secret environment, for systemd's `EnvironmentFile=` |
 | `/run/workspace/config/authorized_keys/<owner>` | The owner's SSH keys |
 | `/run/workspace/config/store-paths`, `registration` | The closure's paths, and their validity for `nix-store --load-db` |
@@ -270,8 +272,8 @@ keeps working.
 `services.workbench.web` serves a web UI at `https://<domain>` and puts
 single sign-on in front of every workspace: whatever the app does about
 accounts, only the workspace's owner and the admins reach it. People see
-and control their own workspaces: start, stop, restart, sign in to the app
-and the serial console. Admins see all of them and the host's memory.
+and control their own workspaces: open their apps, start, stop, restart and
+the serial console. Admins see all of them and the host's memory.
 
 ```nix
 services.workbench.web = {
@@ -326,29 +328,47 @@ group may use and starts, stops and restarts workspaces through polkit.
 
 ## Apps
 
-Each workspace runs one app: the web UI its owner opens at
-`https://<workspace>.<domain>`.
+An app is what runs in a workspace and is opened from the browser, at
+`https://<workspace>--<app>.<domain>`, an origin of its own. The host offers
+them, `services.workbench.apps`; each workspace has the ones its `apps`
+names, all of them unless it says otherwise, and may have none.
+`https://<workspace>.<domain>` leads to the workspace's panel in the web UI.
+
+```nix
+services.workbench.apps.notes = {
+  name = "Notes";
+  port = 8080;
+  packages = [ pkgs.mynotes ];
+  # Run as the owner at every boot; systemd restarts it when it ends.
+  serve = ''exec mynotes --listen 0.0.0.0:"$APP_PORT"'';
+};
+```
+
+The guest agent runs each app's `serve` at every boot as the owner, with
+the workspace's environment and secrets, as `workspace-app-<id>.service`.
+A VM keeps the apps it booted with: a change to them, or a new version,
+comes with its next restart, and the web UI says what waits for it.
 
 ### T3 Code
 
-[T3 Code](https://github.com/pingdotgg/t3code) is the default
-(`package`, from [t3code-nix](https://github.com/OSSystems/t3code-nix)); it
-runs `t3 serve` on `appPort`. It has no accounts: a browser gets in by
-following a one-time pairing link, made for the owner inside the guest.
-The module gives it the sign-in hook below, around `t3 auth pairing create`.
+[T3 Code](https://github.com/pingdotgg/t3code) is the app `t3code` when
+`package` is set (from [t3code-nix](https://github.com/OSSystems/t3code-nix));
+it runs `t3 serve` on port 3773. It has no accounts: a browser gets in by
+following a one-time pairing link, made for the owner inside the guest. The
+module gives it the sign-in hook below, around `t3 auth pairing create`.
 
 ### The sign-in hook
 
-An app bundle may have `bin/sign-in-link`. The agent runs it as the owner,
-with the workspace's URL in `WORKSPACE_URL`, when someone asks to sign a
-browser in to the app; it prints one URL on the workspace's own origin and
-nothing else on stdout. `workbench sign-in` prints it:
+An app may have `openLink`, a script the agent runs as the owner, with the
+app's address in `APP_URL`, when someone opens the app from the web UI; it
+prints one URL on the app's own origin that signs a browser in, and nothing
+else on stdout. `workbench open-link` prints it:
 
 ```sh
-sudo workbench sign-in alice
+sudo workbench open-link alice t3code
 ```
 
-An app without the hook has no sign-in action.
+An app without the hook is opened at its address.
 
 ## Development
 

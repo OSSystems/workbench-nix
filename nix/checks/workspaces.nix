@@ -329,8 +329,12 @@ pkgs.testers.runNixOSTest {
         security.pki.certificateFiles = [ "${certs}/ca.crt" ];
         networking.hosts.${nodes.host.networking.primaryIPAddress} = [
           domain
+          "alice--nope.${domain}"
         ]
-        ++ map (name: "${name}.${domain}") (lib.attrNames workspaces ++ [ "alice-dev" ]);
+        ++ lib.concatMap (name: [
+          "${name}.${domain}"
+          "${name}--t3code.${domain}"
+        ]) (lib.attrNames workspaces ++ [ "alice-dev" ]);
         networking.interfaces.eth1.ipv4.addresses = lib.mkForce [
           {
             address = clientIP;
@@ -371,7 +375,7 @@ pkgs.testers.runNixOSTest {
         return run(f"ssh {ssh_opts} {ws['owner']}@{ws['ip']} {shlex.quote(cmd)}")
 
     def url(name):
-        return f"https://{name}.{domain}"
+        return f"https://{name}--t3code.{domain}"
 
     def os_of(name):
         return workspaces[name].get("os", "ubuntu")
@@ -385,15 +389,16 @@ pkgs.testers.runNixOSTest {
             if os_of(name) == "ubuntu":
                 guest(name, "cloud-init status --wait >/dev/null")
             # A NixOS guest copies the app's closure first.
-            guest(name, "timeout 900 sh -c 'until systemctl is-active workspace-app.service workspace-agent.service; do sleep 5; done'")
+            guest(name, "timeout 900 sh -c 'until systemctl is-active workspace-app-t3code.service workspace-agent.service; do sleep 5; done'")
 
-    with subtest("the app runs as the owner with its environment"):
+    with subtest("the agent runs the app as the owner with its environment"):
         for name, ws in workspaces.items():
-            pid = guest(name, "systemctl show -P MainPID workspace-app.service").strip()
+            pid = guest(name, "systemctl show -P MainPID workspace-app-t3code.service").strip()
             assert guest(name, f"stat -c %U /proc/{pid}").strip() == ws["owner"]
             env = guest(name, f"sudo cat /proc/{pid}/environ | tr '\\0' '\\n'")
             assert f"WORKSPACE_OWNER={ws['owner']}" in env, env
             assert "WORKSPACE_TEST=shared" in env, env
+            assert f"APP_URL={url(name)}" in env and "APP_PORT=3773" in env, env
             guest(name, "sudo -n true")
 
     with subtest("the guest is shared only its closure"):
@@ -410,10 +415,12 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a NixOS workspace is its owner's to rebuild"):
         config = json.loads(host.succeed("cat /etc/workbench/bob.json"))
-        app = guest("bob", "readlink /run/workspace/config/app").strip()
-        assert app == config["app"], app
-        guest("bob", f"nix-store --verify-path {app}")
-        assert guest("bob", "readlink /nix/var/nix/gcroots/workspace-app").strip() == app
+        packages = guest("bob", "readlink /run/workspace/config/app").strip()
+        assert packages == config["packages"], packages
+        guest("bob", f"nix-store --verify-path {packages}")
+        assert guest("bob", "readlink /nix/var/nix/gcroots/workspace-app").strip() == packages
+        bundle = config["apps"][0]["bundle"]
+        assert guest("bob", "readlink /nix/var/nix/gcroots/workspace-app-t3code").strip() == bundle
         assert guest("bob", "hostname").strip() == "bob"
         flake = guest("bob", "cat /etc/nixos/flake.nix")
         assert 'nixosConfigurations."bob"' in flake and "workbench.nixosModules.guest" in flake, flake
@@ -424,7 +431,7 @@ pkgs.testers.runNixOSTest {
     with subtest("secrets reach the guest but not the Nix store"):
         secret = host.succeed("sed -n 's/^WORKSPACE_SECRET=//p' /var/lib/workbench-secrets/alice/environment").strip()
         assert len(secret) == 48
-        pid = guest("alice", "systemctl show -P MainPID workspace-app.service").strip()
+        pid = guest("alice", "systemctl show -P MainPID workspace-app-t3code.service").strip()
         guest("alice", f"sudo cat /proc/{pid}/environ | tr '\\0' '\\n' | grep -qx WORKSPACE_SECRET={secret}")
         guest("bob", "! test -s /run/workspace/secrets/environment")
         config = json.loads(host.succeed("cat /etc/workbench/alice.json"))
@@ -449,6 +456,9 @@ pkgs.testers.runNixOSTest {
         for target in ["https://${domain}/", url("alice") + "/", url("alice") + "/.well-known/t3/environment"]:
             out = client.succeed(f"curl -s -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {target}")
             assert out.startswith("302 https://") and "/oauth2/start?rd=https://" in out, out
+        # A workspace's own name leads to its panel, where its apps are.
+        out = client.succeed("curl -s -o /dev/null -w '%{http_code} %{redirect_url}' https://alice.${domain}/x")
+        assert out == "302 https://${domain}/?w=alice", out
 
     with subtest("signing in shows each person their own workspaces"):
         for user in ("alice", "bob", "carol"):
@@ -475,12 +485,14 @@ pkgs.testers.runNixOSTest {
             )
         denied = client.succeed(f"curl -s {as_user('bob')} {url('alice')}/")
         assert "isn't yours" in denied and "bob" in denied, denied
+        assert status_code(f"{as_user('alice')} https://alice--nope.${domain}/") == "404"
+        assert "has no app" in client.succeed(f"curl -s {as_user('alice')} https://alice--nope.${domain}/")
         # The app gets the browser's cookies without the SSO one.
         sso = client.succeed("awk '$6 == \"_workbench_auth\" { print $7 }' /tmp/sso-alice.jar").strip()
         assert sso
         out = host.succeed(
             "curl -s -D - -o /dev/null --unix-socket /run/workbench-web/authz.sock "
-            f"-H 'X-Workbench-Workspace: alice' -H 'Cookie: other=1; _workbench_auth={sso}' http://ui/authz"
+            f"-H 'X-Workbench-Workspace: alice' -H 'X-Workbench-App: t3code' -H 'Cookie: other=1; _workbench_auth={sso}' http://ui/authz"
         )
         assert "x-workbench-cookie: other=1\r\n" in out.lower(), out
 
@@ -489,7 +501,7 @@ pkgs.testers.runNixOSTest {
             "curl -sf --unix-socket /run/workbench-web/ui.sock -H 'X-Workbench-User: carol' http://ui/api/workspaces"
         ))
         for ws in seen:
-            assert ws["state"] == "running" and ws["signIn"], ws
+            assert ws["state"] == "running" and ws["apps"][0]["openLink"] and not ws.get("changes"), ws
 
     with subtest("the serial console is shared through the UI"):
         # The UI holds each VM's serial socket, which share-sockets opened
@@ -498,16 +510,13 @@ pkgs.testers.runNixOSTest {
         perms = host.succeed("stat -c '%a %G' /run/workbench/alice/vm/serial.sock /run/workbench/alice/vm/api.sock").split("\n")
         assert all(p == "660 workbench" for p in perms if p), perms
 
-    with subtest("the UI signs a browser in to the app"):
-        out = client.succeed(
-            f"curl -s -o /dev/null -D - {as_user('alice')} {ui_form} -d ws=alice https://${domain}/api/sign-in"
-        )
+    with subtest("the UI opens an app in a browser it signs in"):
+        open_ = "-d ws=alice -d app=t3code https://${domain}/api/open"
+        out = client.succeed(f"curl -s -o /dev/null -D - {as_user('alice')} {ui_form} {open_}")
         assert out.startswith("HTTP/2 303") or out.startswith("HTTP/1.1 303"), out
         assert f"location: {url('alice')}/pair#token=" in out.lower(), out
-        assert status_code(f"{as_user('bob')} {ui_form} -d ws=alice https://${domain}/api/sign-in") == "403"
-        assert status_code(
-            f"{as_user('alice')} -H 'Accept: text/html' -H 'Origin: {url('alice')}' -d ws=alice https://${domain}/api/sign-in"
-        ) == "403"
+        assert status_code(f"{as_user('bob')} {ui_form} {open_}") == "403"
+        assert status_code(f"{as_user('alice')} -H 'Accept: text/html' -H 'Origin: {url('alice')}' {open_}") == "403"
 
     cookies = {}
     for name in workspaces:
@@ -520,7 +529,7 @@ pkgs.testers.runNixOSTest {
                 ))
             client.wait_until_succeeds(f"curl -sf {as_user(owner)} {url(name)}/.well-known/t3/environment", timeout=300)
             assert not session_state()["authenticated"]
-            link = host.succeed(f"workbench sign-in {name}").strip()
+            link = host.succeed(f"workbench open-link {name}").strip()
             prefix = f"{url(name)}/pair#token="
             assert link.startswith(prefix), link
             grant = {"credential": link.removeprefix(prefix)}
@@ -585,11 +594,11 @@ pkgs.testers.runNixOSTest {
         for name in workspaces:
             assert name in out
         for ws in json.loads(host.succeed("workbench status --json")):
-            assert ws["state"] == "running" and ws["signIn"] and not ws.get("appUpdate"), ws
+            assert ws["state"] == "running" and ws["apps"][0]["openLink"] and not ws.get("changes"), ws
 
     with subtest("a NixOS workspace restarts with its store and configuration"):
         host.succeed("systemctl restart workbench@bob.service")
-        host.wait_until_succeeds(f"ssh {ssh_opts} bob@10.232.0.11 systemctl is-active workspace-app.service", timeout=600)
+        host.wait_until_succeeds(f"ssh {ssh_opts} bob@10.232.0.11 systemctl is-active workspace-app-t3code.service", timeout=600)
         guest("bob", "grep -qx '# kept' /etc/nixos/configuration.nix")
         out = guest("bob", "journalctl -b -u workspace-store.service")
         assert "copying" not in out, out
@@ -615,7 +624,7 @@ pkgs.testers.runNixOSTest {
 
     # Workspaces people make themselves, with the groups from the directory.
     def create(user, name, keys=""):
-        form = f"-d name={name} -d os=ubuntu -d memory_gib=4 -d disk_gib=16 --data-urlencode ssh_keys={shlex.quote(keys)}"
+        form = f"-d name={name} -d os=ubuntu -d memory_gib=4 -d disk_gib=16 -d apps%5B0%5D=t3code --data-urlencode ssh_keys={shlex.quote(keys)}"
         return client.succeed(
             f"curl -s -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {as_user(user)} {ui_form} {form} https://${domain}/api/create"
         ).strip()
@@ -640,12 +649,13 @@ pkgs.testers.runNixOSTest {
         assert out == "303 https://${domain}/?w=alice-dev", out
         config = json.loads(host.succeed("cat /var/lib/workbench/configs/alice-dev.json"))
         assert config["owner"] == "alice" and config["selfService"] and config["ip"] == "10.232.0.128", config
+        assert [a["id"] for a in config["apps"]] == ["t3code"], config
         host.succeed("getent passwd wb-alice-dev")
         workspaces["alice-dev"] = {"ip": config["ip"], "owner": "alice"}
         host.wait_until_succeeds(f"ssh {ssh_opts} alice@{config['ip']} true", timeout=900)
         guest("alice-dev", "cloud-init status --wait >/dev/null")
-        guest("alice-dev", "timeout 600 sh -c 'until systemctl is-active workspace-app.service; do sleep 5; done'")
-        pid = guest("alice-dev", "systemctl show -P MainPID workspace-app.service").strip()
+        guest("alice-dev", "timeout 600 sh -c 'until systemctl is-active workspace-app-t3code.service; do sleep 5; done'")
+        pid = guest("alice-dev", "systemctl show -P MainPID workspace-app-t3code.service").strip()
         env = guest("alice-dev", f"sudo cat /proc/{pid}/environ | tr '\\0' '\\n'")
         assert "WORKSPACE_TOKEN=token-of-alice" in env, env
         # One virtual host, no reload: the access check names the address.
@@ -654,6 +664,47 @@ pkgs.testers.runNixOSTest {
                 f"curl -s -o /dev/null -w '%{{http_code}}' {as_user(user)} {url('alice-dev')}/.well-known/t3/environment | grep -qx {code}",
                 timeout=300,
             )
+
+    def status_of(name):
+        return next(w for w in json.loads(host.succeed("workbench status --json")) if w["name"] == name)
+
+    def set_apps(form):
+        return client.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {as_user('alice')} {ui_form} "
+            f"-d ws=alice-dev {form} https://${domain}/api/apps"
+        ).strip()
+
+    def app_active(name):
+        return guest(name, "systemctl is-active workspace-app-t3code.service || true").strip() == "active"
+
+    with subtest("alice changes her workspace's apps, which wait for a restart"):
+        assert set_apps("") == "303 https://${domain}/?w=alice-dev"
+        assert json.loads(host.succeed("cat /var/lib/workbench/configs/alice-dev.json"))["apps"] == []
+        ws = status_of("alice-dev")
+        assert ws["changes"] == [{"kind": "appRemoved", "app": "t3code"}], ws
+        assert app_active("alice-dev"), "it runs until the restart"
+        page = client.succeed(f"curl -s {as_user('alice')} 'https://${domain}/?w=alice-dev'")
+        assert "T3 Code goes with the next restart." in page, page[:3000]
+        assert set_apps("-d restart=true") == "303 https://${domain}/?w=alice-dev"
+        host.wait_until_succeeds("workbench status --json | jq -e '.[] | select(.name == \"alice-dev\") | .state == \"running\" and (.changes | not)'", timeout=600)
+        host.wait_until_succeeds(f"ssh {ssh_opts} alice@{config['ip']} true", timeout=600)
+        assert not app_active("alice-dev"), "gone with the restart"
+        assert status_code(f"{as_user('alice')} {url('alice-dev')}/") == "404"
+        assert set_apps("-d apps%5B0%5D=t3code") == "303 https://${domain}/?w=alice-dev"
+        assert status_of("alice-dev")["changes"] == [{"kind": "appAdded", "app": "t3code"}]
+        out = client.succeed(f"curl -s -o /dev/null -w '%{{redirect_url}}' {as_user('alice')} {ui_form} -d ws=alice-dev -d app=t3code https://${domain}/api/open")
+        assert out == "https://${domain}/w/alice-dev/open/t3code", out
+        host.succeed("workbench restart alice-dev")
+        host.wait_until_succeeds(f"ssh {ssh_opts} alice@{config['ip']} systemctl is-active workspace-app-t3code.service", timeout=600)
+        assert not status_of("alice-dev").get("changes")
+
+    with subtest("a config from before apps gets its app back"):
+        file = "/var/lib/workbench/configs/alice-dev.json"
+        host.succeed(f"jq '.app = .packages | del(.packages, .apps) | .appPort = 3773' {file} > /tmp/old.json && cp /tmp/old.json {file}")
+        host.succeed("systemctl restart workbench-self-service.service")
+        now = json.loads(host.succeed(f"cat {file}"))
+        assert [a["id"] for a in now["apps"]] == ["t3code"] and "appPort" not in now and "app" not in now, now
+        assert not status_of("alice-dev").get("changes"), "the same app, the same packages"
 
     with subtest("the quota refuses alice's second workspace"):
         out = create("alice", "alice-two")
