@@ -2,13 +2,14 @@
 
 **Persistent, isolated per-person workspaces** on NixOS: one long-lived
 [cloud-hypervisor](https://www.cloudhypervisor.org/) VM each, an Ubuntu
-24.04 or NixOS guest the person owns, running the apps they open in the
-browser, each at `https://<workspace>--<app>.<domain>`. A person may have
+24.04 or NixOS guest the person owns, running the apps they open from
+outside it: in the browser, each at `https://<workspace>--<app>.<domain>`,
+or from their own terminal, over SSH through the host. A person may have
 several workspaces.
 
 The host owns everything around the apps: the VM, its disk, network
-isolation, secrets, tools and memory. The apps are what the person opens in
-the browser; see [Apps](#apps).
+isolation, secrets, tools and memory. The apps are what the person opens
+from outside the workspace; see [Apps](#apps).
 
 Built on [vmkit-nix](https://github.com/OSSystems/vmkit-nix): workspaces share a
 host with other vmkit controllers only through its guest networks and
@@ -92,6 +93,13 @@ memory pools.
   global and per-workspace `allowedEndpoints`; a guest can only send from
   its own address. nginx on the host proxies `<workspace>--<app>.<domain>`
   to the app's port in the guest, with websockets and day-long timeouts.
+- **SSH by certificate.** The host has two SSH certificate authorities in
+  `/var/lib/workbench/ssh`, made at its first boot. One signs each
+  workspace's host key, which the host keeps and shares with the guest at
+  every start, for `<workspace>.<domain>`; the guest's sshd trusts keys
+  the other signs, for the user they name. The web UI signs people's keys
+  with it; see [From a terminal](#from-a-terminal). Only the host reaches a
+  guest's port 22.
 - **Memory.** Workspaces boot with `memory.bootMiB` and grow through
   virtio-mem up to `memory.maxGiB` under pressure, with free page reporting.
   They are a `first` pool in vmkit's `services.vmkit.memory.pools`: on a
@@ -130,8 +138,11 @@ up and where the apps' closure lives.
 A Nix-built cloud-init NoCloud seed, attached as a second disk, creates the
 `owner` account (optionally with passwordless `sudo`) and its SSH keys,
 lets it linger, so its user manager runs from boot, and writes the network,
-the virtiofs mounts and the agent's service. The app's closure is mounted
-at `/nix/store` itself, so it costs the guest nothing.
+the virtiofs mounts, the agent's service and sshd's settings for the host's
+key and CA. `/etc/environment` puts the workspace's tools first on the
+`PATH` of every session, also of commands over SSH that start no login
+shell. The app's closure is mounted at `/nix/store` itself, so it costs the
+guest nothing.
 
 ### NixOS
 
@@ -220,11 +231,14 @@ workspace; the menu waits `boot.loader.timeout`, one second by default.
 - creates the owner's account in `wheel` if it does not exist yet, lets it
   linger unless the system's configuration says otherwise, and writes
   `/etc/nixos` on a new disk;
-- lets sshd read the owner's keys from the config share, with passwords off;
+- lets sshd read the owner's keys from the config share, serve the host's
+  key for the workspace and trust the host's user CA, with passwords off;
 - starts `workspace-agent.service`, which reports memory, makes sign-in
   links and runs each app as the owner with the workspace's environment, as
   `workspace-app-<id>.service`;
-- prepends the host's tools (`extraPackages`) to every login's `PATH`;
+- prepends the host's tools (`extraPackages` and the apps' packages) to
+  every shell's `PATH`, also of commands over SSH, which bash reads
+  `/etc/set-environment` for;
 - leaves the guest firewall off, enables flakes and lets `wheel` use sudo
   without a password.
 
@@ -269,8 +283,11 @@ keeps working.
 | `/run/workspace/config/apps/<id>` | An app's bundle: `bin/serve`, and `bin/open-link` if it signs browsers in |
 | `/run/workspace/config/environment` | The non-secret environment, for systemd's `EnvironmentFile=` |
 | `/run/workspace/config/authorized_keys/<owner>` | The owner's SSH keys |
+| `/run/workspace/config/ssh/user-ca.pub` | The host's user CA, which sshd trusts for the owner |
+| `/run/workspace/config/ssh/principals/<owner>` | The owner's name, the one principal sshd takes from a certificate |
 | `/run/workspace/config/store-paths`, `registration` | The closure's paths, and their validity for `nix-store --load-db` |
 | `/run/workspace/secrets` | The secrets directory; its `environment` file is the app's secret environment |
+| `/run/workspace/secrets/ssh-host` | The workspace's SSH host key, root's, and its certificate from the host CA |
 | the `store` share | The app's closure, at `/nix/store` (Ubuntu) or `/run/workspace/host/nix/store` (NixOS) |
 | vsock | The agent reports memory to the host on `controlPort` and answers it on `agentPort` |
 
@@ -279,8 +296,9 @@ keeps working.
 `services.workbench.web` serves a web UI at `https://<domain>` and puts
 single sign-on in front of every workspace: whatever the app does about
 accounts, only the workspace's owner and the admins reach it. People see
-and control their own workspaces: open their apps, start, stop, restart and
-the serial console. Admins see all of them and the host's memory.
+and control their own workspaces: open their apps, set their computers up to
+reach them from a terminal, start, stop, restart and the serial console.
+Admins see all of them and the host's memory.
 
 ```nix
 services.workbench.web = {
@@ -335,11 +353,12 @@ group may use and starts, stops and restarts workspaces through polkit.
 
 ## Apps
 
-An app is what runs in a workspace and is opened from the browser, at
-`https://<workspace>--<app>.<domain>`, an origin of its own. The host offers
-them, `services.workbench.apps`; each workspace has the ones its `apps`
-names, those whose `default` is true unless it says otherwise, and may
-have none.
+An app is what runs in a workspace and is opened from outside it: in the
+browser, at `https://<workspace>--<app>.<domain>`, an origin of its own,
+or, for an app without an address, from a terminal on the person's own
+computer, over SSH through the host. The host offers them,
+`services.workbench.apps`; each workspace has the ones its `apps` names,
+those whose `default` is true unless it says otherwise, and may have none.
 `https://<workspace>.<domain>` leads to the workspace's panel in the web UI.
 
 ```nix
@@ -358,7 +377,8 @@ A VM keeps the apps it booted with: a change to them, or a new version,
 comes with its next restart, and the web UI says what waits for it.
 
 - **`port = null`** makes an app without an address: nginx reaches
-  nothing of it, and its panel has no **Open**.
+  nothing of it, and its panel has **Connect…** instead of **Open**, with
+  the steps of its `connect`.
 - **`default = false`** makes an app people opt into: a workspace has it
   when its `apps` names it, and the New workspace form leaves it unticked.
 - **`oneshot = true`** makes `serve` start what the app runs and end, such
@@ -392,9 +412,36 @@ services.workbench.workspaces.alice.apps = [ "t3code" "herdr" "herdrcore" ];
 Their panes and terminals have the workspace's environment and secrets:
 Herdr's server has them as any app does, and Herdr app imports them into
 the owner's user manager before it starts the core, whose terminals are
-user services. `herdr update` and `hc update` say that a newer one comes
-with the host. `herdr.package` and `herdrCore.package` choose the
-versions.
+user services. Both find themselves over SSH on the workspace's `PATH`,
+and `herdr update` and `hc update` say that a newer one comes with the
+host. `herdr.package` and `herdrCore.package` choose the versions.
+
+### From a terminal
+
+People reach a workspace's SSH server from their own computer, with no key
+to register and no port but the host's HTTPS:
+
+1. A workspace's **Connect…** page, behind single sign-on, shows a command
+   with a code that works once, for 10 minutes, for the person signed in:
+
+   ```sh
+   curl -fsSL https://<domain>/connect/install.sh | sh -s -- <code>
+   ```
+
+2. It downloads `workbench-connect`, a static binary for x86_64 or
+   aarch64 Linux, which installs itself in `~/.local/bin` and trades the
+   code for a credential of that computer's, which works for 30 days while
+   the person signs in to the UI at least every 7. It
+   writes `~/.config/workbench` and includes its `ssh_config` at the top of
+   `~/.ssh/config`.
+3. `ssh <workspace>.<domain>` then signs in as the person: `workbench-connect`
+   gets the computer's key signed for them for 8 hours, and is the
+   `ProxyCommand`, a WebSocket to the host, which lets it through to the
+   workspace's port 22 if the workspace is theirs and runs. The host CA
+   vouches for the workspace's host key.
+
+`/devices`, in the user's menu, lists a person's computers, and revokes
+them. [docs/web-ui.md](docs/web-ui.md#from-a-terminal) has the whole design.
 
 ### The sign-in hook
 
@@ -440,7 +487,8 @@ build of the host takes a while longer.
 
 `checks.guest` evaluates the system a new NixOS workspace writes and
 rebuilds. `checks.workspaces` boots two workspaces in a NixOS VM test, one
-Ubuntu and one NixOS; it needs nested virtualization on the machine that
-builds it (`kvm_amd`/`kvm_intel` with `nested=1`). The test runs the default
+Ubuntu and one NixOS, each with T3 Code and herdr's two runtimes; it needs
+nested virtualization on the machine that builds it (`kvm_amd`/`kvm_intel`
+with `nested=1`). The test runs the default
 app, T3 Code, from llm-agents.nix: with `https://cache.numtide.com` among
 the substituters, it is downloaded rather than built.

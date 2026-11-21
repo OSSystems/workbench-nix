@@ -250,6 +250,15 @@ fn refuse(msg: &str, code: axum::http::StatusCode) -> ServerFnError {
     ServerFnError::new(msg)
 }
 
+/// The groups of who is asking, in a server function or a page.
+#[must_use]
+pub fn request_groups() -> Vec<String> {
+    use_context::<axum::http::request::Parts>()
+        .and_then(|p| p.extensions.get::<Groups>().cloned())
+        .map(|g| g.0)
+        .unwrap_or_default()
+}
+
 /// The app state and who is asking, in a server function or a page.
 pub fn request() -> Result<(AppState, Viewer), ServerFnError> {
     let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("no app state"))?;
@@ -457,7 +466,7 @@ impl AppState {
         let page = format!("/w/{name}/open/{}", encode(app));
         match self.link(viewer, name, app).await? {
             Ok(link) => {
-                no_store();
+                no_store_redirect();
                 see_other(&link);
             }
             // The page says these itself, from the workspace's state.
@@ -490,8 +499,18 @@ impl AppState {
     }
 }
 
-/// Keeps a response with a link in it out of every cache and referrer.
+/// Keeps a response out of every cache.
 fn no_store() {
+    if let Some(res) = use_context::<leptos_axum::ResponseOptions>() {
+        res.insert_header(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    }
+}
+
+/// Keeps a redirect to a link out of every cache, and the link out of the
+/// referrer of the request that follows it. Only a redirect's: a page's
+/// policy is the rest of the UI's too, since its links move within one
+/// document, and `no-referrer` sends every form after it with `Origin: null`.
+fn no_store_redirect() {
     if let Some(res) = use_context::<leptos_axum::ResponseOptions>() {
         res.insert_header(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
         res.insert_header(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));

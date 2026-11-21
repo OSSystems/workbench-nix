@@ -8,22 +8,25 @@ and `services.workbench.web` sets it up.
 ## Premises
 
 - **One address.** The UI is at `https://<domain>`, each app of a
-  workspace at `https://<ws>--<app>.<domain>`, and `https://<ws>.<domain>`
-  leads to the workspace's panel. One certificate covers `<domain>` and
+  workspace with an address at `https://<ws>--<app>.<domain>`, and
+  `https://<ws>.<domain>` leads to the workspace's panel; over SSH,
+  `<ws>.<domain>` is the workspace. One certificate covers `<domain>` and
   `*.<domain>`.
-- **A workspace is a VM; apps are what runs in it.** None, one or several,
-  and none is its main one. See [Apps](#apps).
+- **A workspace is a VM; apps are what runs in it**, opened from outside
+  it, in the browser or from a terminal. None, one or several, and none is
+  its main one. See [Apps](#apps).
 - **Single sign-on everywhere.** Keycloak, through oauth2-proxy, guards the
   UI and every workspace. Nobody reaches a workspace's app without signing in,
-  whatever the app does about accounts.
+  whatever the app does about accounts; a terminal gets in with a computer
+  set up from the UI, see [From a terminal](#from-a-terminal).
 - **Three roles, from the directory's groups.** A person sees and controls
   the workspaces they own. Members of the self-service groups also create
   their own, within a quota. Admins, members of the admin groups or names in
   the Nix configuration, see and control all of them.
 - **No database.** State comes from the workspace configs, systemd, the VM's
-  sockets and a few files the host writes: stop markers, the quotas and the
-  configs of workspaces made at run time. It is what `workbench status`
-  collects, called as a function.
+  sockets and a few files the host writes: stop markers, the quotas, the
+  configs of workspaces made at run time, and the UI's paired devices. It
+  is what `workbench status` collects, called as a function.
 - **Rendered on the server, hydrated in the browser.** A Leptos app in
   Rust: the server renders every page, and the same components, compiled to
   WebAssembly, take over in the browser for live updates, dialogs and
@@ -42,6 +45,10 @@ browser ──► nginx ──auth_request──► oauth2-proxy ──OIDC─�
               ├─ <domain>              ──► workbench web   (unix socket)
               ├─ <ws>--<app>.<domain>  ──► that app in the VM  (after an owner check)
               └─ <ws>.<domain>         ──► 302 to <domain>/?w=<ws>
+
+ssh ──► workbench-connect ──WebSocket──► nginx ──► workbench web ──► <ws>:22
+                                        <domain>/connect/ssh/<ws>, no SSO:
+                                        a device's credential, the owner check
 ```
 
 - **oauth2-proxy** is the Keycloak client. It lives at `/oauth2/` on every
@@ -106,10 +113,12 @@ app's address, styled from `https://<domain>`: "isn't yours", or, for a
 workspace of the viewer's, that it has no such app and a link to its panel.
 
 The check lives in `workbench-web`, not in nginx, so runtime configs, the
-groups, the admin list and the owner rule are in one tested place.
+groups, the admin list and the owner rule are in one tested place, which
+the tunnel to a workspace's SSH server asks too.
 
 An app without an address has nothing there: the check answers `403`, as
-for an app the workspace hasn't, and the page says it has no address.
+for an app the workspace hasn't, and the page says it is reached from a
+terminal.
 
 ### Who may what
 
@@ -126,19 +135,26 @@ session refresh, before the reconciliation below stops its VM.
 
 ## Apps
 
-An app is what runs in a workspace and is opened from a browser, at an
-address of its own, `<ws>--<app>.<domain>`, so each is an origin of its own
-and their cookies never mix. The host offers them,
-`services.workbench.apps`; each workspace says which it has, from none to
-all. T3 Code, `t3code`, is the one there is now; a terminal app is for
-later, and it would be another kind, opened in the UI rather than at an
-address.
+An app is what runs in a workspace and is opened from outside it. One with
+a port is opened from a browser, at an address of its own,
+`<ws>--<app>.<domain>`, so each is an origin of its own and their cookies
+never mix. One without, such as herdr's runtimes, is reached from a
+terminal of the person's own computer, over SSH through the host. The host
+offers them, `services.workbench.apps`; each workspace says which it has,
+from none to all, and has those whose `default` is true unless it says
+otherwise. T3 Code, `t3code`, is opened in the browser, and every workspace
+has it by default; Herdr, `herdr`, and Herdr app, `herdrcore`, are reached
+from a terminal, and workspaces opt into them.
 
 An app is a bundle the host shares with the guest at `config/apps/<id>`:
 `bin/serve`, which the guest agent runs at every boot as the owner, as a
-unit of its own, `workspace-app-<id>`, with `APP_PORT` and `APP_URL`; and,
-if the app has a sign-in of its own, `bin/open-link`, which prints a
-one-time link that signs a browser in to it.
+unit of its own, `workspace-app-<id>`, with `APP_PORT` and `APP_URL` for
+an app with an address, and the owner's user manager, which lingers, at
+`XDG_RUNTIME_DIR`; and, if the app has a sign-in of its own,
+`bin/open-link`, which prints a one-time link that signs a browser in to
+it. systemd restarts a server when it ends; a oneshot app's `serve`, such
+as Herdr app's, starts what it runs as user services and ends, and its unit
+stays active.
 
 **What the VM booted with stays until it restarts.** The config says what
 the next start boots: the workspace's packages and its apps, each at a
@@ -165,12 +181,100 @@ one more kind of change.
 A VM a host from before apps started left `<runtimeDir>/app` instead: it
 runs no app the host knows of, so its apps come with its next restart.
 
+## From a terminal
+
+An app without an address is reached over SSH, from a terminal of the
+person's own computer, with nothing but HTTPS to the host between them: no
+key to register, no port to open. The person's computer gets in with a
+credential the UI gave it, which stands in for single sign-on.
+
+**Certificate authorities.** The host has two SSH CAs in
+`<stateDir>/ssh`, which `workbench-ssh-ca.service` makes once: the host
+CA, root's, and the user CA, which only `workbench-web` reads. At every
+start, `workbench run` signs the workspace's host key, which the host
+keeps in `<stateDir>/ssh/hosts/<ws>`, for `<ws>.<domain>`, and shares it
+root-only in the secrets share. The guest's sshd serves it, and trusts
+the user CA's keys for the owner only: `ssh/principals/<owner>`, in the
+config share, is the one `AuthorizedPrincipalsFile`, with the owner's
+name, so a certificate never signs in as another account, root included.
+The owner's keys from the Nix configuration work as well.
+
+**Pairing.**
+
+1. A workspace's Connect page, behind single sign-on, makes a pairing
+   code: it works once, for 10 minutes, for the person signed in, and
+   lives in `workbench-web`'s memory.
+2. On their computer, `curl -fsSL https://<domain>/connect/install.sh | sh
+   -s -- <code>` downloads `workbench-connect` for its architecture and
+   runs `workbench-connect setup <code>`, which installs it in
+   `~/.local/bin`.
+3. `setup` trades the code, `POST /connect/pair`, for a device
+   credential, which works for 30 days or until revoked, while the person
+   signs in to the UI at least every 7 days. The UI keeps its hash, never
+   the credential, in `/var/lib/workbench-web/devices.json`, with its
+   person, their groups, when single sign-on last said them, its label and
+   when it was made and last used. A person has at most 32.
+4. `setup` writes `~/.config/workbench`: the credential, `0600`, an
+   ed25519 key pair, `known_hosts` with `@cert-authority *.<domain>` and the
+   host CA, and `ssh_config`, which it includes at the top of
+   `~/.ssh/config`. For `Host *.<domain>`, it has the person as `User`,
+   `workbench-connect tunnel %h` as `ProxyCommand`, the key, its
+   certificate and those `known_hosts`.
+
+**Certificates.** `POST /connect/cert`, with the credential, signs the
+computer's public key with the user CA for 8 hours, with the person as
+its one principal. ssh loads its certificate before it runs `ProxyCommand`,
+so the tunnel would renew it too late; `ssh_config` has `Match exec
+"workbench-connect login"`, which ssh runs as it reads its configuration
+and which gets a new certificate when this one ends within 15 minutes.
+
+**The tunnel.** `GET /connect/ssh/<ws>` is a WebSocket, with the
+credential, to port 22 of the workspace's VM, which only the host reaches.
+At every connection it asks the access check's owner rule, from the same
+function, with the person and the groups single sign-on last gave them,
+and whether the VM runs; while it is open, it asks the device and the
+owner rule again every 30 seconds, and closes once either says no, so
+revoking a device ends its sessions. Then sshd lets in the person the
+certificate names, by name: an admin passes the tunnel to someone else's
+workspace, but not sshd.
+
+These endpoints are on a socket of their own, `connect.sock`, which nginx
+reaches without single sign-on; each checks what it is given:
+
+| Endpoint | Checks |
+|---|---|
+| `GET /connect/install.sh`, `/connect/bin/workbench-connect-<arch>-linux` | nothing: nginx serves them from the store, and they hold no secret |
+| `POST /connect/pair` | the code |
+| `POST /connect/cert` | the credential |
+| `GET /connect/ssh/<ws>` | the credential, the owner rule and that the VM runs |
+
+**Devices.** `/devices`, from the user's menu, and the Connect page list
+the person's devices, with when each was set up, last used and works
+until, and revoke them. Every visit to the UI, the panel included, notes
+the person's groups for their devices as single sign-on says them then. A
+device whose person hasn't signed in for 7 days works no more until they
+do: someone removed from the directory or from a group loses the way in
+from a terminal within a week, as they lost it in the browser.
+
+**The apps.** Herdr, `herdr`, runs the TUI's server, `herdr server`, as
+any app; `herdr --remote <ws>.<domain>` attaches to it. Herdr app,
+`herdrcore`, is oneshot: it imports the workspace's environment and
+secrets into the owner's user manager, then runs `hc server start`, which
+starts herdr-core's core as a user service, and its terminals' holders
+after it; herdr-app's Add machine and `hc machine add <ws>.<domain>`
+reach it. Their commands find themselves over SSH: an Ubuntu guest's
+`/etc/environment`, and a NixOS guest's `/etc/set-environment`, which bash
+reads for SSH commands, put the workspace's tools first on the `PATH`.
+`herdr update` and `hc update` say that a newer one comes with the host.
+
 ## Screens
 
 ```
 https://<domain>/                    Workspaces
 https://<domain>/?w=<ws>             Workspaces, with <ws> in the side panel
 https://<domain>/w/<ws>/open/<app>   Open <app> of <ws>
+https://<domain>/w/<ws>/connect/<app>   Connect to <app> of <ws>, from a terminal
+https://<domain>/devices             The person's devices
 https://<domain>/w/<ws>/apps         The apps of a workspace made at run time
 https://<domain>/w/<ws>/console      Serial console
 https://<domain>/host                Host memory and quotas (admins)
@@ -181,7 +285,7 @@ https://<domain>/w/<ws>/destroy      Destroy a workspace made at run time
 ### Workspaces (`/`)
 
 A top bar with the mark, a field that finds a workspace by name (`Ctrl K`
-or `/`) and the user's menu (**Sign out**). A sidebar with **Workspaces**,
+or `/`) and the user's menu (**Your devices**, **Sign out**). A sidebar with **Workspaces**,
 **Host** (admins only), and under **Yours** the user's workspaces with
 their status dot. The main area lists workspaces in
 groups by state (Running, Starting, Failing, Stopped), with chips to filter
@@ -215,7 +319,8 @@ actions:
   "T3 Code · after a restart", disabled. A workspace made at run time has
   **Edit…** there, and without apps a dashed box, "No apps yet", with
   **Add an app…**; one from the Nix configuration says its console is the
-  way in.
+  way in. An app without an address has **Connect to `<app>`…** instead,
+  which leads to its Connect page.
 - **Start `<ws>`**, when stopped
 - **Console** (`C`)
 - **Restart…** (`R`), unless it is stopped; primary when something waits
@@ -321,6 +426,30 @@ leaves the change waiting for the next start, and the panel says so.
 Every deploy makes the configs again from the template, keeping what each
 workspace was given: its system, even one no longer offered, and its
 memory.
+
+### Connect to an app (`/w/<ws>/connect/<app>`)
+
+For an app without an address, the owner and the admins see, under
+**Workspaces**, the way back, and the app's name:
+
+1. **Set this computer up**: `curl -fsSL https://<domain>/connect/install.sh
+   | sh -s -- <code>`, with a new code every time the page renders, and
+   **Copy**. Once per computer, on Linux.
+2. **Reach `<app>`**: the steps of the app's `connect`, with `@host@` as
+   `<ws>.<domain>` and commands between backticks: `herdr --remote
+   <ws>.<domain>` for Herdr; herdr-app's Add machine, or `hc machine add
+   <ws>.<domain>`, for Herdr app; `ssh <ws>.<domain>` for any other. A
+   first step that ends in its one command has it in a box with **Copy**;
+   the rest are text.
+3. **Your devices**, as on `/devices`, each with **Revoke**.
+
+Once the viewer has a computer set up, reaching the app comes first, and
+setting another up folds under **Another computer?**.
+
+The page is `no-store`: its code is the viewer's. Its referrer policy is
+the UI's, `same-origin`: the UI moves within one document, and
+`no-referrer` would send its forms with `Origin: null`. An app with an
+address has none, a `404`.
 
 ### Start, stop and restart
 
@@ -476,7 +605,7 @@ Host memory, from `/proc/meminfo` and `/run/vmkit/memory/<pool>.json`:
   workspace isn't yours. You're signed in as bob." with **Sign out** and a
   link to the UI; **404** "`<ws>` has no app `<app>`" for one of the
   viewer's, with a link to its panel, and "`<ws>` has no address for
-  `<app>`" for an app without one.
+  `<app>`" for an app reached from a terminal.
 - **502** when the host can't be read (systemd or a config fails): "Couldn't
   read the workspaces from the host." with the error under Details.
 
@@ -495,9 +624,13 @@ Host memory, from `/proc/meminfo` and `/run/vmkit/memory/<pool>.json`:
   start `workbench-create@`, `workbench-destroy@` and `workbench-apps@`, and
   nothing else.
 - It owns `/var/lib/workbench/.stopped/`.
-- It listens on `/run/workbench-web/ui.sock` and
-  `/run/workbench-web/authz.sock`, `0660` with nginx's group, and on
-  `/run/workbench-web/console.sock`, for `workbench console`.
+- It listens on `/run/workbench-web/ui.sock`,
+  `/run/workbench-web/authz.sock` and `/run/workbench-web/connect.sock`,
+  `0660` with nginx's group, and on `/run/workbench-web/console.sock`, for
+  `workbench console`.
+- It reads the user CA's private key, which it signs people's keys with,
+  and keeps the paired devices in its state directory,
+  `/var/lib/workbench-web`.
 
 Every `POST` must have `Origin: https://<domain>`. The workspaces are
 sibling subdomains, so they are the same site and `SameSite` cookies don't
@@ -516,6 +649,7 @@ stop them; the `Origin` check does.
 | Apps | the request file, `systemctl start workbench-apps@<ws>`, then a restart if asked |
 | Quota | `<stateDir>/self-service/quotas.json`, written in place |
 | Open | the agent's `open-link` over vsock, 90 s |
+| Connect | a code in memory; `devices.json`; `ssh-keygen -s` with the user CA; a TCP connection to `<ip>:22` |
 | Console | the serial socket, shared |
 | Host | `/proc/meminfo`, `/run/vmkit/memory/*.json` |
 
@@ -550,7 +684,14 @@ just a page, current when loaded.
 | `GET` | `/w/<ws>/console/socket` | WebSocket to the shared console |
 | `GET` | `/host` | host memory, admins |
 | `GET` | `/denied` | the page nginx shows at an app's address it refused |
+| `GET` | `/w/<ws>/connect/<app>` | the Connect page of an app without an address |
+| `GET` | `/devices` | the viewer's devices |
+| `POST` | `/api/revoke-device` | server function: `id`, `back`; `303` to `back` |
 | `GET` | `/authz` | on `authz.sock` only, for nginx |
+| `GET` | `/connect/install.sh`, `/connect/bin/<file>` | without SSO: the script that sets a computer up, and `workbench-connect` |
+| `POST` | `/connect/pair` | without SSO, on `connect.sock`: `{"code", "label"}` for `{"credential", "user", "domain", "hostCa", "expires"}` |
+| `POST` | `/connect/cert` | without SSO, with the credential: `{"publicKey"}` for `{"certificate", "validBefore"}` |
+| `GET` | `/connect/ssh/<ws>` | without SSO, with the credential: the WebSocket to `<ip>:22` |
 
 A workspace as `/api/workspaces` gives it:
 
@@ -563,7 +704,8 @@ A workspace as `/api/workspaces` gives it:
   "state": "running",
   "since": "2026-11-16T09:12:00Z",
   "apps": [
-    { "id": "t3code", "name": "T3 Code", "url": "https://alice--t3code.ws.example.com", "openLink": true }
+    { "id": "t3code", "name": "T3 Code", "url": "https://alice--t3code.ws.example.com", "openLink": true },
+    { "id": "herdr", "name": "Herdr", "connect": ["In a terminal: `herdr --remote @host@`"] }
   ],
   "changes": [{ "kind": "packages" }],
   "memoryBytes": 3435973836,
@@ -605,9 +747,10 @@ services.workbench.web = {
 ```
 
 It sets up `workbench-web.service`, oauth2-proxy, the nginx virtual host
-for `<domain>` and the one, with `auth_request`, for every app, the group, the
-socket permissions, the stop marker condition and the polkit rule. Without
-`web.enable`, workspaces are served as before, without SSO.
+for `<domain>`, with `/connect/` apart from single sign-on, and the one,
+with `auth_request`, for every app, the group, the socket permissions, the
+stop marker condition and the polkit rule. Without `web.enable`, workspaces
+are served as before, without SSO, and no one signs people's keys.
 
 The Keycloak client is a confidential OIDC client with the one redirect
 URI `https://<domain>/oauth2/callback`, a mapper that puts the LDAP uid in
@@ -625,6 +768,13 @@ module knows neither.
   the state derivation, what waits for a restart and each app's stage, the
   open link check, the console fan-out, and the pages and server functions
   against fake systemd and agent.
+- Rust, too: apps without an address and oneshot ones, the host key and
+  its certificate, codes that work once and not for long, credentials that
+  expire, are revoked and are kept as hashes, certificates for the person
+  by name, and the tunnel, end to end, refusing another person's, a
+  revoked or no credential and a VM that doesn't run.
+- `workbench-connect`: what it tells ssh, the include it puts first, and
+  when it renews its certificate.
 - Rust, too: the name rule, the SSH key check, the quota, the request's
   validation and the address picked.
 - NixOS: `checks.workspaces` has OpenLDAP with the users and groups, Dex
@@ -640,6 +790,15 @@ module knows neither.
   refuses alice's second; a failing credential command refuses the
   request; and taking alice out of the group cuts her off at the next
   refresh, and the timer stops her VM.
+- NixOS, from a terminal: alice and bob, as users of the client, set
+  their computers up with a code from the Connect page, by
+  `install.sh`; `ssh <ws>.<domain>` reaches each one's workspace through
+  the tunnel, by certificates both ways, and bob's credential doesn't reach
+  alice's, nor once he revoked it. In both guests herdr's server and
+  herdr-core's core run; `herdr machine add` and `herdr --machine` reach the
+  server without a terminal, `hc ls` over SSH sees the core the unit
+  started, and a pane or terminal of each has the workspace's environment
+  and secrets.
 
 ## Later
 
@@ -647,8 +806,9 @@ module knows neither.
   own API, instead of a command that reads them.
 - **A page per workspace** with tabs: Console, then secrets, SSH keys, port
   previews and the NixOS config. The name in the panel links to it.
-- **Terminal apps**, such as herdr: a kind of app opened in the UI, in a
-  terminal like the console's, rather than at an address.
+- **A terminal in the UI**, like the console's, for an app without an
+  address, besides the person's own.
+- **workbench-connect for macOS and Windows.**
 
 ## Open
 
@@ -659,5 +819,20 @@ module knows neither.
   `t3 serve` and `t3 auth pairing create --json`: llm-agents.nix packages
   T3 Code without a NixOS module.
 - An app can't use paths under `/oauth2/`: oauth2-proxy has them.
+- A device's credential stands in for single sign-on for up to 7 days
+  after the person last signed in to the UI: someone removed from the
+  directory, or from a group, keeps the way in from a terminal, with the
+  groups single sign-on last gave them, until then, unless their device is
+  revoked. Only its person revokes it. Their workspaces made at run time
+  are stopped by the reconciliation timer all the same.
+- `ProxyCommand workbench-connect tunnel %h` hands the host name to a
+  shell, as any `ProxyCommand` with `%h`: OpenSSH 9.6 and later, and the
+  distributions' fixes for CVE-2023-51385, refuse a name with shell
+  characters first, but an older ssh doesn't.
+- A computer whose `herdr` or `hc` is of another generation than the
+  workspace's offers to copy its own into the guest's `~/.local/bin`,
+  apart from the version the host decides: herdr asks in a terminal and
+  refuses without one, and `hc machine add --install` copies it without
+  asking.
 - The name rule is a prefix: someone whose slug is `samuel` may take
   `samuel-silva`, before `samuel.silva` does. Names are first come.

@@ -1,11 +1,14 @@
 {
   pkgs,
   flake,
+  inputs,
   ...
 }:
 let
   inherit (pkgs) lib;
   domain = "ws.test";
+  # What a person's computer has to reach herdr's two runtimes.
+  agents = inputs.llm-agents.packages.${pkgs.stdenv.hostPlatform.system};
 
   certs = pkgs.runCommand "workspaces-test-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir $out
@@ -24,6 +27,7 @@ let
     ssh-keygen -q -t ed25519 -N "" -C test -f $out/id
   '';
 
+  # Both have herdr's two runtimes, which people opt into, besides T3 Code.
   workspaces = {
     alice = {
       ip = "10.232.0.10";
@@ -35,6 +39,11 @@ let
       os = "nixos";
     };
   };
+  apps = [
+    "t3code"
+    "herdr"
+    "herdrcore"
+  ];
   clientIP = "192.168.1.3";
   users = [
     "alice"
@@ -295,6 +304,7 @@ pkgs.testers.runNixOSTest {
           // {
             diskGiB = if ws.os or "ubuntu" == "nixos" then 16 else 8;
             cpus = 2;
+            inherit apps;
             environment.WORKSPACE_OWNER = ws.owner;
             sshAuthorizedKeys = [ (builtins.readFile "${sshKey}/id.pub") ];
           }
@@ -332,6 +342,7 @@ pkgs.testers.runNixOSTest {
         networking.hosts.${nodes.host.networking.primaryIPAddress} = [
           domain
           "alice--nope.${domain}"
+          "alice--herdr.${domain}"
         ]
         ++ lib.concatMap (name: [
           "${name}.${domain}"
@@ -351,7 +362,15 @@ pkgs.testers.runNixOSTest {
           pkgs.curl
           pkgs.jq
           pkgs.python3
+          pkgs.openssh
+          agents.herdr
+          agents.herdr-core
         ];
+        # alice's and bob's computers, which reach their workspaces through
+        # the host.
+        users.users = lib.genAttrs [ "alice" "bob" ] (_: {
+          isNormalUser = true;
+        });
         systemd.services = lib.genAttrs [ "web-8080" "web-8081" ] (name: {
           wantedBy = [ "multi-user.target" ];
           serviceConfig.ExecStart = "${lib.getExe pkgs.python3} -m http.server ${lib.removePrefix "web-" name}";
@@ -361,11 +380,12 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import json
+    import re
     import shlex
 
     workspaces = ${builtins.toJSON workspaces}
     domain = "${domain}"
-    ssh_opts = "-i /root/id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
+    ssh_opts = "-i /root/id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o BatchMode=yes"
 
     start_all()
     host.succeed("test -c /dev/kvm || (echo 'this test needs nested KVM' >&2; false)")
@@ -391,7 +411,8 @@ pkgs.testers.runNixOSTest {
             if os_of(name) == "ubuntu":
                 guest(name, "cloud-init status --wait >/dev/null")
             # A NixOS guest copies the app's closure first.
-            guest(name, "timeout 900 sh -c 'until systemctl is-active workspace-app-t3code.service workspace-agent.service; do sleep 5; done'")
+            units = " ".join(f"workspace-app-{a}.service" for a in ${builtins.toJSON apps})
+            guest(name, f"timeout 900 sh -c 'until systemctl is-active {units} workspace-agent.service; do sleep 5; done'")
 
     with subtest("the agent runs the app as the owner with its environment"):
         for name, ws in workspaces.items():
@@ -563,6 +584,117 @@ pkgs.testers.runNixOSTest {
                 f"curl -sf -H 'Origin: {url(other)}' -H 'Cookie: _workbench_auth={admin}; {name}={cookies[owner][1]}' {url(other)}/api/auth/session"
             ))
             assert not state["authenticated"]
+
+    # A person's computer: a user of the client's, alice or bob, who runs
+    # what they would in a terminal, without one.
+    def laptop(user, cmd, check=True, err=True):
+        run = client.succeed if check else client.fail
+        return run(f"su - {user} -c {shlex.quote(cmd)} </dev/null" + (" 2>&1" if err else ""))
+
+    def connect_code(user, name, app):
+        page = client.succeed(f"curl -sf {as_user(user)} https://${domain}/w/{name}/connect/{app}")
+        found = re.search(r"sh -s -- (wbp-[0-9a-f]{32})", page)
+        assert found, page[:3000]
+        return found.group(1)
+
+    with subtest("the host's SSH CAs are each readable by its signer only"):
+        perms = host.succeed("stat -c '%n %U %a' /var/lib/workbench/ssh/host-ca /var/lib/workbench/ssh/user-ca").split("\n")
+        assert perms[:2] == ["/var/lib/workbench/ssh/host-ca root 400", "/var/lib/workbench/ssh/user-ca workbench-web 400"], perms
+        for name in workspaces:
+            cert = guest(name, "ssh-keygen -L -f /run/workspace/secrets/ssh-host/ssh_host_ed25519_key-cert.pub")
+            assert "host certificate" in cert and f"{name}.${domain}" in cert, cert
+            guest(name, "! cat /run/workspace/secrets/ssh-host/ssh_host_ed25519_key")
+
+    with subtest("the panel has Connect for an app reached from a terminal"):
+        page = client.succeed(f"curl -sf {as_user('alice')} 'https://${domain}/?w=alice'")
+        assert 'href="/w/alice/connect/herdr"' in page and 'href="/w/alice/connect/herdrcore"' in page, page[:3000]
+        page = client.succeed(f"curl -sf {as_user('alice')} https://${domain}/w/alice/connect/herdr")
+        assert "curl -fsSL https://${domain}/connect/install.sh | sh -s -- wbp-" in page and "herdr --remote alice.${domain}" in page, page[:3000]
+        assert status_code(f"{as_user('bob')} https://${domain}/w/alice/connect/herdr") == "403"
+        # Herdr has no address, so nothing reaches it through nginx.
+        assert status_code(f"{as_user('alice')} https://alice--herdr.${domain}/") == "404"
+
+    with subtest("alice sets her computer up with a code from it"):
+        code = connect_code("alice", "alice", "herdr")
+        out = laptop("alice", f"curl -fsSL https://${domain}/connect/install.sh | sh -s -- {code}")
+        assert "ssh <workspace>.${domain}" in out, out
+        laptop("alice", "test -x ~/.local/bin/workbench-connect")
+        laptop("alice", "head -1 ~/.ssh/config | grep -qx 'Include ~/.config/workbench/ssh_config'")
+        assert laptop("alice", "stat -c %a ~/.config/workbench/credential").strip() == "600"
+        laptop("alice", "grep -qx '@cert-authority \\*.${domain} ssh-ed25519 .*' ~/.config/workbench/known_hosts")
+        out = laptop("alice", f"~/.local/bin/workbench-connect setup --server https://${domain} {code}", check=False)
+        assert "doesn't work" in out, "a code works once: " + out
+
+    with subtest("ssh reaches her workspace through the tunnel, by certificates"):
+        # Only the host CA is known, and only her certificate lets her in.
+        out = laptop("alice", "ssh -o BatchMode=yes alice.${domain} 'id -un; hostname'", err=False)
+        assert out.split() == ["alice", "alice"], out
+        guest("alice", "sudo journalctl -b | grep -q 'Accepted publickey for alice .* ED25519-CERT'")
+        devices = client.succeed(f"curl -sf {as_user('alice')} https://${domain}/devices")
+        assert "<b>client</b>" in devices and "never used" not in devices, devices[:3000]
+
+    with subtest("bob's credential reaches his workspace, not alice's"):
+        code = connect_code("bob", "bob", "herdr")
+        laptop("bob", f"curl -fsSL https://${domain}/connect/install.sh | sh -s -- {code}")
+        assert laptop("bob", "ssh -o BatchMode=yes bob.${domain} id -un", err=False).strip() == "bob"
+        out = laptop("bob", "ssh -o BatchMode=yes alice.${domain} true", check=False)
+        assert "isn't yours" in out, out
+        out = laptop("bob", "ssh -o BatchMode=yes -l alice alice.${domain} true", check=False)
+        assert "isn't yours" in out, out
+
+    owners = {"alice": "alice", "bob": "bob"}
+    for name, user in owners.items():
+        with subtest(f"herdr in {name}: its server runs, and herdr reaches it without a terminal"):
+            guest(name, "systemctl is-active workspace-app-herdr.service")
+            out = laptop(user, f"herdr machine add {name}.${domain} --label {name} --remote-session default")
+            assert "Remote server is ready" in out, out
+            status = json.loads(laptop(user, f"herdr --machine {name} status server --json", err=False))
+            assert status["running"] and status["capabilities"]["detached_server_daemon"], status
+            made = json.loads(laptop(user, f"herdr --machine {name} workspace create --cwd /home/{user} --label probe --no-focus", err=False))
+            pane = made["result"]["root_pane"]["pane_id"]
+            probe = "printf 'PROBE=%s:%s\\n' \"$WORKSPACE_OWNER\" \"$WORKSPACE_TEST\""
+            laptop(user, f"herdr --machine {name} pane run {pane} {shlex.quote(probe)}")
+            laptop(user, f"herdr --machine {name} pane wait-output {pane} --regex '^PROBE={user}:shared$' --timeout 30000")
+            out = laptop(user, f"ssh {name}.${domain} herdr update", check=False)
+            assert "comes from the workspace's host" in out, out
+
+        with subtest(f"Herdr app in {name}: the unit started the core, which SSH sees"):
+            guest(name, "systemctl is-active workspace-app-herdrcore.service")
+            # Asked before any hc command over SSH, which would start one.
+            units = laptop(user, f"ssh {name}.${domain} systemctl --user list-units --plain --no-legend 'hc-serve-*'", err=False)
+            assert units.startswith("hc-serve-"), units
+            pid = laptop(user, f"ssh {name}.${domain} systemctl --user show -P MainPID {units.split()[0]}", err=False).strip()
+            status = json.loads(laptop(user, f"ssh {name}.${domain} hc server status --json", err=False))
+            assert str(status["pid"]) == pid, (status, pid)
+            listed = json.loads(laptop(user, f"ssh {name}.${domain} hc ls", err=False))
+            assert "terminals" in listed, listed
+            assert laptop(user, f"ssh {name}.${domain} hc run printenv WORKSPACE_OWNER", err=False).strip() == user
+            # As herdr-app adds it: a machine of the computer's own core.
+            laptop(user, f"hc machine add {name}.${domain}")
+            assert laptop(user, f"hc run --on {name} printenv WORKSPACE_TEST", err=False).strip() == "shared"
+            out = laptop(user, f"ssh {name}.${domain} hc update", check=False)
+            assert "comes from the workspace's host" in out, out
+
+    with subtest("a pane of either runtime has the workspace's secrets"):
+        secret = host.succeed("sed -n 's/^WORKSPACE_SECRET=//p' /var/lib/workbench-secrets/alice/environment").strip()
+        assert laptop("alice", "hc run --on alice printenv WORKSPACE_SECRET", err=False).strip() == secret
+        made = json.loads(laptop("alice", "herdr --machine alice workspace create --cwd /home/alice --label secret --no-focus", err=False))
+        pane = made["result"]["root_pane"]["pane_id"]
+        probe = "printf 'SECRET=%s\\n' \"$WORKSPACE_SECRET\""
+        laptop("alice", f"herdr --machine alice pane run {pane} {shlex.quote(probe)}")
+        laptop("alice", f"herdr --machine alice pane wait-output {pane} --regex '^SECRET={secret}$' --timeout 30000")
+
+    with subtest("a revoked credential is refused"):
+        devices = client.succeed(f"curl -sf {as_user('bob')} https://${domain}/devices")
+        found = re.search(r'data-device="([0-9a-f]{16})"', devices)
+        assert found, devices[:3000]
+        device = found.group(1)
+        assert status_code(f"{as_user('alice')} {ui_form} -d id={device} https://${domain}/api/revoke-device") == "303"
+        assert device in client.succeed(f"curl -sf {as_user('bob')} https://${domain}/devices"), "not alice's"
+        assert status_code(f"{as_user('bob')} {ui_form} -d id={device} https://${domain}/api/revoke-device") == "303"
+        out = laptop("bob", "ssh -o BatchMode=yes bob.${domain} true", check=False)
+        assert "revoked" in out, out
+        assert laptop("alice", "ssh -o BatchMode=yes alice.${domain} true") == "", "alice's still works"
 
     with subtest("guests reach neither the host, each other nor private ranges"):
         def blocked(name, ip, port):

@@ -1030,7 +1030,7 @@ pub(crate) mod tests {
                 name: "T3 Code".into(),
                 port: Some(3773),
                 bundle: "/nix/store/x-t3code-app".into(),
-                oneshot: false,
+                ..BootApp::default()
             }],
             default_apps: vec!["t3code".into()],
             environment: BTreeMap::new(),

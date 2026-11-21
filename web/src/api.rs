@@ -5,13 +5,16 @@
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
 use workbench_model::apps::DeviceLink;
+use workbench_model::connect::{ConnectView, DeviceRow};
 use workbench_model::self_service::NewView;
-use workbench_model::{HostView, Snapshot};
+use workbench_model::{HostView, Snapshot, Viewer};
 
 /// What the viewer sees of the host's workspaces.
 #[server(prefix = "/api", endpoint = "snapshot", input = GetUrl)]
 pub async fn get_snapshot() -> Result<Snapshot, ServerFnError> {
     let (state, viewer) = crate::server::request()?;
+    // Signing in to the UI confirms the viewer's groups for their devices.
+    state.devices.seen(&viewer.name, &crate::server::request_groups());
     state.snapshot_for(&viewer).await.map_err(crate::server::failed)
 }
 
@@ -105,4 +108,33 @@ pub async fn destroy(ws: String, #[server(default)] confirm: String) -> Result<(
 pub async fn quota(user: String, quota: String) -> Result<(), ServerFnError> {
     let (state, viewer) = crate::server::request()?;
     state.quota_action(&viewer, &user, &quota)
+}
+
+/// The Connect page of a workspace's app without an address: how to set a
+/// computer up, with a fresh pairing code, and the viewer's devices.
+#[server(prefix = "/api", endpoint = "connect", input = GetUrl)]
+pub async fn get_connect(ws: String) -> Result<(Snapshot, ConnectView), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    let view = state.connect_view(&viewer, &crate::server::request_groups(), &ws).await?;
+    let snap = state.snapshot_for(&viewer).await.map_err(crate::server::failed)?;
+    Ok((snap, view))
+}
+
+/// The viewer's devices.
+// A server function is async, whether it waits or not.
+#[allow(clippy::unused_async)]
+#[server(prefix = "/api", endpoint = "devices", input = GetUrl)]
+pub async fn get_devices() -> Result<(Viewer, Vec<DeviceRow>), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    state.devices.seen(&viewer.name, &crate::server::request_groups());
+    Ok((viewer.clone(), state.device_rows(&viewer.name)))
+}
+
+/// Revokes one of the viewer's devices; a form comes back to `back`.
+// A server function is async, whether it waits or not.
+#[allow(clippy::unused_async)]
+#[server(prefix = "/api", endpoint = "revoke-device")]
+pub async fn revoke_device(id: String, #[server(default)] back: String) -> Result<(), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    state.revoke_action(&viewer, &id, &back)
 }
