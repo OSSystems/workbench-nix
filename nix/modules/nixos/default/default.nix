@@ -13,6 +13,8 @@
       {
         services.workbench = {
           package = lib.mkDefault agents.t3code;
+          herdr.package = lib.mkDefault agents.herdr;
+          herdrCore.package = lib.mkDefault agents.herdr-core;
           vmkitSource = inputs.vmkit;
         };
       }
