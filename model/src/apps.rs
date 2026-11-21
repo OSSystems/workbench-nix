@@ -75,6 +75,9 @@ pub struct BootApp {
     /// it is stopped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub oneshot: bool,
+    /// How people reach it from a terminal: see [`App::connect`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connect: Vec<String>,
 }
 
 impl Boot {
@@ -189,6 +192,40 @@ pub struct App {
     /// the agent answers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub open_link: bool,
+    /// For an app without an address: how people reach it from a terminal
+    /// of a computer set up for it, one step each, with `@host@` for the
+    /// workspace's address, `@name@` for its name, and commands between
+    /// backticks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connect: Vec<String>,
+}
+
+/// A step of [`App::connect`] for a workspace at `host`, in pieces: text,
+/// then a command, then text, and so on.
+#[must_use]
+pub fn connect_step(step: &str, host: &str) -> Vec<(bool, String)> {
+    let name = host.split('.').next().unwrap_or(host);
+    step.replace("@host@", host)
+        .replace("@name@", name)
+        .split('`')
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .map(|(i, s)| (i % 2 == 1, s.to_owned()))
+        .collect()
+}
+
+/// A step of [`connect_step`]'s pieces as a box to copy from: the text
+/// before its command, and the command, when nothing but punctuation
+/// follows it. Any other step reads best as it is.
+#[must_use]
+pub fn copyable_step(parts: &[(bool, String)]) -> Option<(String, String)> {
+    let at = parts.iter().position(|(code, _)| *code)?;
+    let punctuation = |(code, s): &(bool, String)| !code && s.trim().chars().all(|c| c.is_ascii_punctuation());
+    if !parts[at + 1..].iter().all(punctuation) {
+        return None;
+    }
+    let lead = parts[..at].iter().map(|(_, s)| s.as_str()).collect::<String>();
+    Some((lead.trim().to_owned(), parts[at].1.clone()))
 }
 
 /// Why an app of a workspace doesn't open now.
@@ -220,7 +257,13 @@ mod tests {
     use super::*;
 
     fn app(id: &str, bundle: &str) -> BootApp {
-        BootApp { id: id.into(), name: id.to_uppercase(), port: Some(3773), bundle: bundle.into(), oneshot: false }
+        BootApp {
+            id: id.into(),
+            name: id.to_uppercase(),
+            port: Some(3773),
+            bundle: bundle.into(),
+            ..BootApp::default()
+        }
     }
 
     fn boot(packages: &str, apps: &[BootApp]) -> Boot {
@@ -274,8 +317,24 @@ mod tests {
         assert_eq!(herdr.port, None);
         let old: BootApp = serde_json::from_str(r#"{"id":"t3code","name":"T3","port":3773,"bundle":"/b"}"#).unwrap();
         assert_eq!(old.port, Some(3773));
-        let app = App { id: "herdr".into(), name: "Herdr".into(), url: None, open_link: false };
+        let app = App { id: "herdr".into(), name: "Herdr".into(), ..App::default() };
         assert_eq!(serde_json::to_string(&app).unwrap(), r#"{"id":"herdr","name":"Herdr"}"#);
+        assert_eq!(
+            connect_step("In Herdr app, Add machine with `@host@`.", "alice.ws.test"),
+            [(false, "In Herdr app, Add machine with ".into()), (true, "alice.ws.test".into()), (false, ".".into())]
+        );
+        assert_eq!(connect_step("`ssh @host@`", "a.ws.test"), [(true, "ssh a.ws.test".into())]);
+        assert_eq!(connect_step("`hc run --on @name@ x`", "a-b.ws.test"), [(true, "hc run --on a-b x".into())]);
+
+        let copyable = |step: &str| copyable_step(&connect_step(step, "a.ws.test"));
+        assert_eq!(
+            copyable("In Herdr app: Add machine, with `@host@`."),
+            Some(("In Herdr app: Add machine, with".into(), "a.ws.test".into()))
+        );
+        assert_eq!(copyable("`ssh @host@`"), Some((String::new(), "ssh a.ws.test".into())));
+        assert_eq!(copyable("Or `hc machine add @host@`, then `hc run --on @name@ x`."), None);
+        assert_eq!(copyable("Run `x` as root."), None);
+        assert_eq!(copyable("Ask an admin."), None);
     }
 
     #[test]

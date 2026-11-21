@@ -85,6 +85,12 @@ pub fn ago(t: Timestamp, now: Timestamp) -> String {
     }
 }
 
+/// How long ago something happened, from seconds since the epoch.
+#[must_use]
+pub fn ago_s(at: i64, now: Timestamp) -> String {
+    Timestamp::from_second(at).map(|t| ago(t, now)).unwrap_or_default()
+}
+
 /// The host page: its memory, each pool's share and the running
 /// workspaces'.
 pub fn host(opts: &Options, all: &[Workspace]) -> anyhow::Result<HostView> {

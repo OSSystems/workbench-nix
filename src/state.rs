@@ -190,6 +190,7 @@ async fn probe(dirs: &[PathBuf], state_root: &Path, name: String, u: UnitInfo) -
                 name: a.name.clone(),
                 url: a.port.map(|_| app_url(&c.url, &a.id)),
                 open_link: a.port.is_some() && open_links.contains(&a.id),
+                connect: a.connect.clone(),
             })
             .collect();
     }

@@ -54,6 +54,7 @@ fn ws(name: &str, owner: &str, state: State) -> Workspace {
             name: "T3 Code".into(),
             url: Some(format!("https://{name}--t3code.ws.test")),
             open_link: true,
+            ..App::default()
         }],
         unit: "active".into(),
         vm: if state == State::Stopped { "-".into() } else { "Running".into() },
@@ -65,7 +66,12 @@ impl Backend for Fake {
     fn list(&self) -> BoxFuture<'_, anyhow::Result<Vec<Workspace>>> {
         let mut alice = ws("alice", "alice", State::Running);
         if self.herdr {
-            alice.apps.push(App { id: "herdr".into(), name: "Herdr".into(), url: None, open_link: false });
+            alice.apps.push(App {
+                id: "herdr".into(),
+                name: "Herdr".into(),
+                connect: vec!["`herdr --remote @host@`".into()],
+                ..App::default()
+            });
         }
         let mut all = vec![alice, ws("bob", "bob", State::Stopped), ws("bobby", "bob", State::Stopping)];
         all.extend(self.made.iter().cloned());
@@ -101,7 +107,7 @@ impl Backend for Fake {
                 name: "Herdr".into(),
                 port: None,
                 bundle: "/nix/store/x-herdr".into(),
-                oneshot: false,
+                ..BootApp::default()
             });
         }
         Ok(Config {
@@ -169,7 +175,7 @@ fn t3code() -> BootApp {
         name: "T3 Code".into(),
         port: Some(3773),
         bundle: "/nix/store/x-t3code".into(),
-        oneshot: false,
+        ..BootApp::default()
     }
 }
 
@@ -688,7 +694,75 @@ async fn apps_without_an_address() {
     assert_eq!(code, StatusCode::CONFLICT);
     assert!(body.contains("no address to open in a browser"), "{body}");
     let (_, _, body) = send(ui(&s), get("/?w=alice", "alice")).await;
-    assert!(body.contains("Herdr · from a terminal") && !body.contains("Open Herdr"), "{body}");
+    assert!(body.contains(r#"href="/w/alice/connect/herdr""#) && body.contains("Connect to Herdr…"), "{body}");
+    assert!(!body.contains("Open Herdr"), "{body}");
+}
+
+/// The Connect page of an app without an address sets a computer up with
+/// a fresh code and says how to reach the app; the person's devices are
+/// listed there and on their page, and they revoke them, theirs only.
+#[tokio::test]
+async fn connect_and_devices() {
+    let _turn = TURN.lock().await;
+    let s = state(Fake { herdr: true, ..Fake::default() });
+    let (code, h, body) = send(ui(&s), with_groups(get("/w/alice/connect/herdr", "alice"), "staff")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(h[header::CACHE_CONTROL], "no-store", "the code is the viewer's");
+    assert_eq!(h[header::REFERRER_POLICY], "same-origin", "the UI's forms keep their origin");
+    let install = "curl -fsSL https://ws.test/connect/install.sh | sh -s -- wbp-";
+    assert!(body.contains(install) && body.contains("<code>herdr --remote alice.ws.test</code>"), "{body}");
+    assert!(body.contains("No computer is set up yet"), "{body}");
+    let (set_up, reach) = (body.find("Set this computer up").unwrap(), body.find("Reach Herdr").unwrap());
+    assert!(set_up < reach, "setting up first: {body}");
+    let code_of = |body: &str| body.split("sh -s -- ").nth(1).unwrap()[..36].to_owned();
+    let (_, _, again) = send(ui(&s), get("/w/alice/connect/herdr", "alice")).await;
+    assert_ne!(code_of(&body), code_of(&again), "a new code every time");
+    let (_, device) = s.devices.pair(&code_of(&body), "laptop").unwrap();
+    assert_eq!(device.groups, ["staff"], "the groups single sign-on gave her");
+    assert_eq!(s.devices.pair(&code_of(&body), "again"), Err(connect::PairError::Code));
+    let (_, _, paired) = send(ui(&s), get("/w/alice/connect/herdr", "alice")).await;
+    let (reach, more) = (paired.find("Reach Herdr").unwrap(), paired.find("Another computer?").unwrap());
+    assert!(reach < more && paired.contains("<b>laptop</b>"), "reaching first, once set up: {paired}");
+    let (code, _, _) = send(ui(&s), get("/w/alice/connect/herdr", "bob")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "not bob's");
+    let (code, _, _) = send(ui(&s), get("/w/alice/connect/t3code", "alice")).await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "T3 Code opens in the browser");
+
+    let (code, _, body) = send(ui(&s), get("/devices", "alice")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body.contains("<b>laptop</b>") && body.contains("never used"), "{body}");
+    let (_, _, body) = send(ui(&s), get("/devices", "bob")).await;
+    assert!(body.contains("No computer is set up yet"), "bob has none: {body}");
+    let revoke = format!("id={}&back=%2Fw%2Falice%2Fconnect%2Fherdr", device.id);
+    let (code, h, _) = send(ui(&s), post("/api/revoke-device", "bob", ORIGIN, &revoke)).await;
+    assert_eq!((code, h[header::LOCATION].to_str().unwrap()), (StatusCode::SEE_OTHER, "/w/alice/connect/herdr"));
+    assert_eq!(s.devices.of("alice").len(), 1, "not bob's to revoke");
+    let (code, _, _) = send(ui(&s), post("/api/revoke-device", "alice", "https://alice.ws.test", &revoke)).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "from the UI's origin only");
+    assert_eq!(s.devices.of("alice").len(), 1);
+    let (code, h, _) = send(ui(&s), post("/api/revoke-device", "alice", ORIGIN, &revoke)).await;
+    assert_eq!((code, h[header::LOCATION].to_str().unwrap()), (StatusCode::SEE_OTHER, "/w/alice/connect/herdr"));
+    assert!(s.devices.of("alice").is_empty(), "revoked");
+    let (code, h, _) = send(ui(&s), post("/api/revoke-device", "alice", ORIGIN, &revoke)).await;
+    assert_eq!(
+        (code, h[header::LOCATION].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/w/alice/connect/herdr"),
+        "twice"
+    );
+
+    // Back only to a path of the UI's: browsers read `/\host` as `//host`.
+    let (_, device) = s.devices.pair(&s.devices.make_code("alice", &[]).unwrap(), "phone").unwrap();
+    for back in ["%2F%5Cevil.example", "%2F%09%2Fevil.example", "%2F%0A%2Fevil.example"] {
+        let revoke = format!("id={}&back={back}", device.id);
+        let (code, h, _) = send(ui(&s), post("/api/revoke-device", "alice", ORIGIN, &revoke)).await;
+        assert_eq!((code, h[header::LOCATION].to_str().unwrap()), (StatusCode::SEE_OTHER, "/devices"), "{back}");
+    }
+
+    // Any visit to the panel says her groups again, for her devices.
+    s.devices.pair(&s.devices.make_code("alice", &["staff".into()]).unwrap(), "desk").unwrap();
+    let (code, _, _) = send(ui(&s), with_groups(get("/", "alice"), "admins")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(s.devices.of("alice")[0].groups, ["admins"], "as single sign-on says them now");
 }
 
 fn json_post(path: &str, bearer: Option<&str>, body: &serde_json::Value) -> Request<Body> {

@@ -9,7 +9,8 @@ use leptos_meta::{MetaTags, Title, provide_meta_context};
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::{SsrMode, path};
-use workbench_model::apps::AppInfo;
+use workbench_model::apps::{AppInfo, connect_step, copyable_step};
+use workbench_model::connect::{CODE_MINUTES, ConnectView, DEVICE_DAYS, DeviceRow, GROUPS_DAYS};
 use workbench_model::self_service::{MIN_DISK_GIB, NewView};
 use workbench_model::{
     App, Change, Filter, HostView, List, OpenBlocker, Quotas, Row, Snapshot, Stage, State, Verb, Viewer, Workspace,
@@ -65,6 +66,8 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/new") view=NewPage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/console") view=ConsolePage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/open/:app") view=OpenPage ssr=SsrMode::Async />
+                <Route path=path!("/w/:ws/connect/:app") view=ConnectPage ssr=SsrMode::Async />
+                <Route path=path!("/devices") view=DevicesPage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/:action") view=ActionPage ssr=SsrMode::Async />
             </Routes>
         </Router>
@@ -133,6 +136,7 @@ const ICON_LINK: &str =
 const ICON_PLUS: &str = "M12 5v14M5 12h14";
 const ICON_DOTS: &str = "M6 12h.01M12 12h.01M18 12h.01";
 const ICON_CONSOLE: &str = "m5 8 4 4-4 4M12 16h7";
+const ICON_TERMINAL: &str = "M4 5h16v14H4zM8 10l2 2-2 2M12 14h4";
 const ICON_RESTART: &str = "M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6";
 const ICON_STOP: &str = "M12 3v8M6.6 6.6a8 8 0 1 0 10.8 0";
 
@@ -189,6 +193,7 @@ fn Top(viewer: Viewer, #[prop(optional)] find: Option<RwSignal<String>>) -> impl
                     <span class="av" aria-hidden="true">{initials(&viewer.name)}</span>
                 </summary>
                 <div class="menu">
+                    <a href="/devices">"Your devices"</a>
                     <a href="/oauth2/sign_out" rel="external">"Sign out"</a>
                 </div>
             </details>
@@ -1081,11 +1086,13 @@ fn AppRow(ws: Workspace, app: App, first: bool, device: Callback<(String, String
             }
             .into_any()
         }
+        // Reached from a terminal: its page says how, with a code that sets
+        // a computer up for it.
         Some(OpenBlocker::NoAddress) => view! {
             <div class="appo">
-                <span class="btn" aria-disabled="true">
-                    <span><span class=dot></span>{format!("{} · from a terminal", app.name)}{until}</span>
-                </span>
+                <a class="btn" href=format!("/w/{}/connect/{}", ws.name, app.id) rel="external" title="From your terminal">
+                    <span><span class=dot></span>{format!("Connect to {}…", app.name)}{until}<Icon d=ICON_TERMINAL /></span>
+                </a>
             </div>
         }
         .into_any(),
@@ -1861,6 +1868,226 @@ fn OpenBody(ws: Workspace, app: App, error: String, detail: String) -> impl Into
     view! {
         <h1>{format!("Open {} in ", app.name)} <span class="mono">{name.clone()}</span></h1>
         {body}
+    }
+}
+
+/// The Connect page of an app without an address, at
+/// `/w/<ws>/connect/<app>`: the command that sets a computer up, with a
+/// fresh code, then how to reach the app from it, and the viewer's
+/// devices. A GET makes a code, which nothing spends until a computer
+/// trades it.
+#[component]
+fn ConnectPage() -> impl IntoView {
+    let params = use_params_map();
+    let get = move |k: &str| params.with_untracked(|p| p.get(k).unwrap_or_default());
+    let (name, id) = (get("ws"), get("app"));
+    let data = Resource::new_blocking(move || name.clone(), api::get_connect);
+    view! {
+        <Suspense>
+            {move || {
+                let id = id.clone();
+                Suspend::new(async move {
+                    match data.await {
+                        Ok((snap, c)) => {
+                            let name = c.host.split('.').next().unwrap_or_default().to_owned();
+                            let ws = snap.find(&name).map(|r| r.ws.clone());
+                            let app = ws.as_ref().and_then(|w| w.app(&id)).cloned();
+                            view! { <ConnectBody viewer=snap.viewer ws=ws.unwrap_or_default() app c /> }.into_any()
+                        }
+                        Err(e) if e.to_string().contains("isn't yours") => view! { <Forbidden viewer=None /> }.into_any(),
+                        Err(e) => view! { <Unreachable detail=e.to_string() /> }.into_any(),
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+#[component]
+fn ConnectBody(viewer: Viewer, ws: Workspace, app: Option<App>, c: ConnectView) -> impl IntoView {
+    let name = ws.name.clone();
+    let Some(app) = app.filter(|a| a.url.is_none()) else {
+        set_status(404);
+        return view! {
+            <Title text="No such app · workbench" />
+            <div class="app">
+                <Top viewer />
+                <main class="solo">
+                    <div class="card">
+                        <h1><span class="mono">{name.clone()}</span>" has no app to reach from a terminal there"</h1>
+                        <p>"Its apps are on its panel."</p>
+                        <div class="acts"><a class="btn p" href=format!("/?w={name}")>"Back to workspaces"</a></div>
+                    </div>
+                </main>
+            </div>
+        }
+        .into_any();
+    };
+    let install = c.install();
+    let steps =
+        if app.connect.is_empty() { vec!["In a terminal: `ssh @host@`".to_owned()] } else { app.connect.clone() };
+    let mut steps = steps.iter().map(|s| connect_step(s, &c.host));
+    let an = app.name.clone();
+    let first = steps.next().unwrap_or_default();
+    let first = match copyable_step(&first) {
+        Some((lead, text)) => view! {
+            {(!lead.is_empty()).then(|| view! { <p class="stepnote">{lead}</p> })}
+            <CopyBox text label=format!("Copy what reaches {an}") />
+        }
+        .into_any(),
+        None => view! { <p class="stepnote">{inline_step(first)}</p> }.into_any(),
+    };
+    let more = steps.map(|parts| view! { <p class="stepnote">{inline_step(parts)}</p> }).collect_view();
+    let reach = move |n: &'static str| {
+        view! {
+            <section class="step">
+                <div class="sh"><span class="n">{n}</span><h2>{format!("Reach {an}")}</h2></div>
+                {first}
+                {more}
+            </section>
+        }
+    };
+    let set_up = view! {
+        <p class="stepnote">
+            {format!("In a terminal there, on Linux: it pairs the computer with you and sets ssh up for your workspaces. The code works once, for {CODE_MINUTES} minutes.")}
+        </p>
+        <CopyBox text=install label="Copy the setup command".to_owned() />
+    };
+    // Once a computer is set up, reaching the app comes first.
+    let steps = if c.devices.is_empty() {
+        view! {
+            <section class="step">
+                <div class="sh"><span class="n">"1"</span><h2>"Set this computer up"</h2><span class="meta">"once"</span></div>
+                {set_up}
+            </section>
+            {reach("2")}
+        }
+        .into_any()
+    } else {
+        view! {
+            {reach("1")}
+            <details class="step">
+                <summary class="sh">
+                    <span class="n ok">"✓"</span>
+                    <h2>"Another computer?"</h2>
+                    <span class="btn q">"Set it up"</span>
+                </summary>
+                {set_up}
+            </details>
+        }
+        .into_any()
+    };
+    let here = format!("/w/{name}/connect/{}", app.id);
+    view! {
+        <Title text=format!("Connect to {} · workbench", app.name) />
+        <div class="app">
+            <Top viewer />
+            <main class="solo">
+                <div class="card wide">
+                    <a class="back" href=format!("/?w={name}")><Icon d=ICON_BACK />"Workspaces"</a>
+                    <h1>{app.name.clone()} " " <span class="ws mono">{name.clone()}</span></h1>
+                    <p class="lede">"Reached from your computer, over SSH through this host, not in a browser."</p>
+                    {steps}
+                    <section class="devsec">
+                        <h3 class="label">"Your devices"</h3>
+                        <DeviceList devices=c.devices back=here />
+                    </section>
+                </div>
+            </main>
+        </div>
+    }
+    .into_any()
+}
+
+/// A step's pieces, its commands as code.
+fn inline_step(parts: Vec<(bool, String)>) -> impl IntoView {
+    parts
+        .into_iter()
+        .map(|(code, text)| if code { view! { <code>{text}</code> }.into_any() } else { text.into_any() })
+        .collect_view()
+}
+
+/// A command or name, whole, and a button that copies it, named `label`.
+#[component]
+fn CopyBox(text: String, label: String) -> impl IntoView {
+    let copied = RwSignal::new(false);
+    let copy = text.clone();
+    view! {
+        <div class="copy">
+            <code>{text}</code>
+            <button
+                type="button"
+                class="btn"
+                aria-label=label
+                on:click=move |_| {
+                    let _ = window().navigator().clipboard().write_text(&copy);
+                    copied.set(true);
+                }
+            >
+                <Icon d=ICON_COPY />
+                {move || if copied.get() { "Copied" } else { "Copy" }}
+            </button>
+        </div>
+    }
+}
+
+/// A person's devices, each with Revoke, which brings the form back to
+/// `back`.
+#[component]
+fn DeviceList(devices: Vec<DeviceRow>, back: String) -> impl IntoView {
+    if devices.is_empty() {
+        return view! { <p class="devs-none">"No computer is set up yet."</p> }.into_any();
+    }
+    let rows = devices
+        .into_iter()
+        .map(|d| {
+            let used = if d.last_used.is_empty() { "never used".to_owned() } else { format!("used {}", d.last_used) };
+            view! {
+                <form method="post" action="/api/revoke-device" data-device=d.id.clone()>
+                    <input type="hidden" name="id" value=d.id.clone() />
+                    <input type="hidden" name="back" value=back.clone() />
+                    <div>
+                        <b>{d.label.clone()}</b>
+                        <span class="small">{format!("set up {} · {used} · works until {}", d.created, d.expires)}</span>
+                    </div>
+                    <button class="btn q bad" aria-label=format!("Revoke {}", d.label)>"Revoke"</button>
+                </form>
+            }
+        })
+        .collect_view();
+    view! { <div class="devs">{rows}</div> }.into_any()
+}
+
+/// The viewer's devices, at `/devices`.
+#[component]
+fn DevicesPage() -> impl IntoView {
+    let data = Resource::new_blocking(|| (), |()| api::get_devices());
+    view! {
+        <Title text="Your devices · workbench" />
+        <Suspense>
+            {move || Suspend::new(async move {
+                match data.await {
+                    Ok((viewer, devices)) => view! {
+                        <div class="app">
+                            <Top viewer />
+                            <main class="solo">
+                                <div class="card wide">
+                                    <h1>"Your devices"</h1>
+                                    <p>
+                                        {format!("The computers set up to reach your workspaces from a terminal. Each works for {DEVICE_DAYS} days from when it was set up, while you sign in here at least every {GROUPS_DAYS} days; revoke one you no longer use, or have lost.")}
+                                    </p>
+                                    <DeviceList devices back="/devices".to_owned() />
+                                    <p class="small">"A workspace's app you reach from a terminal has a Connect page, which sets a computer up."</p>
+                                    <div class="acts"><a class="btn q" href="/">"Back to workspaces"</a></div>
+                                </div>
+                            </main>
+                        </div>
+                    }
+                    .into_any(),
+                    Err(e) => view! { <Unreachable detail=e.to_string() /> }.into_any(),
+                }
+            })}
+        </Suspense>
     }
 }
 

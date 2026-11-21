@@ -582,7 +582,13 @@ mod tests {
     #[test]
     fn open_blockers() {
         let mut w = ws("a", "alice", State::Running).ws;
-        let app = |id: &str| App { id: id.into(), name: id.into(), url: Some(String::new()), open_link: true };
+        let app = |id: &str| App {
+            id: id.into(),
+            name: id.into(),
+            url: Some(String::new()),
+            open_link: true,
+            ..App::default()
+        };
         w.apps = vec![app("t3code"), app("herdr"), app("old"), App { url: None, ..app("term") }];
         w.changes = vec![Change::AppAdded { app: "herdr".into() }, Change::AppRemoved { app: "old".into() }];
         assert_eq!(w.open_blocker("t3code"), None);
@@ -611,6 +617,7 @@ mod tests {
                 name: "T3 Code".into(),
                 url: Some("https://alice--t3code.ws.test".into()),
                 open_link: true,
+                ..App::default()
             }],
             unit: "active".into(),
             vm: "Running".into(),

@@ -272,3 +272,36 @@ dialog.dlg::backdrop { background: var(--scrim); }
 .dlg .form .acts, .card .form .acts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 .card .err { margin: 2px 0 14px; }
 @media (max-width: 760px) { .appo .btn { height: 42px; } .appo .more > summary { width: 42px; height: 42px; } }
+
+/* Connect, and the person's devices */
+.card.wide { width: 560px; }
+.card > .back { margin: 0 0 14px -4px; gap: 2px; color: var(--t3); font-size: 12.5px; }
+.card > .back:hover { color: var(--t); }
+.card h1 .ws { display: inline-block; padding: 1px 7px; border: 1px solid var(--line2); border-radius: 6px; background: var(--g2); color: var(--t2); font-size: .72em; font-weight: 500; vertical-align: 3px; }
+.card .lede { margin-bottom: 16px; }
+.step { margin-bottom: 10px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--g1); }
+.step .sh { display: flex; align-items: center; gap: 10px; }
+.card .step h2 { flex: 1; margin: 0; font-size: 14px; letter-spacing: 0; }
+.step .n { display: grid; place-items: center; flex: none; width: 20px; height: 20px; border-radius: 50%; background: var(--g3); color: var(--t2); font-size: 11.5px; font-weight: 600; }
+.step .n.ok { background: var(--ok-soft); color: var(--ok); }
+.step .meta { color: var(--t3); font-size: 12px; }
+.step .stepnote { margin: 6px 0 8px 30px; color: var(--t3); font-size: 12.5px; }
+.step .stepnote code { color: var(--t2); }
+.step .copy { margin-left: 30px; }
+.step .copy + .stepnote { margin-top: 8px; }
+.step .sh + .copy { margin-top: 10px; }
+details.step > summary { list-style: none; cursor: pointer; }
+details.step > summary::-webkit-details-marker { display: none; }
+details.step:not([open]) { padding: 10px 14px; }
+details.step[open] > summary .btn { display: none; }
+details.step[open] > summary { margin-bottom: 4px; }
+.copy { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 4px 4px 4px 10px; border: 1px solid var(--line2); border-radius: 8px; background: var(--g2); }
+.copy code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.5; }
+.copy .btn { flex: none; height: 28px; }
+.devsec { margin-top: 18px; }
+.label { margin-bottom: 4px; color: var(--t3); font-size: 11.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.devs { display: grid; margin: 0 0 16px; }
+.devs > form { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
+.devs > form > div { flex: 1; min-width: 0; }
+.devs-none { margin-bottom: 16px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--t3); font-size: 12.5px; }
+.devs b { display: block; font-size: 13.5px; }

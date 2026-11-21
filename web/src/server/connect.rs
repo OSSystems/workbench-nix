@@ -25,14 +25,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
 use jiff::Timestamp;
+use leptos::prelude::ServerFnError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vmkit::hostutil;
+use workbench_model::Viewer;
 use workbench_model::connect::{
     CERT_HOURS, CODE_MINUTES, CODE_PREFIX, CREDENTIAL_PREFIX, Cert, CertRequest, DEVICE_DAYS, GROUPS_DAYS, MAX_DEVICES,
     PairRequest, Paired, Refusal, clean_label, credential_id, is_code,
 };
+use workbench_model::connect::{ConnectView, DeviceRow};
 use workbench_model::self_service::parse_ssh_keys;
 
 use super::{AppState, lock};
@@ -290,6 +293,62 @@ impl Devices {
         if changed && let Err(e) = self.save(&store) {
             eprintln!("noting {user}'s groups for their devices: {e:#}");
         }
+    }
+}
+
+impl AppState {
+    /// The Connect page of a workspace's app without an address: a fresh
+    /// code for the viewer and their devices, whose groups are noted as
+    /// single sign-on says them now.
+    pub async fn connect_view(
+        &self,
+        viewer: &Viewer,
+        groups: &[String],
+        name: &str,
+    ) -> Result<ConnectView, ServerFnError> {
+        let ws = self.find(viewer, name).await?;
+        self.devices.seen(&viewer.name, groups);
+        let code = self.devices.make_code(&viewer.name, groups).map_err(super::failed)?;
+        super::no_store();
+        Ok(ConnectView {
+            origin: self.opts.origin.clone(),
+            host: ws.host().to_owned(),
+            code,
+            devices: self.device_rows(&viewer.name),
+        })
+    }
+
+    /// A person's devices, as their page lists them.
+    pub fn device_rows(&self, user: &str) -> Vec<DeviceRow> {
+        let at = Timestamp::now();
+        let when = |s: i64| Timestamp::from_second(s).map(|t| super::view::when(t, at)).unwrap_or_default();
+        self.devices
+            .of(user)
+            .into_iter()
+            .map(|d| DeviceRow {
+                id: d.id,
+                label: d.label,
+                created: when(d.created),
+                last_used: if d.last_used == 0 { String::new() } else { super::view::ago_s(d.last_used, at) },
+                expires: when(d.expires),
+            })
+            .collect()
+    }
+
+    /// The `revoke_device` server function: one of the viewer's devices
+    /// works no more; a form comes back to `back`. So does one for a device
+    /// that is gone already, sent twice or from a page left open, or isn't
+    /// theirs, which stays as it is.
+    pub fn revoke_action(&self, viewer: &Viewer, id: &str, back: &str) -> Result<(), ServerFnError> {
+        self.devices.revoke(&viewer.name, id).map_err(super::failed)?;
+        // A path of this origin: browsers read `/\host` as `//host`, and
+        // drop tabs and newlines, so `/<tab>/host` too.
+        let local = back.starts_with('/')
+            && !back.starts_with("//")
+            && back.bytes().all(|b| b.is_ascii_graphic() && b != b'\\');
+        let back = if local { back } else { "/devices" };
+        super::see_other(back);
+        Ok(())
     }
 }
 

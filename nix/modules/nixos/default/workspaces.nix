@@ -149,6 +149,7 @@ let
   appConfig = id: {
     inherit id;
     inherit (cfg.apps.${id}) name port oneshot;
+    connect = lib.optionals (cfg.apps.${id}.port == null) cfg.apps.${id}.connect;
     bundle = "${appBundles.${id}}";
   };
 
@@ -200,6 +201,7 @@ let
     port = lib.mkDefault null;
     default = lib.mkDefault false;
     packages = [ (noSelfUpdate cfg.herdr.package [ "herdr" ]) ];
+    connect = [ "In a terminal: `herdr --remote @host@`" ];
     # In the foreground: its panes get the workspace's environment.
     serve = ''
       exec herdr server
@@ -214,6 +216,10 @@ let
     port = lib.mkDefault null;
     default = lib.mkDefault false;
     oneshot = lib.mkDefault true;
+    connect = [
+      "In Herdr app: Add machine, with `@host@`."
+      "Or in a terminal: `hc machine add @host@`, then `hc run --on @name@ <command>`."
+    ];
     packages = [
       (noSelfUpdate cfg.herdrCore.package [
         "hc"
@@ -248,6 +254,17 @@ let
           `APP_PORT`, and the app is at `<workspace>--<id>.<domain>`. Null
           for an app without an address, which people reach from a
           terminal instead.
+        '';
+      };
+      connect = mkOption {
+        type = types.listOf types.str;
+        default = [ "In a terminal: `ssh @host@`" ];
+        example = [ "In a terminal: `herdr --remote @host@`" ];
+        description = ''
+          For an app without a port: how people reach it from a computer
+          set up on its Connect page, one step each, with `@host@` for
+          `<workspace>.<domain>`, `@name@` for the workspace, and commands
+          between backticks.
         '';
       };
       default = mkOption {
