@@ -375,6 +375,27 @@ accounts: a browser gets in by following a one-time pairing link, made for
 the owner inside the guest. The module gives it the sign-in hook below,
 around `t3 auth pairing create`.
 
+### Herdr and Herdr app
+
+[herdr](https://herdr.dev) has two runtimes, apps without an address that
+workspaces opt into, from llm-agents.nix too:
+
+| App | What runs in the workspace | From the person's computer |
+|---|---|---|
+| `herdr`, Herdr | the TUI's server, `herdr server`, in the foreground | `herdr --remote <workspace>.<domain>` |
+| `herdrcore`, Herdr app | herdr-core's core, which `hc server start` starts as a user service | herdr-app: Add machine, `<workspace>.<domain>`; or `hc machine add <workspace>.<domain>` |
+
+```nix
+services.workbench.workspaces.alice.apps = [ "t3code" "herdr" "herdrcore" ];
+```
+
+Their panes and terminals have the workspace's environment and secrets:
+Herdr's server has them as any app does, and Herdr app imports them into
+the owner's user manager before it starts the core, whose terminals are
+user services. `herdr update` and `hc update` say that a newer one comes
+with the host. `herdr.package` and `herdrCore.package` choose the
+versions.
+
 ### The sign-in hook
 
 An app may have `openLink`, a script the agent runs as the owner, with the

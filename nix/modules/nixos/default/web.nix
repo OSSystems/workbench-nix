@@ -162,8 +162,10 @@ in
       };
       apps = mkOption {
         type = types.listOf types.str;
-        default = lib.attrNames cfg.apps;
-        defaultText = lib.literalExpression "lib.attrNames config.services.workbench.apps";
+        default =
+          lib.attrNames (lib.filterAttrs (_: a: a.default) cfg.apps)
+          ++ lib.attrNames (lib.filterAttrs (_: a: !a.default) cfg.apps);
+        defaultText = lib.literalMD "every app of `services.workbench.apps`, those a workspace has by default first";
         description = "The apps, of `services.workbench.apps`, people may give the workspaces they make, in the order offered.";
       };
       environmentCommand = mkOption {

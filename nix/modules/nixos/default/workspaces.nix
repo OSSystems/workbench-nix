@@ -158,6 +158,70 @@ let
     '';
   };
 
+  # A tool that updates itself, refusing to: the workspace has the host's
+  # version, and a newer one comes with its next restart.
+  noSelfUpdate =
+    pkg: bins:
+    pkgs.runCommand "${pkg.pname}-workspace-${pkg.version}" { } ''
+      mkdir -p $out/bin
+      for f in ${pkg}/*; do
+        [ "''${f##*/}" = bin ] || ln -s "$f" $out/
+      done
+      ln -s ${pkg}/bin/* $out/bin/
+      for b in ${lib.escapeShellArgs bins}; do
+        rm $out/bin/$b
+        cat > $out/bin/$b <<EOF
+      #!${pkgs.runtimeShell}
+      if [ "\''${1-}" = update ]; then
+        echo "$b comes from the workspace's host: a newer one comes with the workspace's next restart, once the host has it." >&2
+        exit 1
+      fi
+      exec ${pkg}/bin/$b "\$@"
+      EOF
+        chmod +x $out/bin/$b
+      done
+    '';
+
+  # herdr's two runtimes, which people reach from their terminal over SSH:
+  # the TUI's server, and herdr-core, which herdr-app and `hc` drive.
+  herdr = {
+    name = lib.mkDefault "Herdr";
+    port = lib.mkDefault null;
+    default = lib.mkDefault false;
+    packages = [ (noSelfUpdate cfg.herdr.package [ "herdr" ]) ];
+    # In the foreground: its panes get the workspace's environment.
+    serve = ''
+      exec herdr server
+    '';
+  };
+  # The core and the holders of its terminals are user services, which
+  # take the user manager's environment and the caller's: the workspace's
+  # goes to the manager first, so a core started later over SSH has it
+  # too. From then on `hc` keeps the core up.
+  herdrCore = {
+    name = lib.mkDefault "Herdr app";
+    port = lib.mkDefault null;
+    default = lib.mkDefault false;
+    oneshot = lib.mkDefault true;
+    packages = [
+      (noSelfUpdate cfg.herdrCore.package [
+        "hc"
+        "herdr-core"
+      ])
+    ];
+    serve = ''
+      set -euo pipefail
+      names=$(${pkgs.gnused}/bin/sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' \
+          /run/workspace/config/environment /run/workspace/secrets/environment 2>/dev/null \
+        | ${pkgs.gnugrep}/bin/grep -vxE 'PATH|HOME|USER|LOGNAME|SHELL|XDG_[A-Z_]*|HC_[A-Z_]*' \
+        | ${pkgs.coreutils}/bin/sort -u || true)
+      if [ -n "$names" ]; then
+        systemctl --user import-environment $names
+      fi
+      exec hc server start
+    '';
+  };
+
   appModule = {
     options = {
       name = mkOption {
@@ -304,6 +368,14 @@ let
           path = "/etc/profile.d/workbench.sh";
           content = ''
             PATH=/run/workspace/config/app/sw/bin:$PATH
+          '';
+        }
+        # Commands over SSH that start no login shell, such as the ones
+        # `herdr --remote` and herdr-core run, find the workspace's tools.
+        {
+          path = "/etc/environment";
+          content = ''
+            PATH="/run/workspace/config/app/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
           '';
         }
         {
@@ -682,6 +754,24 @@ in
       default = null;
       description = "T3 Code: when set, the app `t3code`, which every workspace has unless it says otherwise.";
     };
+    herdr.package = mkOption {
+      type = types.nullOr types.package;
+      default = null;
+      description = ''
+        herdr: when set, the app `herdr`, the TUI's server, which people
+        reach with `herdr --remote <workspace>.<domain>`. Workspaces have it
+        when they name it.
+      '';
+    };
+    herdrCore.package = mkOption {
+      type = types.nullOr types.package;
+      default = null;
+      description = ''
+        herdr-core: when set, the app `herdrcore`, which herdr-app and `hc`
+        reach as the machine `<workspace>.<domain>`. Workspaces have it when
+        they name it.
+      '';
+    };
     apps = mkOption {
       type = types.attrsOf (types.submodule appModule);
       default = { };
@@ -880,7 +970,11 @@ in
             message = "services.workbench.workspaces.${name}: a NixOS workspace needs sudo; its owner rebuilds the system.";
           }) cfg.workspaces;
 
-        services.workbench.apps.t3code = lib.mkIf (cfg.package != null) t3code;
+        services.workbench.apps = {
+          t3code = lib.mkIf (cfg.package != null) t3code;
+          herdr = lib.mkIf (cfg.herdr.package != null) herdr;
+          herdrcore = lib.mkIf (cfg.herdrCore.package != null) herdrCore;
+        };
 
         environment.systemPackages = [ package ];
         environment.etc = lib.mapAttrs' (
