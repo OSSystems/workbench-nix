@@ -188,8 +188,8 @@ async fn probe(dirs: &[PathBuf], state_root: &Path, name: String, u: UnitInfo) -
             .map(|a| App {
                 id: a.id.clone(),
                 name: a.name.clone(),
-                url: app_url(&c.url, &a.id),
-                open_link: open_links.contains(&a.id),
+                url: a.port.map(|_| app_url(&c.url, &a.id)),
+                open_link: a.port.is_some() && open_links.contains(&a.id),
             })
             .collect();
     }
@@ -312,6 +312,9 @@ impl std::error::Error for OpenLinkError {}
 /// Asks an app of the workspace, through the agent, for a link that signs
 /// a browser in to it.
 pub async fn open_link(c: &Config, app: &str) -> Result<String, OpenLinkError> {
+    if c.apps.iter().any(|a| a.id == app && a.port.is_none()) {
+        return Err(OpenLinkError::Failed { exit_code: 0, detail: "the app has no address".into() });
+    }
     let req = Request { op: "open-link".into(), args: vec![app.to_owned()] };
     let reply = match agent::exchange(c, &req, OPEN_LINK_TIMEOUT).await {
         Err(agent::AskError::Timeout) => return Err(OpenLinkError::Timeout),

@@ -49,7 +49,8 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let config = state.backend.config(name).ok().filter(|c| viewer.may_use(&c.owner, c.self_service));
     let Some(c) = config else { return (StatusCode::FORBIDDEN, refused).into_response() };
     // The UI's page for a workspace without the app tells the two apart.
-    let Some(port) = state.backend.reachable(&c).into_iter().find(|a| a.id == app).map(|a| a.port) else {
+    // An app without an address has nothing here to reach.
+    let Some(port) = state.backend.reachable(&c).into_iter().find(|a| a.id == app).and_then(|a| a.port) else {
         return (StatusCode::FORBIDDEN, refused).into_response();
     };
     if let Ok(v) = HeaderValue::from_str(&format!("{}:{port}", c.ip)) {

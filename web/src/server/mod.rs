@@ -392,6 +392,7 @@ impl AppState {
             Some(OpenBlocker::Stopped) => "stopped",
             Some(OpenBlocker::Starting) => "starting",
             Some(OpenBlocker::Coming) => "coming",
+            Some(OpenBlocker::NoAddress) => "no-address",
             None if !ws.app(app).is_some_and(|a| a.open_link) => "no-hook",
             None => "",
         };
@@ -422,7 +423,7 @@ impl AppState {
                 see_other(&link);
             }
             // The page says these itself, from the workspace's state.
-            Err(("stopped" | "starting" | "coming" | "no-hook" | "unknown", _)) => see_other(&page),
+            Err(("stopped" | "starting" | "coming" | "no-hook" | "no-address" | "unknown", _)) => see_other(&page),
             Err((kind, detail)) => see_other(&format!("{page}?error={kind}&detail={}", encode(&detail))),
         }
         Ok(())

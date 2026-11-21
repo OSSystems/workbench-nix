@@ -28,19 +28,26 @@ impl std::fmt::Display for ExitCode {
 impl std::error::Error for ExitCode {}
 
 /// Prints a link that signs a browser in to an app of the workspace: the
-/// one named, or its only one.
+/// one named, or its only one with an address.
 pub async fn open_link(dirs: &[PathBuf], name: &str, app: Option<&str>) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
-    let ids: Vec<&str> = c.apps.iter().map(|a| a.id.as_str()).collect();
-    let app = match (app, ids.as_slice()) {
-        (Some(app), _) => app,
-        (None, [only]) => only,
-        (None, []) => bail!("{name} has no app"),
-        (None, _) => bail!("{name} has several apps; name one of {}", ids.join(", ")),
+    let app = match app {
+        Some(app) => app,
+        None => only_app(&c)?,
     };
     let link = state::open_link(&c, app).await?;
     println!("{link}");
     Ok(())
+}
+
+/// The one app of a workspace that a browser opens, at an address.
+fn only_app(c: &config::Config) -> anyhow::Result<&str> {
+    let ids: Vec<&str> = c.apps.iter().filter(|a| a.port.is_some()).map(|a| a.id.as_str()).collect();
+    match ids.as_slice() {
+        [only] => Ok(only),
+        [] => bail!("{} has no app opened in a browser", c.name),
+        _ => bail!("{} has several apps; name one of {}", c.name, ids.join(", ")),
+    }
 }
 
 /// The apps column: each app, and what the next start changes, `+` for
@@ -314,6 +321,21 @@ mod tests {
     use super::*;
 
     /// destroy deletes nothing unless the workspace name is typed back.
+    /// Without a name, the one app a browser opens: an app reached from a
+    /// terminal has no link.
+    #[test]
+    fn the_app_to_open() {
+        let mut c = crate::config::tests::test_config();
+        assert_eq!(only_app(&c).unwrap(), "t3code");
+        let terminal = workbench_model::apps::BootApp { id: "herdr".into(), port: None, ..c.apps[0].clone() };
+        c.apps.push(terminal);
+        assert_eq!(only_app(&c).unwrap(), "t3code", "Herdr has no address");
+        c.apps.push(workbench_model::apps::BootApp { id: "notes".into(), port: Some(8080), ..c.apps[0].clone() });
+        assert!(only_app(&c).unwrap_err().to_string().contains("name one of t3code, notes"));
+        c.apps.retain(|a| a.port.is_none());
+        assert!(only_app(&c).unwrap_err().to_string().contains("no app opened in a browser"));
+    }
+
     #[tokio::test]
     async fn destroy_needs_confirmation() {
         let root = tempfile::tempdir().unwrap();

@@ -598,9 +598,10 @@ fn OpenButton(
 ) -> impl IntoView {
     let opened = expect_context::<Opened>();
     let id = format!("{ws}/{}", app.id);
+    let url = app.url.clone().unwrap_or_default();
     if !app.open_link {
         return view! {
-            <a class=format!("btn {class}") href=app.url target="_blank" rel="noopener" data-key=key title=app.name>
+            <a class=format!("btn {class}") href=url target="_blank" rel="noopener" data-key=key title=app.name>
                 {children()}
             </a>
         }
@@ -625,7 +626,7 @@ fn OpenButton(
         </form>
         <a
             class=format!("btn {class}")
-            href=app.url
+            href=url
             target="_blank"
             rel="noopener"
             data-key=key
@@ -645,7 +646,7 @@ fn Primary(ws: Workspace) -> impl IntoView {
     if !ws.configured {
         return view! { <span class="wait">"workbench destroy"</span> }.into_any();
     }
-    let first = ws.running_apps().next().cloned();
+    let first = ws.running_apps().find(|a| a.url.is_some()).cloned();
     let console = |name: &str| {
         view! {
             <a class="btn" href=format!("/w/{name}/console") rel="external" data-key="enter">
@@ -662,7 +663,7 @@ fn Primary(ws: Workspace) -> impl IntoView {
         }
         .into_any(),
         (State::Starting, Some(app)) => view! {
-            <a class="btn" href=app.url target="_blank" rel="noopener" data-key="enter" title=app.name>
+            <a class="btn" href=app.url.unwrap_or_default() target="_blank" rel="noopener" data-key="enter" title=app.name>
                 "Open"
             </a>
         }
@@ -1080,9 +1081,17 @@ fn AppRow(ws: Workspace, app: App, first: bool, device: Callback<(String, String
             }
             .into_any()
         }
+        Some(OpenBlocker::NoAddress) => view! {
+            <div class="appo">
+                <span class="btn" aria-disabled="true">
+                    <span><span class=dot></span>{format!("{} · from a terminal", app.name)}{until}</span>
+                </span>
+            </div>
+        }
+        .into_any(),
         Some(OpenBlocker::Starting) => view! {
             <div class="appo">
-                <a class="btn" href=app.url.clone() target="_blank" rel="noopener" title="Still starting">
+                <a class="btn" href=app.url.clone().unwrap_or_default() target="_blank" rel="noopener" title="Still starting">
                     <span><span class="dot go"></span>{format!("Open {}", app.name)}<Icon d=ICON_OUT /></span>
                 </a>
             </div>
@@ -1108,7 +1117,7 @@ fn AppRow(ws: Workspace, app: App, first: bool, device: Callback<(String, String
 #[component]
 fn MoreMenu(ws: String, app: App, device: Callback<(String, String)>) -> impl IntoView {
     let copied = RwSignal::new(false);
-    let url = app.url.clone();
+    let url = app.url.clone().unwrap_or_default();
     let page = format!("/w/{ws}/open/{}", app.id);
     let close = |ev: &leptos::ev::MouseEvent| {
         let menu = ev
@@ -1249,11 +1258,17 @@ fn AppsForm(
         .map(|(i, a)| {
             let url = workbench_model::apps::app_url(&ws.url, &a.id);
             let host = url.split_once("://").map_or(url.clone(), |(_, h)| h.to_owned());
+            let opens = if a.terminal {
+                view! { <small>"Reached from your terminal, at " <span class="mono">{ws.host().to_owned()}</span> "."</small> }
+                    .into_any()
+            } else {
+                view! { <small>"Opens in the browser at " <span class="mono">{host}</span> "."</small> }.into_any()
+            };
             view! {
                 <label class="check">
                     <input type="checkbox" name=format!("apps[{i}]") value=a.id.clone() checked=has.contains(&a.id) />
                     <span><b>{a.name.clone()}</b></span>
-                    <small>"Opens in the browser at " <span class="mono">{host}</span> "."</small>
+                    {opens}
                 </label>
             }
         })
@@ -1742,6 +1757,7 @@ fn OpenBody(ws: Workspace, app: App, error: String, detail: String) -> impl Into
             Some(OpenBlocker::Starting) => "starting",
             Some(OpenBlocker::Coming) => "coming",
             Some(OpenBlocker::Unknown) => "unknown",
+            Some(OpenBlocker::NoAddress) => "no-address",
             None if !app.open_link => "no-hook",
             None => "",
         }
@@ -1752,7 +1768,13 @@ fn OpenBody(ws: Workspace, app: App, error: String, detail: String) -> impl Into
     let mono = |s: String| view! { <span class="mono">{s}</span> };
     let an = app.name.clone();
     let back = view! { <a class="btn q" href=format!("/?w={name}")>"Back to workspaces"</a> };
+    let url = app.url.clone().unwrap_or_default();
     let body = match kind.as_str() {
+        "no-address" => view! {
+            <p>{format!("{an} has no address to open in a browser: you reach it from your terminal. Its panel says how.")}</p>
+            <div class="acts"><a class="btn p" href=format!("/?w={name}")>{format!("Open {name}'s panel")}</a></div>
+        }
+        .into_any(),
         "" => view! {
             <p>{format!("{an} has a sign-in of its own. This makes a one-time link for this browser and opens {an} with it.")}</p>
             <div class="acts">
@@ -1767,7 +1789,7 @@ fn OpenBody(ws: Workspace, app: App, error: String, detail: String) -> impl Into
         .into_any(),
         "no-hook" => view! {
             <p>{format!("{an} has no sign-in of its own: opening it is all it takes.")}</p>
-            <div class="acts"><a class="btn p" href=app.url.clone()>{format!("Open {an}")} <Icon d=ICON_OUT /></a>{back}</div>
+            <div class="acts"><a class="btn p" href=url.clone()>{format!("Open {an}")} <Icon d=ICON_OUT /></a>{back}</div>
         }
         .into_any(),
         "stopped" => view! {
@@ -1813,7 +1835,7 @@ fn OpenBody(ws: Workspace, app: App, error: String, detail: String) -> impl Into
         "not-a-link" => view! {
             <div class="err">
                 <b>{format!("{an} answered something that isn't a link to it.")}</b>
-                "Its sign-in hook must print one URL on " {mono(app.url.clone())} "."
+                "Its sign-in hook must print one URL on " {mono(url.clone())} "."
             </div>
             <div class="acts"><a class="btn p" href=page rel="external">"Try again"</a></div>
         }
@@ -1831,7 +1853,10 @@ fn OpenBody(ws: Workspace, app: App, error: String, detail: String) -> impl Into
         .into_any(),
     };
     if !kind.is_empty() && kind != "no-hook" {
-        set_status(if matches!(kind.as_str(), "stopped" | "starting" | "coming") { 409 } else { 502 });
+        set_status(match kind.as_str() {
+            "stopped" | "starting" | "coming" | "no-address" => 409,
+            _ => 502,
+        });
     }
     view! {
         <h1>{format!("Open {} in ", app.name)} <span class="mono">{name.clone()}</span></h1>
@@ -1966,19 +1991,28 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
         l.os.iter()
             .map(|os| view! { <option value=os.clone() selected=*os == chosen>{os_name(os)}</option> })
             .collect_view();
-    // Every app, unless a refused form picked others.
-    let picked = |id: &str| filled.apps.as_ref().is_none_or(|p| p.split(',').any(|a| a == id));
+    // The apps a new workspace has, unless a refused form picked others.
+    let picked = |a: &AppInfo| filled.apps.as_ref().map_or(a.default, |p| p.split(',').any(|id| id == a.id));
     let apps = (!l.apps.is_empty()).then(|| {
         let boxes = l
             .apps
             .iter()
             .enumerate()
             .map(|(i, a)| {
+                let opens = if a.terminal {
+                    view! { <small>"Reached from your terminal, at " <span class="mono">"<name>.<domain>"</span> "."</small> }
+                        .into_any()
+                } else {
+                    view! {
+                        <small>"Opens in the browser at " <span class="mono">{format!("<name>--{}.<domain>", a.id)}</span> "."</small>
+                    }
+                    .into_any()
+                };
                 view! {
                     <label class="check">
-                        <input type="checkbox" name=format!("apps[{i}]") value=a.id.clone() checked=picked(&a.id) />
+                        <input type="checkbox" name=format!("apps[{i}]") value=a.id.clone() checked=picked(a) />
                         <span><b>{a.name.clone()}</b></span>
-                        <small>"Opens in the browser at " <span class="mono">{format!("<name>--{}.<domain>", a.id)}</span> "."</small>
+                        {opens}
                     </label>
                 }
             })

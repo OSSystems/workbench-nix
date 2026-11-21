@@ -305,7 +305,7 @@ in
           ->
             lib.all (id: cfg.apps ? ${id}) ss.apps
             && lib.allUnique ss.apps
-            && lib.allUnique (map (id: cfg.apps.${id}.port) ss.apps);
+            && lib.allUnique (lib.filter (p: p != null) (map (id: cfg.apps.${id}.port) ss.apps));
         message = "services.workbench.web.selfService.apps: each must be one of services.workbench.apps, once, on a port of its own.";
       }
     ];
