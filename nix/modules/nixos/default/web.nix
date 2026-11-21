@@ -512,6 +512,17 @@ in
             "@workbench_sign_in".extraConfig = signInLocation;
             "= /connect/pair" = connectLocation;
             "= /connect/cert" = connectLocation;
+            # The tunnel to a workspace's SSH server, which lasts as long as
+            # the session in it.
+            "/connect/ssh/" = {
+              proxyPass = "http://unix:${run}/connect.sock";
+              proxyWebsockets = true;
+              extraConfig = ''
+                proxy_buffering off;
+                proxy_read_timeout 1d;
+                proxy_send_timeout 1d;
+              '';
+            };
             "/" = {
               proxyPass = "http://unix:${run}/ui.sock";
               proxyWebsockets = true;

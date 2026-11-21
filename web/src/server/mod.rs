@@ -60,6 +60,8 @@ pub trait Backend: Send + Sync + 'static {
     fn host_ca(&self) -> anyhow::Result<String>;
     /// An SSH public key signed by the user CA for `user`, for a few hours.
     fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
+    /// Where a workspace's SSH server listens: its address, port 22.
+    fn ssh_address(&self, c: &Config) -> String;
 }
 
 /// The groups single sign-on gave the person asking, as the UI's
@@ -160,6 +162,10 @@ impl Backend for HostBackend {
 
     fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
         Box::pin(connect::sign_with(&self.opts.ssh_keygen, &self.opts.user_ca, user, id, key))
+    }
+
+    fn ssh_address(&self, c: &Config) -> String {
+        format!("{}:22", c.ip)
     }
 
     fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
