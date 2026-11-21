@@ -1,9 +1,9 @@
 //! What workbench's host, its CLI and its web UI agree on: workspace and
 //! user names, a workspace's status and the state people see, its apps and
-//! what waits for a restart, who may control it, and how the UI lists
-//! workspaces. It compiles for the host
-//! and for the browser, so the web UI's server and its WebAssembly share
-//! the same types and checks.
+//! what waits for a restart, who may control it, how the UI lists
+//! workspaces, and what `workbench-connect` exchanges with the UI. It
+//! compiles for the host and for the browser, so the web UI's server and
+//! its WebAssembly share the same types and checks.
 
 use std::fmt;
 use std::str::FromStr;
@@ -12,6 +12,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 pub mod apps;
+pub mod connect;
 pub mod self_service;
 
 pub use apps::{App, Change, OpenBlocker, Stage};

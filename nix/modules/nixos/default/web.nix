@@ -90,6 +90,15 @@ let
     };
   };
 
+  # The way in from a terminal, without single sign-on: workbench-web
+  # checks a pairing code or a device's credential itself.
+  connectLocation = {
+    proxyPass = "http://unix:${run}/connect.sock";
+    extraConfig = ''
+      client_max_body_size 16k;
+    '';
+  };
+
   pools = [
     "workbench=${vmkit.memory.pools.workbench.statusFile}"
   ]
@@ -342,7 +351,11 @@ in
         lib.optional ss.enable
           config.environment.etc."workbench-self-service.json".source;
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      after = [
+        "network.target"
+        "workbench-ssh-ca.service"
+      ];
+      wants = [ "workbench-ssh-ca.service" ];
       path = [ config.systemd.package ];
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
@@ -355,6 +368,10 @@ in
             "--cookie-name=${cookieName}"
             "--mem-reserve-percent=${toString cfg.memory.reservePercent}"
             "--mem-reserve-min-gib=${toString vmkit.memory.reserveMinGiB}"
+            "--devices=/var/lib/workbench-web/devices.json"
+            "--ssh-keygen=${pkgs.openssh}/bin/ssh-keygen"
+            "--user-ca=${cfg.stateDir}/ssh/user-ca"
+            "--host-ca=${cfg.stateDir}/ssh/host-ca.pub"
           ]
           ++ map (a: "--admin=${a}") web.admins
           ++ map (g: "--admin-group=${g}") web.adminGroups
@@ -367,6 +384,9 @@ in
         Group = "workbench-web";
         RuntimeDirectory = "workbench-web";
         RuntimeDirectoryMode = "0750";
+        # The paired devices: a hash of each credential.
+        StateDirectory = "workbench-web";
+        StateDirectoryMode = "0700";
         UMask = "0007";
         Restart = "always";
         RestartSec = 2;
@@ -490,6 +510,8 @@ in
               '';
             };
             "@workbench_sign_in".extraConfig = signInLocation;
+            "= /connect/pair" = connectLocation;
+            "= /connect/cert" = connectLocation;
             "/" = {
               proxyPass = "http://unix:${run}/ui.sock";
               proxyWebsockets = true;

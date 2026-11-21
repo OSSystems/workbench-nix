@@ -10,7 +10,9 @@ use clap::Parser;
 use leptos::config::LeptosOptions;
 use workbench::config::DEFAULT_CONFIG_DIRS;
 use workbench::self_service::Template;
-use workbench_web::server::{AppState, HostBackend, Options, SelfService, asset_version, authz_router, ui_router};
+use workbench_web::server::{
+    AppState, HostBackend, Options, SelfService, asset_version, authz_router, connect_router, ui_router,
+};
 
 /// Serves workbench's web UI.
 // The comments are the help text, written for people, not rustdoc.
@@ -66,6 +68,22 @@ struct Args {
     /// Where the shared consoles listen, for `workbench console`
     #[arg(long, default_value = "/run/workbench-web/console.sock")]
     console_socket: PathBuf,
+    /// Where pairing, certificates and the SSH tunnel listen, for nginx
+    /// without single sign-on
+    #[arg(long, default_value = "/run/workbench-web/connect.sock")]
+    connect_socket: PathBuf,
+    /// Where the paired devices are kept
+    #[arg(long, default_value = "/var/lib/workbench-web/devices.json")]
+    devices: PathBuf,
+    /// ssh-keygen, which signs people's keys
+    #[arg(long, default_value = "ssh-keygen")]
+    ssh_keygen: String,
+    /// The user CA's private key
+    #[arg(long, default_value = "/var/lib/workbench/ssh/user-ca")]
+    user_ca: PathBuf,
+    /// The host CA's public key
+    #[arg(long, default_value = "/var/lib/workbench/ssh/host-ca.pub")]
+    host_ca: PathBuf,
 }
 
 fn bind(path: &Path, mode: u32) -> anyhow::Result<tokio::net::UnixListener> {
@@ -108,22 +126,29 @@ async fn main() -> anyhow::Result<()> {
         reserve_percent: args.reserve_percent,
         reserve_min_gib: args.reserve_min_gib,
         pools,
+        devices: args.devices,
+        ssh_keygen: args.ssh_keygen,
+        user_ca: args.user_ca,
+        host_ca: args.host_ca,
     };
     let leptos = LeptosOptions::builder()
         .output_name("workbench-web")
         .site_root(args.site.to_string_lossy().into_owned())
         .site_pkg_dir(format!("pkg/{}", asset_version(&args.site)))
         .build();
-    let state = AppState::new(opts.clone(), Box::new(HostBackend { opts }), leptos);
+    let state = AppState::new(opts.clone(), Box::new(HostBackend { opts }), leptos)?;
     let ui = bind(&args.ui_socket, 0o660)?;
     let authz = bind(&args.authz_socket, 0o660)?;
+    let connect = bind(&args.connect_socket, 0o660)?;
     let ui_app = ui_router(state.clone(), &args.site);
     let authz_app = authz_router(state.clone());
+    let connect_app = connect_router(state.clone());
     let local = state.clone();
     let console_socket = args.console_socket.clone();
     tokio::select! {
         r = axum::serve(ui, ui_app) => r.context("the UI")?,
         r = axum::serve(authz, authz_app) => r.context("the access check")?,
+        r = axum::serve(connect, connect_app) => r.context("the way in from a terminal")?,
         r = local.serve_consoles(&console_socket) => r.context("the shared consoles")?,
     }
     Ok(())
