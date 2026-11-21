@@ -246,8 +246,8 @@ next closure drops would stay registered without its files. Instead every
 boot copies the paths the guest lacks from `/run/workspace/host/nix/store`.
 A first boot, and the first boot after a new app or `extraPackages`, takes
 as long as copying them, and each NixOS workspace keeps the closure on its
-disk: about 5 GiB for T3 Code, which counts against `diskGiB`. Old versions
-go when the owner collects garbage.
+disk: about 3 GiB for T3 Code and the agents it runs, which counts against
+`diskGiB`. Old versions go when the owner collects garbage.
 
 **Versions.** The host decides the apps' versions, as for Ubuntu; the owner
 decides the system's, including the version of `nixosModules.guest`
@@ -355,10 +355,12 @@ comes with its next restart, and the web UI says what waits for it.
 ### T3 Code
 
 [T3 Code](https://github.com/pingdotgg/t3code) is the app `t3code` when
-`package` is set (from [t3code-nix](https://github.com/OSSystems/t3code-nix));
-it runs `t3 serve` on port 3773. It has no accounts: a browser gets in by
-following a one-time pairing link, made for the owner inside the guest. The
-module gives it the sign-in hook below, around `t3 auth pairing create`.
+`package` is set, by default to the `t3code` of
+[llm-agents.nix](https://github.com/numtide/llm-agents.nix), where
+workbench's AI tools come from; it runs `t3 serve` on port 3773. It has no
+accounts: a browser gets in by following a one-time pairing link, made for
+the owner inside the guest. The module gives it the sign-in hook below,
+around `t3 auth pairing create`.
 
 ### The sign-in hook
 
@@ -399,5 +401,5 @@ requests, is described in [docs/contracts.md](docs/contracts.md).
 rebuilds. `checks.workspaces` boots two workspaces in a NixOS VM test, one
 Ubuntu and one NixOS; it needs nested virtualization on the machine that
 builds it (`kvm_amd`/`kvm_intel` with `nested=1`). The test runs the default
-app, T3 Code, which is not in a binary cache, so the first build compiles
-it.
+app, T3 Code, from llm-agents.nix: with `https://cache.numtide.com` among
+the substituters, it is downloaded rather than built.

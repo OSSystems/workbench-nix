@@ -17,5 +17,5 @@ jobs:
     runs-on: octocat-microvm
     steps:
       - uses: actions/checkout@v6
-      - run: nix flake check -L
+      - run: nix flake check -L --accept-flake-config
       - run: nix fmt -- --check $(git ls-files '*.nix')
