@@ -419,6 +419,9 @@ pkgs.testers.runNixOSTest {
         assert packages == config["packages"], packages
         guest("bob", f"nix-store --verify-path {packages}")
         assert guest("bob", "readlink /nix/var/nix/gcroots/workspace-app").strip() == packages
+        agent = guest("bob", "readlink /run/workspace/config/agent").strip()
+        assert agent == config["agent"], agent
+        assert guest("bob", "readlink /nix/var/nix/gcroots/workspace-agent").strip() == agent
         bundle = config["apps"][0]["bundle"]
         assert guest("bob", "readlink /nix/var/nix/gcroots/workspace-app-t3code").strip() == bundle
         assert guest("bob", "hostname").strip() == "bob"

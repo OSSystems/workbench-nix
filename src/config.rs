@@ -75,10 +75,14 @@ pub struct Config {
     pub closure: String,
     /// Their validity, for a guest that copies them into a store of its own.
     pub registration: String,
-    /// The workspace's packages and its agent, which the guest finds at
-    /// `config/app`, the name it had when it was the one app.
+    /// The workspace's packages, which the guest finds at `config/app`,
+    /// the name it had when it was the one app.
     #[serde(alias = "app")]
     pub packages: String,
+    /// The agent, which the guest finds at `config/agent`. Not in a config
+    /// from before it was apart: the packages had it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
     /// The apps it runs, each at `<name>--<id>.<domain>`.
     pub apps: Vec<BootApp>,
     /// Only in a config from before apps, whose one app listened here: the
@@ -157,6 +161,10 @@ impl Config {
         ] {
             ensure!(is_clean_path(path), "{field} must be a clean absolute path without commas");
         }
+        ensure!(
+            self.agent.is_empty() || is_clean_path(&self.agent),
+            "agent must be a clean absolute path without commas"
+        );
         match self.os.as_str() {
             "ubuntu" => {
                 ensure!(
@@ -393,6 +401,7 @@ pub(crate) mod tests {
             closure: "/nix/store/x-closure/store-paths".into(),
             registration: "/nix/store/x-closure/registration".into(),
             packages: "/nix/store/x-packages".into(),
+            agent: "/nix/store/x-agent".into(),
             apps: vec![BootApp {
                 id: "t3code".into(),
                 name: "T3 Code".into(),

@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+use std::{fs, io};
 
 use anyhow::{Context, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,11 @@ pub const GUEST_PACKAGES: &str = "/run/workspace/config/app";
 /// `bin/serve`, and may have `bin/open-link`, a hook that, run as the owner,
 /// prints one URL that signs a browser in to the app, and nothing else.
 pub const GUEST_APPS: &str = "/run/workspace/config/apps";
+/// Where the guest mounts what the host shares: the packages, the agent
+/// at `agent` and the apps.
+const GUEST_CONFIG: &str = "/run/workspace/config";
+/// Where a guest with a Nix store of its own keeps its GC roots.
+const GC_ROOTS: &str = "/nix/var/nix/gcroots";
 /// The largest request the agent reads.
 const MAX_REQUEST: u64 = 64 << 10;
 /// The largest reply the host reads.
@@ -71,6 +77,9 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     let raw = hostutil::read_bounded(config_path, 1 << 20).with_context(|| config_path.display().to_string())?;
     let gc: GuestConfig = serde_json::from_slice(&raw).context("workspace.json")?;
     configure_hotplug();
+    if let Err(e) = root_shared(Path::new(GUEST_CONFIG), Path::new(GC_ROOTS)) {
+        eprintln!("rooting the agent and the apps: {e}");
+    }
     let control_port = u32::try_from(gc.control_port).context("controlPort")?;
     let agent_port = u32::try_from(gc.agent_port).context("agentPort")?;
     tokio::spawn(report_stats(control_port));
@@ -90,6 +99,45 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Keeps the agent and the apps' bundles in a guest's own store, which has
+/// a copy of them: the packages refer to neither, and a guest module from
+/// before roots only the packages. Roots of apps the VM no longer has go.
+/// Nothing to do without a store.
+fn root_shared(config: &Path, gcroots: &Path) -> io::Result<()> {
+    if !gcroots.is_dir() {
+        return Ok(());
+    }
+    let mut roots = Vec::new();
+    match fs::read_link(config.join("agent")) {
+        Ok(target) => roots.push(("workspace-agent".to_owned(), target)),
+        // A host from before the agent was apart shares none.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if let Ok(apps) = fs::read_dir(config.join("apps")) {
+        // One the host shares wrong roots nothing, and keeps nothing else
+        // from being rooted.
+        for app in apps.flatten() {
+            if let Ok(target) = fs::read_link(app.path()) {
+                roots.push((format!("workspace-app-{}", app.file_name().to_string_lossy()), target));
+            }
+        }
+    }
+    for old in fs::read_dir(gcroots)? {
+        let name = old?.file_name().to_string_lossy().into_owned();
+        if name.starts_with("workspace-app-") && !roots.iter().any(|(n, _)| *n == name) {
+            fs::remove_file(gcroots.join(&name))?;
+        }
+    }
+    let tmp = gcroots.join(".workspace-root.tmp");
+    for (name, target) in roots {
+        let _ = fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(&target, &tmp)?;
+        fs::rename(&tmp, gcroots.join(name))?;
+    }
+    Ok(())
 }
 
 /// Starts each app as a unit of its own, as the owner, the way one of the
@@ -349,6 +397,50 @@ mod tests {
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     use tokio::net::UnixListener;
+
+    /// The agent roots itself in a guest's own store, and only there.
+    #[test]
+    fn shared_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, gcroots) = (tmp.path().join("config"), tmp.path().join("gcroots"));
+        fs::create_dir_all(config.join("apps")).unwrap();
+        root_shared(&config, &gcroots).unwrap();
+        fs::create_dir(&gcroots).unwrap();
+        std::os::unix::fs::symlink("/nix/store/p-packages", gcroots.join("workspace-app")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/o-old", gcroots.join("workspace-app-old")).unwrap();
+        root_shared(&config, &gcroots).unwrap();
+        let roots = || {
+            let mut r: Vec<_> = fs::read_dir(&gcroots)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (e.file_name().into_string().unwrap(), fs::read_link(e.path()).unwrap())
+                })
+                .collect();
+            r.sort();
+            r
+        };
+        assert_eq!(roots(), [("workspace-app".into(), "/nix/store/p-packages".into())], "a host that shares no agent");
+        for (agent, t3) in
+            [("/nix/store/x-agent", "/nix/store/x-t3code"), ("/nix/store/y-agent", "/nix/store/y-t3code")]
+        {
+            for (link, to) in [(config.join("agent"), agent), (config.join("apps/t3code"), t3)] {
+                let _ = fs::remove_file(&link);
+                std::os::unix::fs::symlink(to, link).unwrap();
+            }
+            fs::create_dir_all(config.join("apps/broken")).unwrap();
+            root_shared(&config, &gcroots).unwrap();
+            assert_eq!(
+                roots(),
+                [
+                    ("workspace-agent".into(), PathBuf::from(agent)),
+                    ("workspace-app".into(), "/nix/store/p-packages".into()),
+                    ("workspace-app-t3code".into(), PathBuf::from(t3)),
+                ],
+                "the packages' root is the guest module's"
+            );
+        }
+    }
 
     /// The ping names the apps with a hook; a link needs one, of an app
     /// the VM booted with.

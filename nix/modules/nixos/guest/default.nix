@@ -163,6 +163,10 @@ in
         fi
         nix-store --load-db < ${configDir}/registration
         ln -sfn "$(readlink ${app})" /nix/var/nix/gcroots/workspace-app
+        rm -f /nix/var/nix/gcroots/workspace-agent
+        if [ -e ${configDir}/agent ]; then
+          ln -sfn "$(readlink ${configDir}/agent)" /nix/var/nix/gcroots/workspace-agent
+        fi
         rm -f /nix/var/nix/gcroots/workspace-app-*
         for bundle in ${configDir}/apps/*; do
           if [ -e "$bundle" ]; then
