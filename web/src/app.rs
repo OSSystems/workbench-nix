@@ -56,6 +56,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 pub fn App() -> impl IntoView {
     provide_meta_context();
     provide_context(Opened(RwSignal::new(HashSet::new())));
+    close_menus_outside();
     view! {
         <Router>
             <Routes fallback=|| view! { <Forbidden viewer=None /> }>
@@ -1288,6 +1289,33 @@ fn AppsForm(
             <div class="acts">{cancel} {save}</div>
         </form>
     }
+}
+
+/// The menus, the ⋯ of an app and the viewer's, close as a press lands
+/// outside them, or on Escape, like any other menu.
+fn close_menus_outside() {
+    use wasm_bindgen::JsCast;
+    let close = |inside: Option<web_sys::Node>| {
+        let Ok(open) = document().query_selector_all("details.more[open], details.me[open]") else { return };
+        for i in 0..open.length() {
+            let Some(menu) = open.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) else { continue };
+            if !inside.as_ref().is_some_and(|n| menu.contains(Some(n))) {
+                let _ = menu.remove_attribute("open");
+            }
+        }
+    };
+    let press = window_event_listener(leptos::ev::pointerdown, move |e| {
+        close(e.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok()));
+    });
+    let escape = window_event_listener(leptos::ev::keydown, move |e| {
+        if e.key() == "Escape" {
+            close(None);
+        }
+    });
+    on_cleanup(move || {
+        press.remove();
+        escape.remove();
+    });
 }
 
 /// Follows `/events`: every message is the viewer's snapshot.
