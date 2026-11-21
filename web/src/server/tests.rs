@@ -96,6 +96,7 @@ impl Backend for Fake {
                 name: "Herdr".into(),
                 port: None,
                 bundle: "/nix/store/x-herdr".into(),
+                oneshot: false,
             });
         }
         Ok(Config {
@@ -144,7 +145,13 @@ impl Backend for Fake {
 }
 
 fn t3code() -> BootApp {
-    BootApp { id: "t3code".into(), name: "T3 Code".into(), port: Some(3773), bundle: "/nix/store/x-t3code".into() }
+    BootApp {
+        id: "t3code".into(),
+        name: "T3 Code".into(),
+        port: Some(3773),
+        bundle: "/nix/store/x-t3code".into(),
+        oneshot: false,
+    }
 }
 
 fn state(fake: Fake) -> AppState {

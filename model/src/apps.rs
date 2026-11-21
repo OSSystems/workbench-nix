@@ -71,6 +71,10 @@ pub struct BootApp {
     pub port: Option<u16>,
     /// Its bundle: a new one is a new version.
     pub bundle: String,
+    /// Its `serve` starts what it runs and ends, rather than serving until
+    /// it is stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oneshot: bool,
 }
 
 impl Boot {
@@ -117,7 +121,7 @@ pub fn changes(running: Option<&Boot>, next: &Boot) -> Vec<Change> {
     for app in &next.apps {
         match running.app(&app.id) {
             None => out.push(Change::AppAdded { app: app.id.clone() }),
-            Some(r) if r.bundle != app.bundle || r.port != app.port => {
+            Some(r) if r.bundle != app.bundle || r.port != app.port || r.oneshot != app.oneshot => {
                 out.push(Change::AppUpdated { app: app.id.clone() });
             }
             Some(_) => {}
@@ -216,7 +220,7 @@ mod tests {
     use super::*;
 
     fn app(id: &str, bundle: &str) -> BootApp {
-        BootApp { id: id.into(), name: id.to_uppercase(), port: Some(3773), bundle: bundle.into() }
+        BootApp { id: id.into(), name: id.to_uppercase(), port: Some(3773), bundle: bundle.into(), oneshot: false }
     }
 
     fn boot(packages: &str, apps: &[BootApp]) -> Boot {
@@ -251,6 +255,8 @@ mod tests {
         );
         let moved = boot("/nix/store/p1", &[BootApp { port: Some(8080), ..t3.clone() }]);
         assert_eq!(changes(Some(&next), &moved), [Change::AppUpdated { app: "t3code".into() }], "a new port too");
+        let oneshot = boot("/nix/store/p1", &[BootApp { oneshot: true, ..t3.clone() }]);
+        assert_eq!(changes(Some(&next), &oneshot), [Change::AppUpdated { app: "t3code".into() }], "another kind");
         let unaddressed = boot("/nix/store/p1", &[BootApp { port: None, ..t3 }]);
         assert_eq!(
             changes(Some(&next), &unaddressed),

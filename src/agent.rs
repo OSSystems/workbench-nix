@@ -39,6 +39,9 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_OUTPUT: u64 = 64 << 10;
 /// How often the guest reports its memory.
 const STATS_EVERY: Duration = Duration::from_secs(2);
+/// How long the agent waits for the owner's account, which a NixOS guest
+/// makes as it boots, before it starts the apps without it.
+const OWNER_WAIT: Duration = Duration::from_secs(300);
 
 /// What the host asks the agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +87,11 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     let agent_port = u32::try_from(gc.agent_port).context("agentPort")?;
     tokio::spawn(report_stats(control_port));
     let listener = vsock::listen(agent_port)?;
-    start_apps(&gc).await;
+    // The host's requests are answered while the apps wait for the owner.
+    tokio::spawn({
+        let gc = gc.clone();
+        async move { start_apps(&gc).await }
+    });
     loop {
         match listener.accept().await {
             Ok((conn, _)) => {
@@ -144,8 +151,9 @@ fn root_shared(config: &Path, gcroots: &Path) -> io::Result<()> {
 /// guest's services would run: systemd keeps it up and its journal is the
 /// app's. A unit an agent that ran before started stays as it is.
 async fn start_apps(gc: &GuestConfig) {
+    let owner = owner_of(&gc.owner).await;
     for app in &gc.apps {
-        let argv = app_unit_argv(gc, app, &home_of(&gc.owner));
+        let argv = app_unit_argv(gc, app, &owner);
         let out = tokio::process::Command::new("systemd-run")
             .args(&argv)
             .env_clear()
@@ -161,20 +169,39 @@ async fn start_apps(gc: &GuestConfig) {
     }
 }
 
-/// The owner's home, or where it will be: a NixOS guest makes the owner
-/// after the agent starts.
-fn home_of(owner: &str) -> String {
-    match nix::unistd::User::from_name(owner) {
-        Ok(Some(u)) => u.dir.to_string_lossy().into_owned(),
-        _ => format!("/home/{owner}"),
+/// The owner as the apps' units need them: their home, and their uid for
+/// their user manager and its runtime directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Owner {
+    pub home: String,
+    pub uid: Option<u32>,
+}
+
+/// The owner's account, once it exists: a NixOS guest makes it as it
+/// boots, after the agent starts. Without one in time, where their home
+/// will be.
+async fn owner_of(name: &str) -> Owner {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(Some(u)) = nix::unistd::User::from_name(name) {
+            return Owner { home: u.dir.to_string_lossy().into_owned(), uid: Some(u.uid.as_raw()) };
+        }
+        if start.elapsed() > OWNER_WAIT {
+            eprintln!("no account {name:?} yet: starting the apps without its user manager");
+            return Owner { home: format!("/home/{name}"), uid: None };
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
 /// `systemd-run`'s arguments for an app's unit, `workspace-app-<id>`: its
 /// bundle's `bin/serve`, as the owner in their home, with the workspace's
-/// environment and secrets, and `APP_PORT` and `APP_URL` for an app with an
-/// address.
-pub(crate) fn app_unit_argv(gc: &GuestConfig, app: &GuestApp, home: &str) -> Vec<String> {
+/// environment and secrets, their user manager's runtime directory, and
+/// `APP_PORT` and `APP_URL` for an app with an address. systemd restarts a
+/// server when it ends; a oneshot app's `serve` starts what it runs, such
+/// as user services, and its unit stays active once it is done.
+pub(crate) fn app_unit_argv(gc: &GuestConfig, app: &GuestApp, owner: &Owner) -> Vec<String> {
+    let home = &owner.home;
     let path = format!(
         "{GUEST_PACKAGES}/sw/bin:{home}/.nix-profile/bin:/etc/profiles/per-user/{owner}/bin:/run/wrappers/bin:\
          /run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin",
@@ -188,9 +215,6 @@ pub(crate) fn app_unit_argv(gc: &GuestConfig, app: &GuestApp, home: &str) -> Vec
         "--property=WorkingDirectory=~".into(),
         "--property=After=workspace-init.service network-online.target".into(),
         "--property=Wants=network-online.target".into(),
-        "--property=Restart=always".into(),
-        "--property=RestartSec=5".into(),
-        "--property=StartLimitIntervalSec=0".into(),
         "--property=KillMode=mixed".into(),
         "--property=EnvironmentFile=/run/workspace/config/environment".into(),
         "--property=EnvironmentFile=-/run/workspace/secrets/environment".into(),
@@ -198,6 +222,24 @@ pub(crate) fn app_unit_argv(gc: &GuestConfig, app: &GuestApp, home: &str) -> Vec
         format!("--setenv=WORKSPACE_URL={}", gc.url),
     ]
     .into();
+    if app.oneshot {
+        argv.extend(
+            ["--property=Type=oneshot", "--property=RemainAfterExit=yes", "--property=TimeoutStartSec=5min"]
+                .map(String::from),
+        );
+    } else {
+        argv.extend(
+            ["--property=Restart=always", "--property=RestartSec=5", "--property=StartLimitIntervalSec=0"]
+                .map(String::from),
+        );
+    }
+    // The owner lingers, so their user manager runs from boot; an app may
+    // start user services through it.
+    if let Some(uid) = owner.uid {
+        argv.push(format!("--property=Wants=user@{uid}.service"));
+        argv.push(format!("--property=After=user@{uid}.service"));
+        argv.push(format!("--setenv=XDG_RUNTIME_DIR=/run/user/{uid}"));
+    }
     if let (Some(port), Some(url)) = (app.port, &app.url) {
         argv.push(format!("--setenv=APP_PORT={port}"));
         argv.push(format!("--setenv=APP_URL={url}"));
@@ -472,7 +514,8 @@ mod tests {
     #[test]
     fn app_units() {
         let gc = GuestConfig::of(&test_config());
-        let argv = app_unit_argv(&gc, &gc.apps[0], "/home/alice");
+        let owner = Owner { home: "/home/alice".into(), uid: Some(1000) };
+        let argv = app_unit_argv(&gc, &gc.apps[0], &owner);
         assert_eq!(argv[0], "--unit=workspace-app-t3code");
         assert_eq!(argv.last().unwrap(), "/run/workspace/config/apps/t3code/bin/serve");
         for want in [
@@ -480,12 +523,23 @@ mod tests {
             "--setenv=APP_PORT=3773",
             "--setenv=APP_URL=https://alice-dev--t3code.ws.test",
             "--property=EnvironmentFile=-/run/workspace/secrets/environment",
+            "--property=Restart=always",
+            "--property=After=user@1000.service",
+            "--setenv=XDG_RUNTIME_DIR=/run/user/1000",
         ] {
             assert!(argv.iter().any(|a| a == want), "{want} missing from {argv:?}");
         }
-        let herdr = GuestApp { id: "herdr".into(), name: "Herdr".into(), port: None, url: None };
-        let argv = app_unit_argv(&gc, &herdr, "/home/alice");
+        assert!(!argv.iter().any(|a| a.contains("Type=oneshot")), "{argv:?}");
+        let herdr = GuestApp { id: "herdr".into(), name: "Herdr".into(), port: None, url: None, oneshot: true };
+        let argv = app_unit_argv(&gc, &herdr, &owner);
         assert!(!argv.iter().any(|a| a.starts_with("--setenv=APP_")), "an app without an address: {argv:?}");
+        for want in ["--property=Type=oneshot", "--property=RemainAfterExit=yes"] {
+            assert!(argv.iter().any(|a| a == want), "{want} missing from {argv:?}");
+        }
+        assert!(!argv.iter().any(|a| a.contains("Restart")), "a oneshot app isn't restarted: {argv:?}");
+        // An owner not made yet has no user manager to wait for.
+        let argv = app_unit_argv(&gc, &gc.apps[0], &Owner { home: "/home/alice".into(), uid: None });
+        assert!(!argv.iter().any(|a| a.contains("user@") || a.contains("XDG_RUNTIME_DIR")), "{argv:?}");
     }
 
     #[tokio::test]

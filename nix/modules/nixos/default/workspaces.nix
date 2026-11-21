@@ -137,7 +137,7 @@ let
   ) cfg.apps;
   appConfig = id: {
     inherit id;
-    inherit (cfg.apps.${id}) name port;
+    inherit (cfg.apps.${id}) name port oneshot;
     bundle = "${appBundles.${id}}";
   };
 
@@ -189,9 +189,20 @@ let
         description = ''
           Shell script run at every boot as the owner, in their home, that
           serves the app, on `$APP_PORT` if it has a port; systemd restarts
-          it when it ends. It has the workspace's environment and secrets,
-          the workspace's packages on its PATH, and the app's address in
-          `APP_URL`.
+          it when it ends, unless the app is `oneshot`. It has the
+          workspace's environment and secrets, the workspace's packages on
+          its PATH, the app's address in `APP_URL`, and the owner's user
+          manager, which lingers, at `XDG_RUNTIME_DIR`.
+        '';
+      };
+      oneshot = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Whether `serve` starts what the app runs and ends, such as user
+          services of the owner's, rather than serving until it is
+          stopped. Its unit stays active once `serve` is done, and is
+          never restarted.
         '';
       };
       openLink = mkOption {
@@ -314,6 +325,12 @@ let
         }
       ];
       runcmd = [
+        # The owner's user manager runs from boot, for the apps.
+        [
+          "loginctl"
+          "enable-linger"
+          ws.owner
+        ]
         [
           "systemctl"
           "daemon-reload"

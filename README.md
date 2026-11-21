@@ -128,9 +128,10 @@ up and where the apps' closure lives.
 ### Ubuntu
 
 A Nix-built cloud-init NoCloud seed, attached as a second disk, creates the
-`owner` account (optionally with passwordless `sudo`) and its SSH keys, the
-network, the virtiofs mounts and the agent and app services. The app's
-closure is mounted at `/nix/store` itself, so it costs the guest nothing.
+`owner` account (optionally with passwordless `sudo`) and its SSH keys,
+lets it linger, so its user manager runs from boot, and writes the network,
+the virtiofs mounts and the agent's service. The app's closure is mounted
+at `/nix/store` itself, so it costs the guest nothing.
 
 ### NixOS
 
@@ -177,6 +178,8 @@ writes the flake it is rebuilt from:
   users.users."carol" = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
+    # The user manager runs from boot, for the workspace's apps.
+    linger = true;
   };
 
   environment.systemPackages = with pkgs; [ git vim ];
@@ -214,8 +217,9 @@ workspace; the menu waits `boot.loader.timeout`, one second by default.
   roots `/nix/var/nix/gcroots/workspace-app`, `workspace-app-<id>` and
   `workspace-agent`, which the agent also makes as it starts, for guests
   set up with an older `nixosModules.guest`;
-- creates the owner's account in `wheel` if it does not exist yet, and
-  writes `/etc/nixos` on a new disk;
+- creates the owner's account in `wheel` if it does not exist yet, lets it
+  linger unless the system's configuration says otherwise, and writes
+  `/etc/nixos` on a new disk;
 - lets sshd read the owner's keys from the config share, with passwords off;
 - starts `workspace-agent.service`, which reports memory, makes sign-in
   links and runs each app as the owner with the workspace's environment, as
@@ -357,6 +361,9 @@ comes with its next restart, and the web UI says what waits for it.
   nothing of it, and its panel has no **Open**.
 - **`default = false`** makes an app people opt into: a workspace has it
   when its `apps` names it, and the New workspace form leaves it unticked.
+- **`oneshot = true`** makes `serve` start what the app runs and end, such
+  as services of the owner's user manager, which runs from boot. Its unit
+  stays active and is never restarted.
 
 ### T3 Code
 

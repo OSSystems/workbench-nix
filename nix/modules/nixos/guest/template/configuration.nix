@@ -11,6 +11,8 @@
   users.users."@owner@" = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
+    # The user manager runs from boot, for the workspace's apps.
+    linger = true;
   };
 
   environment.systemPackages = with pkgs; [
