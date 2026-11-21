@@ -60,6 +60,15 @@ The config share, `/run/workspace/config`, holds besides `workspace.json`:
 | `apps/<id>` | An app's bundle: `bin/serve`, and `bin/open-link` when it signs browsers in. |
 | `store-paths`, `registration` | The closure of all of them, which a NixOS guest copies into its store. |
 | `authorized_keys/<owner>`, `environment` | The owner's SSH keys and the non-secret environment. |
+| `ssh/user-ca.pub` | The host's user CA, which sshd trusts (`TrustedUserCAKeys`) for keys signed for the owner by name. |
+| `ssh/principals/<owner>` | The one principal a certificate signs in with, the owner's name (`AuthorizedPrincipalsFile`); no other account has one. |
+
+The secrets share, `/run/workspace/secrets`, holds a copy of the
+workspace's secrets directory, its `environment` file, and the host's
+`ssh-host/`: the guest's SSH host key, `ssh_host_ed25519_key`, root's
+only, with its public key and a certificate for the workspace's address,
+signed by the host CA at every start. sshd serves it as one of its host
+keys. A secrets directory's own `ssh-host` is not copied.
 
 The agent starts each app at boot with `systemd-run`, as the unit
 `workspace-app-<id>`: its `bin/serve`, as the owner in their home, with

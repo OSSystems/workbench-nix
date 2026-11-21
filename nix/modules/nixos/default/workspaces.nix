@@ -17,6 +17,17 @@ let
   exe = lib.getExe' package "workbench";
 
   hostAddress = "${cfg.network.subnet}.1";
+  # The host's SSH certificate authorities: one signs the guests' host
+  # keys, at every start, the other people's keys, in the web UI; each
+  # private key is readable by its signer only.
+  sshDir = "${cfg.stateDir}/ssh";
+  sshCa = {
+    keygen = "${pkgs.openssh}/bin/ssh-keygen";
+    hostCa = "${sshDir}/host-ca";
+    userCa = "${sshDir}/user-ca.pub";
+    hostKeys = "${sshDir}/hosts";
+  };
+  userCaSigner = if cfg.web.enable then "workbench-web" else "root";
   controlPort = 5001;
   agentPort = 5002;
 
@@ -364,6 +375,20 @@ let
           path = "/etc/modules-load.d/workbench.conf";
           content = "virtiofs\nvirtio_mem\n";
         }
+        # The host signs a host key for the workspace's address, and the
+        # keys of the person it is for.
+        {
+          path = "/etc/ssh/sshd_config.d/10-workbench.conf";
+          content = ''
+            HostKey /etc/ssh/ssh_host_ed25519_key
+            HostKey /etc/ssh/ssh_host_ecdsa_key
+            HostKey /etc/ssh/ssh_host_rsa_key
+            HostKey /run/workspace/secrets/ssh-host/ssh_host_ed25519_key
+            HostCertificate /run/workspace/secrets/ssh-host/ssh_host_ed25519_key-cert.pub
+            TrustedUserCAKeys /run/workspace/config/ssh/user-ca.pub
+            AuthorizedPrincipalsFile /run/workspace/config/ssh/principals/%u
+          '';
+        }
         {
           path = "/etc/profile.d/workbench.sh";
           content = ''
@@ -505,6 +530,7 @@ let
       ];
       secretsDir = secretsDirOf name ws;
       inherit controlPort agentPort;
+      ssh = sshCa;
     }
     // lib.optionalAttrs cfg.web.enable { socketGroup = "workbench"; }
     // (
@@ -605,6 +631,7 @@ let
       mcopy = "${pkgs.mtools}/bin/mcopy";
       inherit (ss) environmentCommand;
       ownerCommand = if ss.ownerCommand == null then "" else ss.ownerCommand;
+      ssh = sshCa;
     };
   selfServiceUnit = description: args: {
     inherit description;
@@ -960,10 +987,11 @@ in
             assertion =
               builtins.match "[a-z]([a-z0-9-]{0,26}[a-z0-9])?" name != null
               && !lib.hasInfix "--" name
+              && name != "ssh"
               && builtins.match "[a-z_][a-z0-9_.-]{0,31}" ws.owner != null
               && ws.owner != "root"
               && inSubnet ws.ip;
-            message = "services.workbench.workspaces.${name}: the name must be a DNS label of at most 28 characters without `--`, the owner a user name other than root, and ip an address in ${cfg.network.subnet}.2-254.";
+            message = "services.workbench.workspaces.${name}: the name must be a DNS label of at most 28 characters without `--`, other than `ssh`, whose state directory holds the SSH CAs, the owner a user name other than root, and ip an address in ${cfg.network.subnet}.2-254.";
           }) cfg.workspaces
           ++ lib.mapAttrsToList (name: ws: {
             assertion = ws.os == "nixos" -> ws.sudo;
@@ -1001,7 +1029,11 @@ in
           services = {
             "workbench@" = {
               description = "Workspace VM %i";
-              after = [ "systemd-networkd.service" ];
+              after = [
+                "systemd-networkd.service"
+                "workbench-ssh-ca.service"
+              ];
+              wants = [ "workbench-ssh-ca.service" ];
               restartIfChanged = false;
               # `workbench stop` leaves this marker so a stopped workspace stays
               # stopped across reboots; `workbench start` removes it.
@@ -1022,6 +1054,31 @@ in
                 CPUAccounting = true;
                 MemoryAccounting = true;
               };
+            };
+
+            # Made once; the guests' host keys are made at their first start.
+            workbench-ssh-ca = {
+              description = "The SSH certificate authorities of workspaces";
+              wantedBy = [ "multi-user.target" ];
+              before = [ "workbench-web.service" ];
+              path = [ pkgs.openssh ];
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+              };
+              script = ''
+                install -d -m 0755 ${sshDir}
+                install -d -m 0700 ${sshCa.hostKeys}
+                for ca in host user; do
+                  if [ ! -e ${sshDir}/$ca-ca ]; then
+                    ssh-keygen -q -t ed25519 -N "" -C "workbench $ca CA of ${cfg.domain}" -f ${sshDir}/$ca-ca
+                  fi
+                  chmod 0644 ${sshDir}/$ca-ca.pub
+                done
+                chown root:root ${sshDir}/host-ca
+                chown ${userCaSigner}:root ${sshDir}/user-ca
+                chmod 0400 ${sshDir}/host-ca ${sshDir}/user-ca
+              '';
             };
 
             workbench-memory = {

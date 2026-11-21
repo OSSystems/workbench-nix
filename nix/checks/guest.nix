@@ -47,4 +47,11 @@ assert lib.all (u: units ? ${u}) [
 assert !(units ? workspace-app);
 assert lib.elem "/run/workspace/config/authorized_keys/%u"
   config.services.openssh.authorizedKeysFiles;
+assert
+  config.services.openssh.settings.TrustedUserCAKeys == "/run/workspace/config/ssh/user-ca.pub";
+assert
+  config.services.openssh.settings.AuthorizedPrincipalsFile
+  == "/run/workspace/config/ssh/principals/%u";
+assert lib.hasInfix "HostCertificate /run/workspace/secrets/ssh-host/"
+  config.services.openssh.extraConfig;
 pkgs.writeText "guest" (builtins.unsafeDiscardStringContext config.system.build.toplevel.drvPath)

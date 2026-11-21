@@ -108,6 +108,52 @@ pub struct Config {
     /// record the host writes with it.
     #[serde(skip_serializing_if = "is_zero")]
     pub uid: u32,
+
+    /// The host's SSH certificate authorities: none in a config from
+    /// before them.
+    #[serde(skip_serializing_if = "SshCa::is_empty")]
+    pub ssh: SshCa,
+}
+
+/// The host's SSH certificate authorities. The guest's host key, which the
+/// host keeps, is signed by one at every start, so people's SSH clients
+/// know the workspace; the guest trusts keys the other signed, for the
+/// person named in them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct SshCa {
+    /// `ssh-keygen`, which signs.
+    pub keygen: String,
+    /// The host CA's private key, root's.
+    pub host_ca: String,
+    /// The user CA's public key.
+    pub user_ca: String,
+    /// Where the guests' host keys are kept, root's, each in a directory
+    /// named after its workspace.
+    pub host_keys: String,
+}
+
+impl SshCa {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == SshCa::default()
+    }
+
+    /// None at all, or every path.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        for (field, path) in [
+            ("keygen", &self.keygen),
+            ("hostCa", &self.host_ca),
+            ("userCa", &self.user_ca),
+            ("hostKeys", &self.host_keys),
+        ] {
+            ensure!(is_clean_path(path), "ssh.{field} must be a clean absolute path without commas");
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -165,6 +211,7 @@ impl Config {
             self.agent.is_empty() || is_clean_path(&self.agent),
             "agent must be a clean absolute path without commas"
         );
+        self.ssh.validate()?;
         match self.os.as_str() {
             "ubuntu" => {
                 ensure!(
@@ -283,6 +330,19 @@ impl Config {
     #[must_use]
     pub fn boot(&self) -> Boot {
         Boot { packages: self.packages.clone(), apps: self.apps.clone() }
+    }
+
+    /// The address the guest's SSH host certificate names: the workspace's.
+    #[must_use]
+    pub fn host_name(&self) -> &str {
+        let rest = self.url.split_once("://").map_or(self.url.as_str(), |(_, r)| r);
+        rest.split(['/', ':']).next().unwrap_or(rest)
+    }
+
+    /// Where the host keeps the guest's SSH host key, if it signs one.
+    #[must_use]
+    pub fn host_key_dir(&self) -> Option<PathBuf> {
+        (!self.ssh.is_empty()).then(|| Path::new(&self.ssh.host_keys).join(&self.name))
     }
 
     /// The host side of the guest's control port.
@@ -422,6 +482,12 @@ pub(crate) mod tests {
             socket_group: String::new(),
             self_service: false,
             uid: 0,
+            ssh: SshCa {
+                keygen: "/nix/store/x-openssh/bin/ssh-keygen".into(),
+                host_ca: "/var/lib/workbench/ssh/host-ca".into(),
+                user_ca: "/var/lib/workbench/ssh/user-ca.pub".into(),
+                host_keys: "/var/lib/workbench/ssh/hosts".into(),
+            },
         }
     }
 
@@ -471,6 +537,8 @@ pub(crate) mod tests {
             ("env name", |c| c.environment = [("A-B".into(), "x".into())].into()),
             ("relative env file", |c| c.environment_files = vec!["keys.env".into()]),
             ("long runtime dir", |c| c.runtime_dir = format!("/run/{}", "x".repeat(100))),
+            ("relative ssh-keygen", |c| c.ssh.keygen = "ssh-keygen".into()),
+            ("half the CAs", |c| c.ssh.host_ca = String::new()),
         ];
         for (name, change) in changes {
             let mut c = test_config();
@@ -483,6 +551,11 @@ pub(crate) mod tests {
             terminal.apps.push(BootApp { id: id.into(), port: None, ..terminal.apps[0].clone() });
         }
         terminal.validate().unwrap();
+        let old = Config { ssh: SshCa::default(), ..test_config() };
+        old.validate().unwrap();
+        assert!(serde_json::to_value(&old).unwrap().get("ssh").is_none(), "a config from before the CAs");
+        assert_eq!(test_config().host_name(), "alice-dev.ws.test");
+        assert_eq!(test_config().host_key_dir().unwrap(), Path::new("/var/lib/workbench/ssh/hosts/alice-dev"));
     }
 
     /// A config written before apps: its app and port, and nothing else,

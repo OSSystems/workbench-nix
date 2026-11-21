@@ -6,6 +6,8 @@ pkgs.mkShell {
     rustc
     rustfmt
     rust-analyzer
+    # The tests sign SSH keys as the host does.
+    openssh
     # The web UI's WebAssembly.
     lld
     wasm-bindgen-cli_0_2_126

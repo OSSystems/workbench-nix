@@ -16,6 +16,8 @@ flake.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
   nativeBuildInputs = old.nativeBuildInputs ++ [
     pkgs.clippy
     pkgs.rustfmt
+    # The tests sign SSH keys as the host does.
+    pkgs.openssh
   ];
   doCheck = true;
   # The web UI builds twice: its server, and its WebAssembly.
