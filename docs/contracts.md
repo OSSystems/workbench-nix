@@ -7,7 +7,7 @@ What the host exchanges with a workspace's guest. The tests in
   keeps at the version its owner last rebuilt with, a few releases behind
   the host perhaps. It changes with care: fields are added, not renamed or
   removed, and readers ignore what they do not know.
-- The agent comes with the packages bundle the host shares, so it is the
+- The agent is the one the host shares at every start, so it is the
   version of the host that started the VM, and so are its requests: they
   change with workbench. A host newer than the VM's agent finds no app it
   knows of in it, and says the apps come with its next restart.
@@ -55,7 +55,8 @@ The config share, `/run/workspace/config`, holds besides `workspace.json`:
 
 | Path | What |
 |---|---|
-| `app` | The workspace's packages: `sw/` on everyone's PATH, `bin/workspace-agent`, and `bin/serve`, which only waits: guests set up before apps run it as the owner. |
+| `app` | The workspace's packages: `sw/` on everyone's PATH, `bin/workspace-agent`, which starts `agent/bin/workspace-agent`, and `bin/serve`, which only waits: guests set up before apps run it as the owner. A newer workbench leaves it as it is. |
+| `agent` | The agent: `bin/workspace-agent`. A host from before it was apart shares none, and its `app/bin/workspace-agent` is the agent. |
 | `apps/<id>` | An app's bundle: `bin/serve`, and `bin/open-link` when it signs browsers in. |
 | `store-paths`, `registration` | The closure of all of them, which a NixOS guest copies into its store. |
 | `authorized_keys/<owner>`, `environment` | The owner's SSH keys and the non-secret environment. |

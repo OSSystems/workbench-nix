@@ -85,10 +85,11 @@ let
     max = (if ws.memory.maxGiB != null then ws.memory.maxGiB else cfg.memory.maxGiB) * 1024;
   };
 
-  # A workspace's packages, those of its apps among them, and its agent:
-  # what the guest finds at config/app. Guests set up before apps were apps
-  # run its `bin/serve` as the owner; it only waits, as the agent runs the
-  # apps now.
+  # A workspace's packages, those of its apps among them: what the guest
+  # finds at config/app. Its `bin/workspace-agent` starts the agent at
+  # config/agent, so the bundle stays the same when only workbench is
+  # newer. Guests set up before apps were apps run its `bin/serve` as the
+  # owner; it only waits, as the agent runs the apps now.
   packagesOf =
     name: extraPackages: apps:
     let
@@ -102,7 +103,7 @@ let
       ln -s ${sw} $out/sw
       cat > $out/bin/workspace-agent <<EOF
       #!${pkgs.runtimeShell}
-      exec ${exe} guest-agent --config=/run/workspace/config/workspace.json
+      exec /run/workspace/config/agent/bin/workspace-agent
       EOF
       cat > $out/bin/serve <<EOF
       #!${pkgs.runtimeShell}
@@ -110,6 +111,17 @@ let
       EOF
       chmod +x $out/bin/workspace-agent $out/bin/serve
     '';
+
+  # The agent, the same for every workspace: what the guest finds at
+  # config/agent.
+  agent = pkgs.runCommand "workbench-agent" { } ''
+    mkdir -p $out/bin
+    cat > $out/bin/workspace-agent <<EOF
+    #!${pkgs.runtimeShell}
+    exec ${exe} guest-agent --config=/run/workspace/config/workspace.json
+    EOF
+    chmod +x $out/bin/workspace-agent
+  '';
 
   # An app's bundle, which the guest finds at config/apps/<id>: its
   # `bin/serve`, and `bin/open-link` if it signs browsers in.
@@ -345,7 +357,13 @@ let
     name: ws:
     let
       packages = packagesOf name ws.extraPackages ws.apps;
-      closure = pkgs.closureInfo { rootPaths = [ packages ] ++ map (id: appBundles.${id}) ws.apps; };
+      closure = pkgs.closureInfo {
+        rootPaths = [
+          packages
+          agent
+        ]
+        ++ map (id: appBundles.${id}) ws.apps;
+      };
       mem = memMiB ws;
     in
     {
@@ -370,6 +388,7 @@ let
       closure = "${closure}/store-paths";
       registration = "${closure}/registration";
       packages = "${packages}";
+      agent = "${agent}";
       apps = map appConfig ws.apps;
       environment = cfg.environment // ws.environment;
       environmentFiles = lib.filter (f: f != null) [
@@ -425,7 +444,13 @@ let
   selfServiceTemplate =
     let
       packages = packagesOf "self-service" [ ] ss.apps;
-      closure = pkgs.closureInfo { rootPaths = [ packages ] ++ map (id: appBundles.${id}) ss.apps; };
+      closure = pkgs.closureInfo {
+        rootPaths = [
+          packages
+          agent
+        ]
+        ++ map (id: appBundles.${id}) ss.apps;
+      };
       images = {
         ubuntu = {
           inherit (cfg) image imageFormat;
@@ -461,6 +486,7 @@ let
       closure = "${closure}/store-paths";
       registration = "${closure}/registration";
       packages = "${packages}";
+      agent = "${agent}";
       apps = map appConfig ss.apps;
       inherit (cfg) environment;
       environmentFiles = lib.optional (cfg.environmentFile != null) cfg.environmentFile;

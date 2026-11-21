@@ -70,8 +70,11 @@ pub struct Template {
     pub firmware: String,
     pub closure: String,
     pub registration: String,
-    /// The packages every such workspace has, and its agent.
+    /// The packages every such workspace has.
     pub packages: String,
+    /// The agent.
+    #[serde(default)]
+    pub agent: String,
     /// The apps offered, in order: the closure has every one of them.
     pub apps: Vec<BootApp>,
     pub environment: BTreeMap<String, String>,
@@ -316,6 +319,7 @@ fn unchecked_config_of(t: &Template, r: &Request, ip: &str, uid: u32) -> anyhow:
         closure: t.closure.clone(),
         registration: t.registration.clone(),
         packages: t.packages.clone(),
+        agent: t.agent.clone(),
         apps: t.apps_of(&r.apps)?,
         legacy_app_port: 0,
         environment: t.environment.clone(),
@@ -1001,6 +1005,7 @@ pub(crate) mod tests {
             closure: "/nix/store/x-closure/store-paths".into(),
             registration: "/nix/store/x-closure/registration".into(),
             packages: "/nix/store/x-packages".into(),
+            agent: "/nix/store/x-agent".into(),
             apps: vec![BootApp {
                 id: "t3code".into(),
                 name: "T3 Code".into(),
@@ -1074,6 +1079,14 @@ pub(crate) mod tests {
         let t = template();
         let c = config_of(&t, &request("ubuntu"), "10.232.0.130", 60_601).unwrap();
         assert_eq!(refreshed(&t, &c).unwrap(), c, "nothing changed, nothing to write");
+        let mut agent = template();
+        agent.agent = "/nix/store/y-agent".into();
+        let fresh = refreshed(&agent, &c).unwrap();
+        assert_eq!(fresh.agent, "/nix/store/y-agent");
+        assert!(
+            workbench_model::apps::changes(Some(&c.boot()), &fresh.boot()).is_empty(),
+            "a newer agent waits for nothing"
+        );
         let mut newer = template();
         newer.packages = "/nix/store/y-packages".into();
         newer.apps[0].bundle = "/nix/store/y-t3code-app".into();

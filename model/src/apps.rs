@@ -81,7 +81,8 @@ pub enum Change {
     AppRemoved { app: String },
     /// A newer version of the app comes.
     AppUpdated { app: String },
-    /// Newer packages, and the agent, come.
+    /// Newer packages come. A newer agent, the host's, comes with every
+    /// start too, but changes nothing anyone sees.
     Packages,
 }
 

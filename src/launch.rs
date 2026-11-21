@@ -236,12 +236,15 @@ impl GuestConfig {
     }
 }
 
-/// Writes what the guest starts its services from: the packages and the
-/// apps in the closure, the closure's paths and their registration, the
+/// Writes what the guest starts its services from: the packages, the
+/// agent and the apps in the closure, the closure's paths and their registration, the
 /// owner's SSH keys, the non-secret environment and `workspace.json`.
 pub(crate) fn write_config_share(c: &Config, dir: &Path) -> anyhow::Result<()> {
     make_dir(dir, 0o755)?;
     std::os::unix::fs::symlink(&c.packages, dir.join("app"))?;
+    if !c.agent.is_empty() {
+        std::os::unix::fs::symlink(&c.agent, dir.join("agent"))?;
+    }
     make_dir(&dir.join("apps"), 0o755)?;
     for app in &c.apps {
         std::os::unix::fs::symlink(&app.bundle, dir.join("apps").join(&app.id))?;
@@ -483,6 +486,12 @@ mod tests {
         fs::write(&c.registration, "/nix/store/x-app\nsha256:0\n0\n\n0\n").unwrap();
         write_config_share(&c, &dir).unwrap();
         assert_eq!(fs::read_link(dir.join("app")).unwrap(), Path::new(&c.packages));
+        assert_eq!(fs::read_link(dir.join("agent")).unwrap(), Path::new(&c.agent));
+        // A config from before the agent was apart: the packages have it.
+        let old = Config { agent: String::new(), ..c.clone() };
+        assert!(!serde_json::to_string(&old).unwrap().contains("agent\""));
+        write_config_share(&old, &tmp.path().join("old")).unwrap();
+        assert!(!tmp.path().join("old/agent").exists());
         assert_eq!(fs::read_link(dir.join("apps/t3code")).unwrap(), Path::new(&c.apps[0].bundle));
         assert_eq!(fs::read_to_string(dir.join("environment")).unwrap(), "LLM_URL=\"https://llm.example\"\n");
         let gc: GuestConfig = serde_json::from_slice(&fs::read(dir.join("workspace.json")).unwrap()).unwrap();

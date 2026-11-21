@@ -211,7 +211,9 @@ workspace; the menu waits `boot.loader.timeout`, one second by default.
   from `workspace.json`, with systemd-networkd;
 - copies the closure of the packages and apps into `/nix/store`, only the
   paths the store lacks, registers them and keeps them alive with the GC
-  roots `/nix/var/nix/gcroots/workspace-app` and `workspace-app-<id>`;
+  roots `/nix/var/nix/gcroots/workspace-app`, `workspace-app-<id>` and
+  `workspace-agent`, which the agent also makes as it starts, for guests
+  set up with an older `nixosModules.guest`;
 - creates the owner's account in `wheel` if it does not exist yet, and
   writes `/etc/nixos` on a new disk;
 - lets sshd read the owner's keys from the config share, with passwords off;
@@ -258,7 +260,8 @@ keeps working.
 | Path in the guest | What |
 |---|---|
 | `/run/workspace/config/workspace.json` | `name`, `owner`, `url`, `ip`, `gateway`, `nameservers`, `appPort`, `controlPort`, `agentPort`, `apps` |
-| `/run/workspace/config/app` | The packages: `bin/workspace-agent` the agent, `sw/bin` holds `extraPackages` and the apps' packages |
+| `/run/workspace/config/app` | The packages: `sw/bin` holds `extraPackages` and the apps' packages; `bin/workspace-agent` starts the agent |
+| `/run/workspace/config/agent` | The agent, `bin/workspace-agent`, the host's workbench |
 | `/run/workspace/config/apps/<id>` | An app's bundle: `bin/serve`, and `bin/open-link` if it signs browsers in |
 | `/run/workspace/config/environment` | The non-secret environment, for systemd's `EnvironmentFile=` |
 | `/run/workspace/config/authorized_keys/<owner>` | The owner's SSH keys |
