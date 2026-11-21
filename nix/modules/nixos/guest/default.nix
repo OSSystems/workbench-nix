@@ -110,13 +110,24 @@ in
   security.sudo.wheelNeedsPassword = lib.mkDefault false;
   documentation.nixos.enable = lib.mkDefault false;
 
+  # The host signs a host key for the workspace's address, and the keys of
+  # the person it is for; the owner's keys from the Nix configuration work
+  # as well.
   services.openssh = {
     enable = true;
     authorizedKeysFiles = [ "${configDir}/authorized_keys/%u" ];
     settings = {
       PasswordAuthentication = lib.mkDefault false;
       KbdInteractiveAuthentication = lib.mkDefault false;
+      TrustedUserCAKeys = "${configDir}/ssh/user-ca.pub";
+      # Only the owner has a principal, their name: a certificate never
+      # signs in as another account, root included.
+      AuthorizedPrincipalsFile = "${configDir}/ssh/principals/%u";
     };
+    extraConfig = ''
+      HostKey ${secretsDir}/ssh-host/ssh_host_ed25519_key
+      HostCertificate ${secretsDir}/ssh-host/ssh_host_ed25519_key-cert.pub
+    '';
   };
 
   environment.extraInit = ''

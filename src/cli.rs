@@ -12,7 +12,7 @@ use vmkit::hostutil;
 use vmkit::memory::GIB;
 use workbench_model::{Change, Stage, Verb, Workspace};
 
-use crate::config::{self, is_workspace_name};
+use crate::config::{self, Config, is_workspace_name};
 use crate::state::{self, unit_name};
 
 /// How a command that reported an exit code ends.
@@ -300,6 +300,14 @@ pub async fn destroy(
         bail!("{unit} is still running or about to start; nothing deleted");
     }
     std::fs::remove_dir_all(&state_dir)?;
+    // Its SSH host key goes with it: a workspace made again with its name
+    // is another machine.
+    if let Some(keys) = declared.as_ref().and_then(Config::host_key_dir) {
+        match std::fs::remove_dir_all(&keys) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
     // A stop marker would keep the fresh disk of a workspace still
     // declared from being made at the next boot.
     match std::fs::remove_file(state::stop_marker(state_root, name)) {

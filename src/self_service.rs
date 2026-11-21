@@ -94,6 +94,9 @@ pub struct Template {
     /// Exits 0 while an owner may keep their workspaces; empty asks no one.
     #[serde(default)]
     pub owner_command: String,
+    /// The host's SSH certificate authorities.
+    #[serde(default)]
+    pub ssh: config::SshCa,
 }
 
 /// A guest system's image.
@@ -342,6 +345,7 @@ fn unchecked_config_of(t: &Template, r: &Request, ip: &str, uid: u32) -> anyhow:
         socket_group: t.socket_group.clone(),
         self_service: true,
         uid,
+        ssh: t.ssh.clone(),
     };
     Ok(c)
 }
@@ -538,6 +542,9 @@ fn host_files(paths: &Paths, c: &Config) -> Vec<PathBuf> {
         Path::new(NETWORK).join(format!("40-{}.netdev", c.tap)),
         Path::new(NETWORK).join(format!("40-{}.network", c.tap)),
     ]
+    .into_iter()
+    .chain(c.host_key_dir())
+    .collect()
 }
 
 /// Removes what a workspace has on the host, its tap included.
@@ -1053,6 +1060,7 @@ pub(crate) mod tests {
             mcopy: "/nix/store/x-mtools/bin/mcopy".into(),
             environment_command: "/run/current-system/sw/bin/env-of".into(),
             owner_command: String::new(),
+            ssh: crate::config::tests::test_config().ssh,
         }
     }
 
