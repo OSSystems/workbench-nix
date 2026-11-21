@@ -31,7 +31,7 @@ js-sys = "0.3.103"
 wasm-bindgen = "=0.2.126"
 web-sys = { version = "0.3.103", features = [
   "BinaryType", "Clipboard", "CssStyleDeclaration", "Document", "Element", "EventSource", "HtmlDialogElement",
-  "HtmlElement", "HtmlInputElement", "KeyboardEvent", "Location", "MediaQueryList", "MessageEvent", "Navigator", "NodeList",
+  "HtmlElement", "HtmlInputElement", "KeyboardEvent", "Location", "MediaQueryList", "MessageEvent", "Navigator", "Node", "NodeList",
   "Storage", "WebSocket", "Window",
 ] }
 
