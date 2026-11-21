@@ -34,6 +34,13 @@ let
               port = 8080;
               serve = "exec ${pkgs.python3}/bin/python3 -m http.server \"$APP_PORT\"";
             };
+            # Reached from a terminal, and only by the workspaces that ask.
+            apps.term = {
+              name = "Term";
+              port = null;
+              default = false;
+              serve = "exec sleep infinity";
+            };
             workspaces = {
               alice-main = {
                 owner = "alice";
@@ -43,6 +50,10 @@ let
                 owner = "alice";
                 ip = "10.232.0.11";
                 sudo = false;
+                apps = [
+                  "hello"
+                  "term"
+                ];
               };
               alice-bare = {
                 owner = "alice";
@@ -79,6 +90,11 @@ let
   memoryExec = config.systemd.services.workbench-memory.serviceConfig.ExecStart;
   unit = config.systemd.services."workbench@alice-main";
   fw = config.networking.firewall.extraCommands;
+  appsOf =
+    name:
+    (builtins.fromJSON (
+      builtins.unsafeDiscardStringContext config.environment.etc."workbench/${name}.json".source.text
+    )).apps;
   failures = lib.filter (c: !c.ok) [
     {
       ok = failedAssertions config == [ ];
@@ -121,6 +137,20 @@ let
         && config.services.nginx.virtualHosts ? "alice-scratch--hello.ws.example.com"
         && lib.all (h: !lib.hasPrefix "alice-bare" h) (lib.attrNames config.services.nginx.virtualHosts);
       msg = "every workspace gets a config, and each of its apps a virtual host";
+    }
+    {
+      ok =
+        map (a: a.id) (appsOf "alice-main") == [
+          "hello"
+          "t3code"
+        ]
+        &&
+          map (a: a.port) (appsOf "alice-scratch") == [
+            8080
+            null
+          ]
+        && !(config.services.nginx.virtualHosts ? "alice-scratch--term.ws.example.com");
+      msg = "an app people opt into, without an address, is only where asked and has no virtual host";
     }
   ];
 in

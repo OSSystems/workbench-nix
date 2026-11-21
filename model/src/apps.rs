@@ -1,6 +1,7 @@
-//! Apps: what runs in a workspace and is opened from a browser, each at an
-//! address of its own. A workspace has none, one or several, and none is
-//! its main one.
+//! Apps: what runs in a workspace and is opened from outside it, in a
+//! browser at an address of its own, or from a terminal for an app with
+//! no address. A workspace has none, one or several, and none is its main
+//! one.
 //!
 //! A VM keeps what it booted with for as long as it runs. The host's config
 //! says what the next start boots, a [`Boot`]; the record the last start
@@ -42,6 +43,12 @@ pub struct AppInfo {
     pub id: String,
     /// What people call it.
     pub name: String,
+    /// It has no address: it is reached from a terminal, not a browser.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
+    /// A new workspace has it unless someone says otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
 }
 
 /// What a VM boots: the workspace's packages, which its agent comes with,
@@ -58,8 +65,10 @@ pub struct Boot {
 pub struct BootApp {
     pub id: String,
     pub name: String,
-    /// The port it listens on in the guest.
-    pub port: u16,
+    /// The port it listens on in the guest; none for an app without an
+    /// address, which is reached from a terminal.
+    #[serde(default)]
+    pub port: Option<u16>,
     /// Its bundle: a new one is a new version.
     pub bundle: String,
 }
@@ -168,8 +177,10 @@ impl Stage {
 pub struct App {
     pub id: String,
     pub name: String,
-    /// Where it is opened.
-    pub url: String,
+    /// Where it is opened; none for an app without an address, which is
+    /// reached from a terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// The guest makes links that sign a browser in to it; known while
     /// the agent answers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -187,6 +198,8 @@ pub enum OpenBlocker {
     Starting,
     /// It comes with the next start.
     Coming,
+    /// It has no address: it is reached from a terminal.
+    NoAddress,
 }
 
 /// A one-time link to open an app on another device, and its QR code: one
@@ -203,7 +216,7 @@ mod tests {
     use super::*;
 
     fn app(id: &str, bundle: &str) -> BootApp {
-        BootApp { id: id.into(), name: id.to_uppercase(), port: 3773, bundle: bundle.into() }
+        BootApp { id: id.into(), name: id.to_uppercase(), port: Some(3773), bundle: bundle.into() }
     }
 
     fn boot(packages: &str, apps: &[BootApp]) -> Boot {
@@ -236,8 +249,27 @@ mod tests {
             changes(Some(&next), &newer),
             [Change::AppUpdated { app: "t3code".into() }, Change::AppAdded { app: "herdr".into() }, Change::Packages]
         );
-        let moved = boot("/nix/store/p1", &[BootApp { port: 8080, ..t3 }]);
+        let moved = boot("/nix/store/p1", &[BootApp { port: Some(8080), ..t3.clone() }]);
         assert_eq!(changes(Some(&next), &moved), [Change::AppUpdated { app: "t3code".into() }], "a new port too");
+        let unaddressed = boot("/nix/store/p1", &[BootApp { port: None, ..t3 }]);
+        assert_eq!(
+            changes(Some(&next), &unaddressed),
+            [Change::AppUpdated { app: "t3code".into() }],
+            "and none at all"
+        );
+    }
+
+    /// An app without an address has no port in the config, and none in
+    /// what a VM booted with; one with a port reads as before.
+    #[test]
+    fn apps_without_an_address() {
+        let herdr: BootApp =
+            serde_json::from_str(r#"{"id":"herdr","name":"Herdr","port":null,"bundle":"/b"}"#).unwrap();
+        assert_eq!(herdr.port, None);
+        let old: BootApp = serde_json::from_str(r#"{"id":"t3code","name":"T3","port":3773,"bundle":"/b"}"#).unwrap();
+        assert_eq!(old.port, Some(3773));
+        let app = App { id: "herdr".into(), name: "Herdr".into(), url: None, open_link: false };
+        assert_eq!(serde_json::to_string(&app).unwrap(), r#"{"id":"herdr","name":"Herdr"}"#);
     }
 
     #[test]

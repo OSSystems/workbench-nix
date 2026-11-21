@@ -172,7 +172,8 @@ fn home_of(owner: &str) -> String {
 
 /// `systemd-run`'s arguments for an app's unit, `workspace-app-<id>`: its
 /// bundle's `bin/serve`, as the owner in their home, with the workspace's
-/// environment and secrets, and `APP_PORT` and `APP_URL`.
+/// environment and secrets, and `APP_PORT` and `APP_URL` for an app with an
+/// address.
 pub(crate) fn app_unit_argv(gc: &GuestConfig, app: &GuestApp, home: &str) -> Vec<String> {
     let path = format!(
         "{GUEST_PACKAGES}/sw/bin:{home}/.nix-profile/bin:/etc/profiles/per-user/{owner}/bin:/run/wrappers/bin:\
@@ -194,11 +195,13 @@ pub(crate) fn app_unit_argv(gc: &GuestConfig, app: &GuestApp, home: &str) -> Vec
         "--property=EnvironmentFile=/run/workspace/config/environment".into(),
         "--property=EnvironmentFile=-/run/workspace/secrets/environment".into(),
         format!("--setenv=PATH={path}"),
-        format!("--setenv=APP_PORT={}", app.port),
-        format!("--setenv=APP_URL={}", app.url),
         format!("--setenv=WORKSPACE_URL={}", gc.url),
     ]
     .into();
+    if let (Some(port), Some(url)) = (app.port, &app.url) {
+        argv.push(format!("--setenv=APP_PORT={port}"));
+        argv.push(format!("--setenv=APP_URL={url}"));
+    }
     argv.push(format!("{GUEST_APPS}/{}/bin/serve", app.id));
     argv
 }
@@ -263,6 +266,9 @@ async fn answer(req: Request, gc: &GuestConfig, apps: &Path) -> Reply {
             let Some(app) = req.args.first().and_then(|id| gc.app(id)) else {
                 return Reply::error("no such app");
             };
+            if app.url.is_none() {
+                return Reply::error("the app has no address");
+            }
             let hook = open_link_hook(apps, &app.id);
             if !hook.exists() {
                 return Reply::error("the app has no sign-in hook");
@@ -306,8 +312,8 @@ pub(crate) async fn run_as_owner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Some(app) = app {
-        cmd.env("APP_URL", &app.url).env("APP_PORT", app.port.to_string());
+    if let Some((port, url)) = app.and_then(|a| Some((a.port?, a.url.as_ref()?))) {
+        cmd.env("APP_URL", url).env("APP_PORT", port.to_string());
     }
     let mut child = cmd.spawn().with_context(|| argv[0].clone())?;
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
@@ -477,6 +483,9 @@ mod tests {
         ] {
             assert!(argv.iter().any(|a| a == want), "{want} missing from {argv:?}");
         }
+        let herdr = GuestApp { id: "herdr".into(), name: "Herdr".into(), port: None, url: None };
+        let argv = app_unit_argv(&gc, &herdr, "/home/alice");
+        assert!(!argv.iter().any(|a| a.starts_with("--setenv=APP_")), "an app without an address: {argv:?}");
     }
 
     #[tokio::test]

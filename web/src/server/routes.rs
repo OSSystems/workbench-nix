@@ -161,7 +161,8 @@ async fn denied(
     let theirs =
         ws.as_ref().and_then(|n| state.backend.config(n).ok()).filter(|c| viewer.may_use(&c.owner, c.self_service));
     if let (Some(c), false) = (theirs, app.is_empty()) {
-        return no_app(&state, &c.name, &app);
+        let terminal = state.backend.reachable(&c).iter().any(|a| a.id == app && a.port.is_none());
+        return no_app(&state, &c.name, &app, terminal);
     }
     let what = ws.map_or_else(|| "This workspace".to_owned(), |n| format!("{n}.{domain}"));
     let page = view! {
@@ -205,9 +206,19 @@ async fn denied(
     (StatusCode::FORBIDDEN, [(header::CONTENT_SECURITY_POLICY, policy)], Html(page)).into_response()
 }
 
-/// The page at the address of an app a workspace of the viewer's hasn't.
-fn no_app(state: &AppState, name: &str, app: &str) -> Response {
+/// The page at the address of an app a workspace of the viewer's hasn't,
+/// or has without an address: one reached from a terminal.
+fn no_app(state: &AppState, name: &str, app: &str, terminal: bool) -> Response {
     let origin = state.opts.origin.clone();
+    let (title, says) = if terminal {
+        (
+            "No address · workbench",
+            "It has no address to open in a browser: you reach it from your terminal. Its panel says how.",
+        )
+    } else {
+        ("No such app · workbench", "Its apps, and how to add one, are on its panel.")
+    };
+    let head = if terminal { " has no address for " } else { " has no app " };
     let page = view! {
         <!DOCTYPE html>
         <html lang="en">
@@ -215,7 +226,7 @@ fn no_app(state: &AppState, name: &str, app: &str) -> Response {
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <meta name="color-scheme" content="light dark" />
-                <title>"No such app · workbench"</title>
+                <title>{title}</title>
                 <link rel="icon" href=format!("{origin}{}", asset(&state.leptos, "mark.svg")) type="image/svg+xml" />
                 <link rel="stylesheet" href=format!("{origin}{}", asset(&state.leptos, "app.css")) />
             </head>
@@ -223,8 +234,8 @@ fn no_app(state: &AppState, name: &str, app: &str) -> Response {
                 <div class="app">
                     <main class="solo">
                         <div class="card">
-                            <h1><span class="mono">{name.to_owned()}</span>" has no app " <span class="mono">{app.to_owned()}</span></h1>
-                            <p>"Its apps, and how to add one, are on its panel."</p>
+                            <h1><span class="mono">{name.to_owned()}</span>{head} <span class="mono">{app.to_owned()}</span></h1>
+                            <p>{says}</p>
                             <div class="acts">
                                 <a class="btn p" href=format!("{origin}/?w={name}")>
                                     {format!("Open {name}'s panel")}

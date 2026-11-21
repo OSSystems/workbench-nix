@@ -265,11 +265,14 @@ impl Workspace {
     }
 
     /// What keeps an app from opening now, if anything. One that goes
-    /// with the next start still opens until then.
+    /// with the next start still opens until then; one without an address
+    /// never opens in a browser.
     #[must_use]
     pub fn open_blocker(&self, app: &str) -> Option<OpenBlocker> {
-        if self.app(app).is_none() {
-            return Some(OpenBlocker::Unknown);
+        match self.app(app) {
+            None => return Some(OpenBlocker::Unknown),
+            Some(a) if a.url.is_none() => return Some(OpenBlocker::NoAddress),
+            Some(_) => {}
         }
         match self.state {
             State::Stopped | State::Stopping => Some(OpenBlocker::Stopped),
@@ -578,14 +581,15 @@ mod tests {
     #[test]
     fn open_blockers() {
         let mut w = ws("a", "alice", State::Running).ws;
-        let app = |id: &str| App { id: id.into(), name: id.into(), url: String::new(), open_link: true };
-        w.apps = vec![app("t3code"), app("herdr"), app("old")];
+        let app = |id: &str| App { id: id.into(), name: id.into(), url: Some(String::new()), open_link: true };
+        w.apps = vec![app("t3code"), app("herdr"), app("old"), App { url: None, ..app("term") }];
         w.changes = vec![Change::AppAdded { app: "herdr".into() }, Change::AppRemoved { app: "old".into() }];
         assert_eq!(w.open_blocker("t3code"), None);
         assert_eq!(w.open_blocker("herdr"), Some(OpenBlocker::Coming));
         assert_eq!(w.open_blocker("old"), None, "it goes at the next start, not before");
         assert_eq!(w.open_blocker("nope"), Some(OpenBlocker::Unknown));
-        assert_eq!(w.running_apps().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["t3code", "old"]);
+        assert_eq!(w.open_blocker("term"), Some(OpenBlocker::NoAddress), "reached from a terminal");
+        assert_eq!(w.running_apps().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["t3code", "old", "term"]);
         w.state = State::Failing;
         assert_eq!(w.open_blocker("t3code"), Some(OpenBlocker::Starting));
         w.state = State::Stopped;
@@ -604,7 +608,7 @@ mod tests {
             apps: vec![App {
                 id: "t3code".into(),
                 name: "T3 Code".into(),
-                url: "https://alice--t3code.ws.test".into(),
+                url: Some("https://alice--t3code.ws.test".into()),
                 open_link: true,
             }],
             unit: "active".into(),

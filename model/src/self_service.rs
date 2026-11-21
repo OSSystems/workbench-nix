@@ -255,7 +255,7 @@ mod tests {
             max_memory_gib: 16,
             max_disk_gib: 128,
             quota: 1,
-            apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into() }],
+            apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into(), ..AppInfo::default() }],
         };
         let ok = Request {
             name: "alice".into(),

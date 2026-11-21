@@ -166,17 +166,32 @@ let
         description = "What people call it.";
       };
       port = mkOption {
-        type = types.port;
+        type = types.nullOr types.port;
         example = 3773;
-        description = "The port it listens on in the guest; `serve` gets it in `APP_PORT`.";
+        description = ''
+          The port it listens on in the guest, which `serve` gets in
+          `APP_PORT`, and the app is at `<workspace>--<id>.<domain>`. Null
+          for an app without an address, which people reach from a
+          terminal instead.
+        '';
+      };
+      default = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Whether workspaces have it unless they say otherwise: the
+          default of `workspaces.<name>.apps`, and what a new workspace
+          made in the web UI starts with. False for an app people opt into.
+        '';
       };
       serve = mkOption {
         type = types.lines;
         description = ''
           Shell script run at every boot as the owner, in their home, that
-          serves the app on `$APP_PORT`; systemd restarts it when it ends.
-          It has the workspace's environment and secrets, the workspace's
-          packages on its PATH, and the app's address in `APP_URL`.
+          serves the app, on `$APP_PORT` if it has a port; systemd restarts
+          it when it ends. It has the workspace's environment and secrets,
+          the workspace's packages on its PATH, and the app's address in
+          `APP_URL`.
         '';
       };
       openLink = mkOption {
@@ -196,6 +211,10 @@ let
       };
     };
   };
+
+  # The ports of some apps, each once: those with an address.
+  portsOf = ids: lib.filter (p: p != null) (map (id: cfg.apps.${id}.port) ids);
+  defaultApps = lib.attrNames (lib.filterAttrs (_: app: app.default) cfg.apps);
 
   # An app's own virtual host, without the web UI.
   vhostOf =
@@ -488,6 +507,7 @@ let
       packages = "${packages}";
       agent = "${agent}";
       apps = map appConfig ss.apps;
+      defaultApps = lib.filter (id: cfg.apps.${id}.default) ss.apps;
       inherit (cfg) environment;
       environmentFiles = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
       socketGroup = "workbench";
@@ -524,12 +544,16 @@ let
       options = {
         apps = mkOption {
           type = types.listOf types.str;
-          default = lib.attrNames cfg.apps;
-          defaultText = lib.literalExpression "lib.attrNames config.services.workbench.apps";
-          example = [ "t3code" ];
+          default = defaultApps;
+          defaultText = lib.literalMD "the apps whose `default` is true";
+          example = [
+            "t3code"
+            "herdr"
+          ];
           description = ''
-            The apps it runs, by id, each at `<name>--<id>.<domain>`. A change
-            takes effect when the VM next starts.
+            The apps it runs, by id, each with an address at
+            `<name>--<id>.<domain>`. A change takes effect when the VM next
+            starts.
           '';
         };
         # Gone with apps: an assertion says where it went.
@@ -645,10 +669,11 @@ in
       type = types.attrsOf (types.submodule appModule);
       default = { };
       description = ''
-        What workspaces run and people open from a browser, by id: a
+        What workspaces run and people open from outside them, by id: a
         lowercase letter, then lowercase letters and digits, at most 16.
-        Each app of a workspace is at `<name>--<id>.<domain>`, an origin of
-        its own. `package` adds `t3code`.
+        An app with a port is at `<name>--<id>.<domain>`, an origin of its
+        own, in the browser; one without is reached from a terminal.
+        `package` adds `t3code`.
       '';
     };
     domain = mkOption {
@@ -821,9 +846,7 @@ in
           }) cfg.workspaces
           ++ lib.mapAttrsToList (name: ws: {
             assertion =
-              lib.all (id: cfg.apps ? ${id}) ws.apps
-              && lib.allUnique ws.apps
-              && lib.allUnique (map (id: cfg.apps.${id}.port) ws.apps);
+              lib.all (id: cfg.apps ? ${id}) ws.apps && lib.allUnique ws.apps && lib.allUnique (portsOf ws.apps);
             message = "services.workbench.workspaces.${name}.apps: each must be one of services.workbench.apps, once, on a port of its own.";
           }) cfg.workspaces
           ++ lib.mapAttrsToList (name: ws: {
@@ -996,7 +1019,7 @@ in
                   map (id: {
                     name = "${name}--${id}.${cfg.domain}";
                     value = vhostOf ws.ip cfg.apps.${id}.port;
-                  }) ws.apps
+                  }) (lib.filter (id: cfg.apps.${id}.port != null) ws.apps)
                 ) cfg.workspaces
               )
             )

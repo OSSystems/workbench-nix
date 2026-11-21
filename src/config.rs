@@ -211,9 +211,13 @@ impl Config {
                 "app {} needs a name on one line",
                 app.id
             );
-            ensure!(app.port != 0 && is_clean_path(&app.bundle), "app {} needs a port and a clean bundle path", app.id);
             ensure!(
-                self.apps[..i].iter().all(|a| a.id != app.id && a.port != app.port),
+                app.port != Some(0) && is_clean_path(&app.bundle),
+                "app {} needs a port, or none, and a clean bundle path",
+                app.id
+            );
+            ensure!(
+                self.apps[..i].iter().all(|a| a.id != app.id && (app.port.is_none() || a.port != app.port)),
                 "app {} repeats another's id or port",
                 app.id
             );
@@ -405,7 +409,7 @@ pub(crate) mod tests {
             apps: vec![BootApp {
                 id: "t3code".into(),
                 name: "T3 Code".into(),
-                port: 3773,
+                port: Some(3773),
                 bundle: "/nix/store/x-t3code-app".into(),
             }],
             legacy_app_port: 0,
@@ -457,10 +461,10 @@ pub(crate) mod tests {
             ("same vsock ports", |c| c.agent_port = c.control_port),
             ("bad socket group", |c| c.socket_group = "wheel users".into()),
             ("app id", |c| c.apps[0].id = "t3-code".into()),
-            ("app port 0", |c| c.apps[0].port = 0),
+            ("app port 0", |c| c.apps[0].port = Some(0)),
             ("app bundle", |c| c.apps[0].bundle = "x".into()),
             ("app name", |c| c.apps[0].name = String::new()),
-            ("app twice", |c| c.apps.push(BootApp { port: 1, ..c.apps[0].clone() })),
+            ("app twice", |c| c.apps.push(BootApp { port: Some(1), ..c.apps[0].clone() })),
             ("port twice", |c| c.apps.push(BootApp { id: "other".into(), ..c.apps[0].clone() })),
             ("env newline", |c| c.environment = [("A".into(), "x\nB=y".into())].into()),
             ("env name", |c| c.environment = [("A-B".into(), "x".into())].into()),
@@ -472,6 +476,12 @@ pub(crate) mod tests {
             change(&mut c);
             assert!(c.validate().is_err(), "{name}: accepted");
         }
+        // Apps without an address share no port.
+        let mut terminal = test_config();
+        for id in ["herdr", "herdrcore"] {
+            terminal.apps.push(BootApp { id: id.into(), port: None, ..terminal.apps[0].clone() });
+        }
+        terminal.validate().unwrap();
     }
 
     /// A config written before apps: its app and port, and nothing else,

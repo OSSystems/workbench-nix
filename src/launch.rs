@@ -190,7 +190,7 @@ pub struct GuestConfig {
     pub ip: String,
     pub gateway: String,
     pub nameservers: Vec<String>,
-    /// The first app's port, or 0: what guests of earlier releases had.
+    /// The first port of an app, or 0: what guests of earlier releases had.
     pub app_port: i64,
     pub control_port: i64,
     pub agent_port: i64,
@@ -204,9 +204,12 @@ pub struct GuestConfig {
 pub struct GuestApp {
     pub id: String,
     pub name: String,
-    pub port: u16,
-    /// Its address, which a sign-in link must be on.
-    pub url: String,
+    /// Its port and its address, which a sign-in link must be on; neither
+    /// for an app without an address, which is reached from a terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl GuestConfig {
@@ -219,13 +222,18 @@ impl GuestConfig {
             ip: c.ip.clone(),
             gateway: c.gateway.clone(),
             nameservers: c.nameservers.clone(),
-            app_port: c.apps.first().map_or(0, |a| i64::from(a.port)),
+            app_port: c.apps.iter().find_map(|a| a.port).map_or(0, i64::from),
             control_port: c.control_port,
             agent_port: c.agent_port,
             apps: c
                 .apps
                 .iter()
-                .map(|a| GuestApp { id: a.id.clone(), name: a.name.clone(), port: a.port, url: app_url(&c.url, &a.id) })
+                .map(|a| GuestApp {
+                    id: a.id.clone(),
+                    name: a.name.clone(),
+                    port: a.port,
+                    url: a.port.map(|_| app_url(&c.url, &a.id)),
+                })
                 .collect(),
         }
     }
@@ -403,6 +411,7 @@ pub async fn shutdown(dirs: &[PathBuf], name: &str, timeout: Duration) -> anyhow
 mod tests {
     use super::*;
     use crate::config::tests::test_config;
+    use workbench_model::apps::BootApp;
 
     fn flag_values(argv: &[String], flag: &str) -> Vec<String> {
         let mut values = vec![];
@@ -497,7 +506,7 @@ mod tests {
         let gc: GuestConfig = serde_json::from_slice(&fs::read(dir.join("workspace.json")).unwrap()).unwrap();
         assert_eq!(gc, GuestConfig::of(&c));
         assert_eq!(gc.agent_port, 5002);
-        assert_eq!((gc.app_port, gc.apps[0].url.as_str()), (3773, "https://alice-dev--t3code.ws.test"));
+        assert_eq!((gc.app_port, gc.apps[0].url.as_deref()), (3773, Some("https://alice-dev--t3code.ws.test")));
         for (name, src) in [("store-paths", &c.closure), ("registration", &c.registration)] {
             let (got, want) = (fs::read(dir.join(name)).unwrap(), fs::read(src).unwrap());
             assert!(!want.is_empty() && got == want, "{name} is not a copy of {src}");
@@ -516,6 +525,12 @@ mod tests {
             keys,
             ["agentPort", "appPort", "apps", "controlPort", "gateway", "ip", "name", "nameservers", "owner", "url"]
         );
+        // An app without an address has neither port nor url.
+        let mut c = test_config();
+        c.apps.insert(0, BootApp { id: "herdr".into(), port: None, ..c.apps[0].clone() });
+        let gc = GuestConfig::of(&c);
+        assert_eq!(gc.app_port, 3773, "the first app with a port");
+        assert_eq!(serde_json::to_value(&gc.apps[0]).unwrap(), serde_json::json!({"id": "herdr", "name": "T3 Code"}));
     }
 
     #[test]

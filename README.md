@@ -334,7 +334,8 @@ group may use and starts, stops and restarts workspaces through polkit.
 An app is what runs in a workspace and is opened from the browser, at
 `https://<workspace>--<app>.<domain>`, an origin of its own. The host offers
 them, `services.workbench.apps`; each workspace has the ones its `apps`
-names, all of them unless it says otherwise, and may have none.
+names, those whose `default` is true unless it says otherwise, and may
+have none.
 `https://<workspace>.<domain>` leads to the workspace's panel in the web UI.
 
 ```nix
@@ -351,6 +352,11 @@ The guest agent runs each app's `serve` at every boot as the owner, with
 the workspace's environment and secrets, as `workspace-app-<id>.service`.
 A VM keeps the apps it booted with: a change to them, or a new version,
 comes with its next restart, and the web UI says what waits for it.
+
+- **`port = null`** makes an app without an address: nginx reaches
+  nothing of it, and its panel has no **Open**.
+- **`default = false`** makes an app people opt into: a workspace has it
+  when its `apps` names it, and the New workspace form leaves it unticked.
 
 ### T3 Code
 

@@ -20,6 +20,8 @@ const ORIGIN: &str = "https://ws.test";
 #[derive(Default)]
 struct Fake {
     controlled: Arc<Mutex<Vec<(Verb, String)>>>,
+    /// alice's workspace has Herdr too, an app without an address.
+    herdr: bool,
     open_link: Mutex<Option<Result<String, OpenLinkError>>>,
     /// Workspaces made at run time, besides the declared ones.
     made: Vec<Workspace>,
@@ -45,7 +47,7 @@ fn ws(name: &str, owner: &str, state: State) -> Workspace {
         apps: vec![App {
             id: "t3code".into(),
             name: "T3 Code".into(),
-            url: format!("https://{name}--t3code.ws.test"),
+            url: Some(format!("https://{name}--t3code.ws.test")),
             open_link: true,
         }],
         unit: "active".into(),
@@ -56,11 +58,11 @@ fn ws(name: &str, owner: &str, state: State) -> Workspace {
 
 impl Backend for Fake {
     fn list(&self) -> BoxFuture<'_, anyhow::Result<Vec<Workspace>>> {
-        let mut all = vec![
-            ws("alice", "alice", State::Running),
-            ws("bob", "bob", State::Stopped),
-            ws("bobby", "bob", State::Stopping),
-        ];
+        let mut alice = ws("alice", "alice", State::Running);
+        if self.herdr {
+            alice.apps.push(App { id: "herdr".into(), name: "Herdr".into(), url: None, open_link: false });
+        }
+        let mut all = vec![alice, ws("bob", "bob", State::Stopped), ws("bobby", "bob", State::Stopping)];
         all.extend(self.made.iter().cloned());
         Box::pin(async move { Ok(all) })
     }
@@ -87,12 +89,21 @@ impl Backend for Fake {
             "bob" | "bobby" => "bob",
             _ => anyhow::bail!("no workspace {name:?}"),
         };
+        let mut apps = vec![t3code()];
+        if self.herdr && name == "alice" {
+            apps.push(BootApp {
+                id: "herdr".into(),
+                name: "Herdr".into(),
+                port: None,
+                bundle: "/nix/store/x-herdr".into(),
+            });
+        }
         Ok(Config {
             name: name.into(),
             owner: owner.into(),
             url: format!("https://{name}.ws.test"),
             ip: "10.232.0.10".into(),
-            apps: vec![t3code()],
+            apps,
             ..Config::default()
         })
     }
@@ -133,7 +144,7 @@ impl Backend for Fake {
 }
 
 fn t3code() -> BootApp {
-    BootApp { id: "t3code".into(), name: "T3 Code".into(), port: 3773, bundle: "/nix/store/x-t3code".into() }
+    BootApp { id: "t3code".into(), name: "T3 Code".into(), port: Some(3773), bundle: "/nix/store/x-t3code".into() }
 }
 
 fn state(fake: Fake) -> AppState {
@@ -145,7 +156,10 @@ fn state(fake: Fake) -> AppState {
             max_memory_gib: 16,
             max_disk_gib: 128,
             quota: 1,
-            apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into() }],
+            apps: vec![
+                AppInfo { id: "t3code".into(), name: "T3 Code".into(), terminal: false, default: true },
+                AppInfo { id: "herdr".into(), name: "Herdr".into(), terminal: true, default: false },
+            ],
         },
     });
     let opts = Options {
@@ -466,7 +480,7 @@ async fn people_in_the_group_make_their_own() {
         ("name=alice-x&os=nixos&memory_gib=8&disk_gib=64", "isn%27t%20a%20system"),
         ("name=alice-x&os=ubuntu&memory_gib=99&disk_gib=64", "Memory%20must%20be"),
         ("name=alice&os=ubuntu&memory_gib=8&disk_gib=64", "is%20taken"),
-        ("name=alice-x&os=ubuntu&memory_gib=8&disk_gib=64&apps%5B0%5D=herdr", "isn%27t%20an%20app"),
+        ("name=alice-x&os=ubuntu&memory_gib=8&disk_gib=64&apps%5B0%5D=nope", "isn%27t%20an%20app"),
     ] {
         let (code, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, bad), "workbench")).await;
         let to = h[header::LOCATION].to_str().unwrap();
@@ -477,7 +491,10 @@ async fn people_in_the_group_make_their_own() {
 
 async fn body_has_apps(s: &AppState) -> bool {
     let (_, _, body) = send(ui(s), with_groups(get("/new", "alice"), "workbench")).await;
+    // What a new workspace has is checked; an app it opts into isn't.
     body.contains(r#"name="apps[0]" value="t3code" checked"#)
+        && body.contains(r#"name="apps[1]" value="herdr">"#)
+        && body.contains("Reached from your terminal")
 }
 
 /// A workspace made at run time changes its apps through the host's unit;
@@ -610,6 +627,33 @@ async fn the_denied_page_is_styled_from_the_ui() {
     assert!(headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap().starts_with("default-src 'none'"));
     let (_, _, body) = send(ui(&s), get("/denied?ws=%3Cscript%3E", "bob")).await;
     assert!(!body.contains("<script>"));
+}
+
+/// An app without an address has nothing to reach through nginx, and no
+/// Open: it is reached from a terminal.
+#[tokio::test]
+async fn apps_without_an_address() {
+    let _turn = TURN.lock().await;
+    let s = state(Fake { herdr: true, ..Fake::default() });
+    let check = Request::get("/authz")
+        .header("x-workbench-workspace", "alice")
+        .header("x-workbench-app", "herdr")
+        .header(header::COOKIE, "_workbench_auth=alice")
+        .body(Body::empty())
+        .unwrap();
+    let (code, h, _) = send(authz_router(s.clone()), check).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "as for an app it hasn't");
+    assert!(!h.contains_key("x-workbench-upstream"));
+    let (code, _, body) = send(ui(&s), get("/denied?ws=alice&app=herdr", "alice")).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert!(body.contains("has no address for") && body.contains("from your terminal"), "{body}");
+    let (_, h, _) = send(ui(&s), post("/api/open", "alice", ORIGIN, "ws=alice&app=herdr")).await;
+    assert_eq!(h[header::LOCATION], "/w/alice/open/herdr");
+    let (code, _, body) = send(ui(&s), get("/w/alice/open/herdr", "alice")).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(body.contains("no address to open in a browser"), "{body}");
+    let (_, _, body) = send(ui(&s), get("/?w=alice", "alice")).await;
+    assert!(body.contains("Herdr · from a terminal") && !body.contains("Open Herdr"), "{body}");
 }
 
 #[test]

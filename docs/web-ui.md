@@ -108,6 +108,9 @@ workspace of the viewer's, that it has no such app and a link to its panel.
 The check lives in `workbench-web`, not in nginx, so runtime configs, the
 groups, the admin list and the owner rule are in one tested place.
 
+An app without an address has nothing there: the check answers `403`, as
+for an app the workspace hasn't, and the page says it has no address.
+
 ### Who may what
 
 | | Sees and controls | Creates |
@@ -191,7 +194,7 @@ one primary action:
 
 | State | Primary action |
 |---|---|
-| Running, with an app | **Open**, its first app, with a one-time link the first time from this browser |
+| Running, with an app with an address | **Open**, its first such app, with a one-time link the first time from this browser |
 | Starting, with an app | **Open** (the app may already answer) |
 | Running or Starting without one, Failing | **Console** |
 | Stopped | **Start** |
@@ -374,7 +377,7 @@ bar and the empty state. A page with one form:
 | SSH keys | pasted, one per line, `<type> <key> [comment]`; the directory has no SSH keys to take |
 | Memory | the most the VM grows to, from the boot size up to `web.selfService.maxMemoryGiB` |
 | Disk | from 16 GiB up to `web.selfService.maxDiskGiB` |
-| Apps | checkboxes of `web.selfService.apps`, all checked; none is fine, and they can change later |
+| Apps | checkboxes of `web.selfService.apps`, those whose `default` is true checked; none is fine, and they can change later |
 
 The page says how many of their quota the person has left. **Create**
 refuses, saying why, a name taken by any workspace, a disk or a config, a
@@ -472,7 +475,8 @@ Host memory, from `/proc/meminfo` and `/run/vmkit/memory/<pool>.json`:
 - **403** at `<ws>--<app>.<domain>` from the authorization check: "This
   workspace isn't yours. You're signed in as bob." with **Sign out** and a
   link to the UI; **404** "`<ws>` has no app `<app>`" for one of the
-  viewer's, with a link to its panel.
+  viewer's, with a link to its panel, and "`<ws>` has no address for
+  `<app>`" for an app without one.
 - **502** when the host can't be read (systemd or a config fails): "Couldn't
   read the workspaces from the host." with the error under Details.
 

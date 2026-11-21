@@ -77,6 +77,9 @@ pub struct Template {
     pub agent: String,
     /// The apps offered, in order: the closure has every one of them.
     pub apps: Vec<BootApp>,
+    /// Those a new workspace has unless someone says otherwise.
+    #[serde(default)]
+    pub default_apps: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub environment_files: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -110,7 +113,16 @@ impl Template {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = hostutil::read_bounded(path, MAX_FILE).with_context(|| path.display().to_string())?;
         let mut t: Template = serde_json::from_slice(&raw).with_context(|| path.display().to_string())?;
-        t.limits.apps = t.apps.iter().map(|a| AppInfo { id: a.id.clone(), name: a.name.clone() }).collect();
+        t.limits.apps = t
+            .apps
+            .iter()
+            .map(|a| AppInfo {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                terminal: a.port.is_none(),
+                default: t.default_apps.contains(&a.id),
+            })
+            .collect();
         Ok(t)
     }
 
@@ -339,12 +351,12 @@ fn unchecked_config_of(t: &Template, r: &Request, ip: &str, uid: u32) -> anyhow:
 /// ones. What it was given stays too, whatever the host offers now: its
 /// system, even one no longer offered, with its seed as it is, and its
 /// memory. Apps the host no longer offers go. One from before apps gets
-/// every app offered, which then was the one.
+/// the apps a new workspace has, which then was the one.
 pub fn refreshed(t: &Template, c: &Config) -> anyhow::Result<Config> {
     let mut apps: Vec<String> =
         c.apps.iter().filter(|a| t.apps.iter().any(|o| o.id == a.id)).map(|a| a.id.clone()).collect();
     if c.apps.is_empty() && c.legacy_app_port != 0 {
-        apps = t.apps.iter().map(|a| a.id.clone()).collect();
+        apps = t.apps.iter().filter(|a| t.default_apps.contains(&a.id)).map(|a| a.id.clone()).collect();
     }
     let r = Request {
         name: c.name.clone(),
@@ -987,7 +999,7 @@ pub(crate) mod tests {
                 max_memory_gib: 16,
                 max_disk_gib: 128,
                 quota: 1,
-                apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into() }],
+                apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into(), terminal: false, default: true }],
             },
             domain: "ws.test".into(),
             scheme: "https".into(),
@@ -1009,9 +1021,10 @@ pub(crate) mod tests {
             apps: vec![BootApp {
                 id: "t3code".into(),
                 name: "T3 Code".into(),
-                port: 3773,
+                port: Some(3773),
                 bundle: "/nix/store/x-t3code-app".into(),
             }],
+            default_apps: vec!["t3code".into()],
             environment: BTreeMap::new(),
             environment_files: vec![],
             socket_group: "workbench".into(),
@@ -1102,6 +1115,9 @@ pub(crate) mod tests {
         old.apps.clear();
         old.legacy_app_port = 3773;
         assert_eq!(refreshed(&t, &old).unwrap().apps, t.apps);
+        let mut opt_in = t.clone();
+        opt_in.apps.push(BootApp { id: "herdr".into(), port: None, ..t.apps[0].clone() });
+        assert_eq!(refreshed(&opt_in, &old).unwrap().apps, t.apps, "and only those a new workspace has");
         // A system no longer offered, or less memory than the host now
         // boots with, keeps what the workspace was given.
         let mut fewer = newer.clone();

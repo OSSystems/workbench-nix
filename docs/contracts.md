@@ -44,10 +44,10 @@ start: what the agent and `nixosModules.guest` set the guest up from.
 | `owner` | The person's user name in the guest; the apps run as this user. |
 | `url` | The workspace's address, which leads to its panel. |
 | `ip`, `gateway`, `nameservers` | The guest's `/32` address, the host's address it routes through, DNS. |
-| `appPort` | The first app's port, or 0: what guests from before apps read. Nothing reads it now. |
+| `appPort` | The first port of an app, or 0: what guests from before apps read. Nothing reads it now. |
 | `controlPort` | The vsock port the agent reports memory to, on the host. |
 | `agentPort` | The vsock port the agent listens on for the host. |
-| `apps` | The apps the VM boots with: each one's id, name, port and address. Its bundle is `config/apps/<id>`. |
+| `apps` | The apps the VM boots with: each one's id, name, port and address, without `port` and `url` for an app with no address, which people reach from a terminal. Its bundle is `config/apps/<id>`. |
 
 ## The shares
 
@@ -64,8 +64,8 @@ The config share, `/run/workspace/config`, holds besides `workspace.json`:
 The agent starts each app at boot with `systemd-run`, as the unit
 `workspace-app-<id>`: its `bin/serve`, as the owner in their home, with
 `Restart=always`, the environment and secret environment files, the
-packages first on `PATH`, `APP_PORT` and `APP_URL`. An agent that restarts
-leaves the units it finds.
+packages first on `PATH`, and `APP_PORT` and `APP_URL` for an app with an
+address. An agent that restarts leaves the units it finds.
 
 ## The agent
 
@@ -100,8 +100,8 @@ describes), so it trusts what it is asked.
 
 Failures the agent reports in `error`: `no request` (nothing within 10 s),
 `invalid JSON`, `unknown op`, and an operation's own reasons, such as an
-unknown owner, no such app, an app without a sign-in hook or a command that
-did not finish in time.
+unknown owner, no such app, an app without an address or a sign-in hook,
+or a command that did not finish in time.
 
 ### `ping`
 
