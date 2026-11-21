@@ -10,8 +10,9 @@ publish = false
 
 [workspace]
 members = ["model", "web"]
-# vmkit is the flake's input, linked here by the dev shell and the build.
-exclude = ["vmkit"]
+# vmkit is the flake's input, linked here by the dev shell and the build;
+# workbench-connect is a crate of its own, for people's computers.
+exclude = ["vmkit", "connect"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

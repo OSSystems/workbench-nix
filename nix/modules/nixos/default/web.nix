@@ -99,6 +99,47 @@ let
     '';
   };
 
+  # What a person's computer downloads to reach their workspaces: the
+  # script that sets it up, and workbench-connect for each Linux.
+  client = pkgs.callPackage ../../../packages/workbench-connect.nix { };
+  installScript = pkgs.writeText "install.sh" ''
+    #!/bin/sh
+    # Sets this computer up to reach your workspaces at ${cfg.domain} over SSH:
+    # downloads workbench-connect, which pairs it with the code from a
+    # workspace's Connect page and installs itself in ~/.local/bin.
+    #
+    #   curl -fsSL ${origin}/connect/install.sh | sh -s -- <code>
+    set -eu
+    if [ $# -ne 1 ]; then
+      echo "usage: curl -fsSL ${origin}/connect/install.sh | sh -s -- <code>" >&2
+      exit 2
+    fi
+    case "$(uname -s)" in
+      Linux) ;;
+      *) echo "workbench-connect runs on Linux only, for now." >&2; exit 1 ;;
+    esac
+    case "$(uname -m)" in
+      x86_64 | amd64) arch=x86_64 ;;
+      aarch64 | arm64) arch=aarch64 ;;
+      *) echo "workbench-connect has no build for $(uname -m)." >&2; exit 1 ;;
+    esac
+    if ! command -v ssh >/dev/null; then
+      echo "Install OpenSSH's client first: workbench-connect sets ssh up." >&2
+      exit 1
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    curl -fsSL -o "$tmp/workbench-connect" "${origin}/connect/bin/workbench-connect-$arch-linux"
+    chmod +x "$tmp/workbench-connect"
+    "$tmp/workbench-connect" setup --server "${origin}" "$1"
+  '';
+  connectSite = pkgs.runCommand "workbench-connect-site" { } ''
+    mkdir -p $out/bin
+    cp ${installScript} $out/install.sh
+    cp ${client.x86_64-linux}/bin/workbench-connect $out/bin/workbench-connect-x86_64-linux
+    cp ${client.aarch64-linux}/bin/workbench-connect $out/bin/workbench-connect-aarch64-linux
+  '';
+
   pools = [
     "workbench=${vmkit.memory.pools.workbench.statusFile}"
   ]
@@ -510,6 +551,8 @@ in
               '';
             };
             "@workbench_sign_in".extraConfig = signInLocation;
+            # Public: the script and the client, which hold no secret.
+            "/connect/".alias = "${connectSite}/";
             "= /connect/pair" = connectLocation;
             "= /connect/cert" = connectLocation;
             # The tunnel to a workspace's SSH server, which lasts as long as
