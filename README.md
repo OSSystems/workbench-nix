@@ -416,6 +416,8 @@ nix develop       # cargo, clippy, rustfmt, rust-analyzer, lld, wasm-bindgen; li
 cargo test --workspace
 cargo test -p workbench-web --features ssr
 nix build .#web .#web.site   # the UI's server, and its WebAssembly and assets
+nix build .#workbench-connect .#workbench-connect.aarch64-linux   # the client, static
+(cd connect && cargo test)   # the client, a crate of its own
 nix flake check   # rustfmt, clippy and the tests, the module evaluations, and the VM test
 nix fmt -- $(git ls-files '*.nix')
 ```
@@ -430,6 +432,11 @@ a vmkit checkout of your own; `nix develop` leaves such a link alone.
 
 What the host and its guests exchange, `workspace.json` and the agent's
 requests, is described in [docs/contracts.md](docs/contracts.md).
+
+`workbench-connect`, in `connect/`, has a `Cargo.lock` of its own and no
+dependency on workbench's crates or vmkit. Its aarch64 build cross-compiles
+Rust's standard library for musl, which no binary cache has: the first
+build of the host takes a while longer.
 
 `checks.guest` evaluates the system a new NixOS workspace writes and
 rebuilds. `checks.workspaces` boots two workspaces in a NixOS VM test, one

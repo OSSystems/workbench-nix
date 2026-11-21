@@ -1,0 +1,38 @@
+[package]
+name = "workbench-connect"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Reaches a person's workbench workspaces over SSH, from their own computer"
+license = "MIT"
+publish = false
+
+# Apart from workbench's workspace: a small static binary people download,
+# without the host's dependencies.
+[workspace]
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "json"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
