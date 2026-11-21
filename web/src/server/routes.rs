@@ -86,6 +86,7 @@ async fn guard(State(state): State<AppState>, mut req: Request, next: Next) -> R
         }
     }
     req.extensions_mut().insert(viewer);
+    req.extensions_mut().insert(super::Groups(groups));
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));

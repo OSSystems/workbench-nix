@@ -5,6 +5,7 @@
 //! stop and restart workspace units and nothing else.
 
 pub mod authz;
+pub mod connect;
 pub mod console;
 mod routes;
 mod self_service;
@@ -18,6 +19,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use leptos::config::LeptosOptions;
 use leptos::prelude::*;
 use workbench::config::{self, Config};
@@ -27,6 +29,7 @@ use workbench_model::apps::{BootApp, DeviceLink};
 use workbench_model::self_service::Limits;
 use workbench_model::{HostView, OpenBlocker, Snapshot, State, Verb, Viewer, Workspace, is_user_name};
 
+pub use connect::connect_router;
 pub use routes::{authz_router, ui_router};
 pub use self_service::CreateForm;
 pub use workbench::self_service::Paths as SelfServicePaths;
@@ -53,7 +56,16 @@ pub trait Backend: Send + Sync + 'static {
     /// Starts a unit and waits for it to finish: the units that make and
     /// destroy workspaces.
     fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
+    /// The host CA's public key, which signs the workspaces' host keys.
+    fn host_ca(&self) -> anyhow::Result<String>;
+    /// An SSH public key signed by the user CA for `user`, for a few hours.
+    fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
 }
+
+/// The groups single sign-on gave the person asking, as the UI's
+/// requests carry them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Groups(pub Vec<String>);
 
 /// Who single sign-on says someone is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -93,6 +105,13 @@ pub struct Options {
     pub reserve_min_gib: f64,
     /// The host's memory pools and their status files, for the host page.
     pub pools: Vec<(String, PathBuf)>,
+    /// Where the paired devices are kept.
+    pub devices: PathBuf,
+    /// `ssh-keygen`, the user CA's private key, which it signs people's
+    /// keys with, and the host CA's public key.
+    pub ssh_keygen: String,
+    pub user_ca: PathBuf,
+    pub host_ca: PathBuf,
 }
 
 impl Options {
@@ -133,6 +152,16 @@ impl Backend for HostBackend {
         Box::pin(authz::ask_oauth2_proxy(&self.opts.oauth2_proxy, cookie))
     }
 
+    fn host_ca(&self) -> anyhow::Result<String> {
+        let raw = vmkit::hostutil::read_bounded(&self.opts.host_ca, 64 << 10)
+            .with_context(|| self.opts.host_ca.display().to_string())?;
+        Ok(String::from_utf8_lossy(&raw).trim().to_owned())
+    }
+
+    fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(connect::sign_with(&self.opts.ssh_keygen, &self.opts.user_ca, user, id, key))
+    }
+
     fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let run = tokio::process::Command::new("systemctl")
@@ -167,6 +196,8 @@ pub struct AppState(Arc<Inner>);
 pub struct Inner {
     pub opts: Options,
     pub backend: Box<dyn Backend>,
+    /// The computers people paired, and the codes waiting.
+    pub devices: connect::Devices,
     pub leptos: LeptosOptions,
     pub consoles: console::Consoles,
     cache: tokio::sync::Mutex<Cache>,
@@ -247,18 +278,19 @@ fn see_other(to: &str) {
 }
 
 impl AppState {
-    #[must_use]
-    pub fn new(opts: Options, backend: Box<dyn Backend>, leptos: LeptosOptions) -> Self {
+    pub fn new(opts: Options, backend: Box<dyn Backend>, leptos: LeptosOptions) -> anyhow::Result<Self> {
         let consoles = console::Consoles::new(opts.dirs.clone());
-        AppState(Arc::new(Inner {
+        let devices = connect::Devices::load(&opts.devices)?;
+        Ok(AppState(Arc::new(Inner {
             opts,
             backend,
+            devices,
             leptos,
             consoles,
             cache: tokio::sync::Mutex::default(),
             authz: Mutex::default(),
             making: Mutex::default(),
-        }))
+        })))
     }
 
     /// Who `name`, a member of `groups`, is here.

@@ -29,6 +29,8 @@ struct Fake {
     paths: Option<Paths>,
     outcome: Arc<Mutex<Option<Outcome>>>,
     units: Arc<Mutex<Vec<String>>>,
+    /// The keys the UI had signed, and for whom.
+    signed: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 fn made(name: &str, owner: &str) -> Workspace {
@@ -128,6 +130,16 @@ impl Backend for Fake {
         Box::pin(async move { Ok(who) })
     }
 
+    fn host_ca(&self) -> anyhow::Result<String> {
+        Ok("ssh-ed25519 AAAAhostca workbench host CA".into())
+    }
+
+    fn sign_user_key<'a>(&'a self, user: &'a str, _: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        self.signed.lock().unwrap().push((user.to_owned(), key.to_owned()));
+        let cert = format!("ssh-ed25519-cert-v01@openssh.com AAAAcert-of-{user}");
+        Box::pin(async move { Ok(cert) })
+    }
+
     fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
         self.units.lock().unwrap().push(unit.to_owned());
         let name = unit.split_once('@').map(|(_, r)| r.trim_end_matches(".service")).unwrap_or_default();
@@ -176,11 +188,20 @@ fn state(fake: Fake) -> AppState {
         creator_groups: vec!["workbench".into()],
         self_service,
         cookie_name: "_workbench_auth".into(),
+        devices: devices_file(),
         ..Options::default()
     };
     let leptos =
         LeptosOptions::builder().output_name("workbench-web").site_root("target/site").site_pkg_dir("pkg").build();
-    AppState::new(opts, Box::new(fake), leptos)
+    AppState::new(opts, Box::new(fake), leptos).unwrap()
+}
+
+/// A devices file of the test's own, in a directory the process leaves.
+fn devices_file() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    dir.path().join(format!("devices-{}.json", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// Leptos's reactive runtime is global to the process: tests each on a
@@ -661,6 +682,61 @@ async fn apps_without_an_address() {
     assert!(body.contains("no address to open in a browser"), "{body}");
     let (_, _, body) = send(ui(&s), get("/?w=alice", "alice")).await;
     assert!(body.contains("Herdr · from a terminal") && !body.contains("Open Herdr"), "{body}");
+}
+
+fn json_post(path: &str, bearer: Option<&str>, body: &serde_json::Value) -> Request<Body> {
+    let mut req = Request::post(path).header(header::CONTENT_TYPE, "application/json");
+    if let Some(b) = bearer {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {b}"));
+    }
+    req.body(Body::from(body.to_string())).unwrap()
+}
+
+/// A computer pairs with a code its person made, once, and gets SSH
+/// certificates in their name while its credential works.
+#[tokio::test]
+async fn pairing_and_certificates() {
+    let _turn = TURN.lock().await;
+    let fake = Fake::default();
+    let signed = fake.signed.clone();
+    let s = state(fake);
+    let code = s.devices.make_code("alice", &["workbench".into()]).unwrap();
+    let pair = |code: &str| json_post("/connect/pair", None, &serde_json::json!({"code": code, "label": "laptop"}));
+    let (status, h, body) = send(connect_router(s.clone()), pair(&code)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h[header::CACHE_CONTROL], "no-store");
+    let paired: workbench_model::connect::Paired = serde_json::from_str(&body).unwrap();
+    assert_eq!((paired.user.as_str(), paired.domain.as_str()), ("alice", "ws.test"));
+    assert!(paired.host_ca.starts_with("ssh-ed25519 ") && paired.credential.starts_with("wbc-"), "{paired:?}");
+    let (status, _, body) = send(connect_router(s.clone()), pair(&code)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a code works once");
+    assert!(body.contains("doesn't work"), "{body}");
+    let (status, _, _) = send(connect_router(s.clone()), pair("wbp-0123")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbJhk5H0h7O laptop";
+    let cert =
+        |bearer: Option<&str>, key: &str| json_post("/connect/cert", bearer, &serde_json::json!({"publicKey": key}));
+    let (status, _, _) = send(connect_router(s.clone()), cert(None, key)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no credential");
+    let (status, _, _) = send(connect_router(s.clone()), cert(Some("wbc-nope"), key)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "not a credential");
+    let (status, _, body) = send(connect_router(s.clone()), cert(Some(&paired.credential), key)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let c: workbench_model::connect::Cert = serde_json::from_str(&body).unwrap();
+    assert_eq!(c.certificate, "ssh-ed25519-cert-v01@openssh.com AAAAcert-of-alice");
+    assert_eq!(*signed.lock().unwrap(), [("alice".to_owned(), key.to_owned())], "in her name");
+    let (status, _, _) = send(connect_router(s.clone()), cert(Some(&paired.credential), "ssh-ed25519 short")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "not a key");
+    let two = format!("{key}\n{key}");
+    let (status, _, _) = send(connect_router(s.clone()), cert(Some(&paired.credential), &two)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "one key");
+
+    let id = s.devices.of("alice")[0].id.clone();
+    s.devices.revoke("alice", &id).unwrap();
+    let (status, _, body) = send(connect_router(s), cert(Some(&paired.credential), key)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a revoked credential");
+    assert!(body.contains("revoked"), "{body}");
 }
 
 #[test]
