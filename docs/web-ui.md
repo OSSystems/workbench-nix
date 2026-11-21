@@ -651,9 +651,9 @@ module knows neither.
 - Whether cloud-hypervisor's serial socket takes more than one client. The
   shared console doesn't need it, but `workbench console` without
   `workbench-web` does.
-- T3 Code's `serve` and `openLink` belong in t3code-nix. Until then the
-  workbench module writes them, around `t3 serve` and
-  `t3 auth pairing create --json`.
+- T3 Code's `serve` and `openLink` are the workbench module's, around
+  `t3 serve` and `t3 auth pairing create --json`: llm-agents.nix packages
+  T3 Code without a NixOS module.
 - An app can't use paths under `/oauth2/`: oauth2-proxy has them.
 - The name rule is a prefix: someone whose slug is `samuel` may take
   `samuel-silva`, before `samuel.silva` does. Names are first come.
