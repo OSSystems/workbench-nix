@@ -12,7 +12,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use http_body_util::Empty;
 use hyper::body::Bytes;
-use workbench_model::is_user_name;
+use workbench::config::Config;
+use workbench_model::{Viewer, is_user_name};
 
 use super::{AppState, Identity, lock};
 
@@ -44,10 +45,7 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
     if let Ok(v) = HeaderValue::from_str(&who.groups.join(",")) {
         refused.insert("x-workbench-groups", v);
     }
-    // The owner rule of the list, from the config alone: a workspace made
-    // at run time needs its owner still in a self-service group.
-    let config = state.backend.config(name).ok().filter(|c| viewer.may_use(&c.owner, c.self_service));
-    let Some(c) = config else { return (StatusCode::FORBIDDEN, refused).into_response() };
+    let Some(c) = reachable_by(&state, &viewer, name) else { return (StatusCode::FORBIDDEN, refused).into_response() };
     // The UI's page for a workspace without the app tells the two apart.
     // An app without an address has nothing here to reach.
     let Some(port) = state.backend.reachable(&c).into_iter().find(|a| a.id == app).and_then(|a| a.port) else {
@@ -60,6 +58,14 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
         out.insert("x-workbench-cookie", v);
     }
     (StatusCode::OK, out).into_response()
+}
+
+/// The config of a workspace `viewer` may reach, by the owner rule of the
+/// list, from the config alone: a workspace made at run time needs its
+/// owner still in a self-service group. Its apps through nginx and its SSH
+/// server through the tunnel are reached by this one rule.
+pub(crate) fn reachable_by(state: &AppState, viewer: &Viewer, name: &str) -> Option<Config> {
+    state.backend.config(name).ok().filter(|c| viewer.may_use(&c.owner, c.self_service))
 }
 
 /// Who the single sign-on cookie is signed in as, and their groups, asked

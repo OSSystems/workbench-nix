@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use futures_util::{SinkExt, StreamExt};
 use tower::ServiceExt;
 use workbench::config::Config;
 use workbench::self_service::Paths;
@@ -31,6 +32,8 @@ struct Fake {
     units: Arc<Mutex<Vec<String>>>,
     /// The keys the UI had signed, and for whom.
     signed: Arc<Mutex<Vec<(String, String)>>>,
+    /// Where the workspaces' SSH servers listen.
+    ssh: String,
 }
 
 fn made(name: &str, owner: &str) -> Workspace {
@@ -53,7 +56,7 @@ fn ws(name: &str, owner: &str, state: State) -> Workspace {
             open_link: true,
         }],
         unit: "active".into(),
-        vm: "Running".into(),
+        vm: if state == State::Stopped { "-".into() } else { "Running".into() },
         ..Workspace::default()
     }
 }
@@ -138,6 +141,10 @@ impl Backend for Fake {
         self.signed.lock().unwrap().push((user.to_owned(), key.to_owned()));
         let cert = format!("ssh-ed25519-cert-v01@openssh.com AAAAcert-of-{user}");
         Box::pin(async move { Ok(cert) })
+    }
+
+    fn ssh_address(&self, _: &Config) -> String {
+        self.ssh.clone()
     }
 
     fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
@@ -737,6 +744,59 @@ async fn pairing_and_certificates() {
     let (status, _, body) = send(connect_router(s), cert(Some(&paired.credential), key)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "a revoked credential");
     assert!(body.contains("revoked"), "{body}");
+}
+
+/// The tunnel to a workspace's SSH server lets a device in by its
+/// person, by the owner rule of the access check, while the VM runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ssh_tunnel() {
+    use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+    let _turn = TURN.lock().await;
+    // The guest's SSH server, which says back what it gets.
+    let sshd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ssh = sshd.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = sshd.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = conn.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let s = state(Fake { ssh, ..Fake::default() });
+    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(axum::serve(server, connect_router(s.clone())).into_future());
+    let paired = |user: &str| s.devices.pair(&s.devices.make_code(user, &[]).unwrap(), "laptop").unwrap().0;
+    let (alice, bob, carol) = (paired("alice"), paired("bob"), paired("carol"));
+    let dial = |ws: &str, credential: Option<&str>| {
+        let mut req = format!("ws://{addr}/connect/ssh/{ws}").into_client_request().unwrap();
+        if let Some(c) = credential {
+            req.headers_mut().insert(header::AUTHORIZATION, format!("Bearer {c}").parse().unwrap());
+        }
+        tokio_tungstenite::connect_async(req)
+    };
+    let refused = |r: Result<_, tungstenite::Error>| match r {
+        Err(tungstenite::Error::Http(res)) => res.status().as_u16(),
+        Err(e) => panic!("{e}"),
+        Ok(_) => 101,
+    };
+    let (mut ws, _) = dial("alice", Some(&alice)).await.unwrap();
+    ws.send(tungstenite::Message::Binary(b"SSH-2.0-test\r\n".to_vec().into())).await.unwrap();
+    let back = ws.next().await.unwrap().unwrap();
+    assert_eq!(back.into_data().as_ref(), b"SSH-2.0-test\r\n", "through to the SSH server and back");
+    ws.close(None).await.unwrap();
+    assert_eq!(refused(dial("alice", None).await), 401, "no credential");
+    assert_eq!(refused(dial("alice", Some(&bob)).await), 403, "another person's credential");
+    assert_eq!(refused(dial("nobody", Some(&alice)).await), 403, "a workspace that doesn't exist, alike");
+    assert_eq!(refused(dial("bob", Some(&bob)).await), 409, "a VM that doesn't run");
+    assert_eq!(refused(dial("alice", Some(&carol)).await), 101, "an admin, whom the SSH server then asks for a name");
+    let id = s.devices.of("alice")[0].id.clone();
+    assert!(connect::still_reaches(&s, &id, "alice"), "an open tunnel stays");
+    assert!(!connect::still_reaches(&s, &id, "bob"), "not to another's");
+    s.devices.revoke("alice", &id).unwrap();
+    assert!(!connect::still_reaches(&s, &id, "alice"), "nor once its device is revoked");
+    assert_eq!(refused(dial("alice", Some(&alice)).await), 401, "a revoked credential");
 }
 
 #[test]

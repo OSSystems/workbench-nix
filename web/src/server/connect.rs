@@ -1,9 +1,11 @@
 //! The way in from a terminal, without single sign-on: a person signed in
 //! to the UI makes a pairing code; `workbench-connect` on their computer
 //! trades it, once, for a device credential, and the credential for SSH
-//! certificates in the person's name. These endpoints are on a socket of
-//! their own, `connect.sock`, which nginx reaches without single sign-on:
-//! each checks what it is given itself.
+//! certificates in the person's name, and for the tunnel to a workspace's
+//! SSH server, which `ssh` reaches through `workbench-connect tunnel`.
+//! These endpoints are on a socket of their own, `connect.sock`, which
+//! nginx reaches without single sign-on: each checks what it is given
+//! itself.
 //!
 //! The devices are a file of the UI's, `devices.json`, which keeps a hash
 //! of each credential, never the credential. Codes live in memory: one
@@ -16,13 +18,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
+use futures_util::{SinkExt, StreamExt};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vmkit::hostutil;
 use workbench_model::connect::{
     CERT_HOURS, CODE_MINUTES, CODE_PREFIX, CREDENTIAL_PREFIX, Cert, CertRequest, DEVICE_DAYS, GROUPS_DAYS, MAX_DEVICES,
@@ -38,6 +43,8 @@ const MAX_CODES: usize = 8;
 const USE_EVERY: i64 = 60;
 /// How often single sign-on saying the same groups again is written down.
 const SEEN_EVERY: i64 = 3600;
+/// How often an open tunnel asks again whether it may stay open.
+const RECHECK_EVERY: Duration = Duration::from_secs(30);
 /// The largest request the endpoints read.
 const MAX_BODY: usize = 16 << 10;
 /// The largest devices file read.
@@ -291,6 +298,7 @@ pub fn connect_router(state: AppState) -> Router {
     Router::new()
         .route("/connect/pair", post(pair))
         .route("/connect/cert", post(cert))
+        .route("/connect/ssh/{ws}", get(tunnel))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
@@ -376,6 +384,116 @@ async fn cert(State(state): State<AppState>, headers: HeaderMap, body: axum::bod
             ([(header::CACHE_CONTROL, "no-store")], axum::Json(Cert { certificate, valid_before })).into_response()
         }
         Err(e) => refused(StatusCode::INTERNAL_SERVER_ERROR, &format!("signing the key: {e:#}")),
+    }
+}
+
+/// `GET /connect/ssh/<ws>`, a WebSocket with a device's credential: a
+/// tunnel to the workspace's SSH server, for its owner and the admins, by
+/// the owner rule of the access check, while its VM runs. Both are asked
+/// at every connection, and the device and the owner rule every
+/// [`RECHECK_EVERY`] while it is open: revoking the device closes it. The
+/// SSH server then lets in the person the device's certificate names, by
+/// name.
+async fn tunnel(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    let (mut parts, _) = req.into_parts();
+    let device = match device_of(&state, &parts.headers) {
+        Ok(device) => device,
+        Err(why) => return unusable(&state, why),
+    };
+    let Some(c) = reachable(&state, &device, &name) else {
+        return refused(StatusCode::FORBIDDEN, &format!("{name} isn't yours, or doesn't exist."));
+    };
+    let runs = match state.all().await {
+        Ok(all) => all.iter().any(|ws| ws.name == c.name && ws.vm == "Running"),
+        Err(e) => return refused(StatusCode::BAD_GATEWAY, &format!("couldn't read the workspaces: {e:#}")),
+    };
+    if !runs {
+        return refused(StatusCode::CONFLICT, &format!("{name} isn't running. Start it from its panel."));
+    }
+    let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+        Ok(ws) => ws,
+        Err(e) => return e.into_response(),
+    };
+    let address = state.backend.ssh_address(&c);
+    ws.on_upgrade(move |socket| async move {
+        match tokio::net::TcpStream::connect(&address).await {
+            Ok(tcp) => {
+                tokio::select! {
+                    () = pump(socket, tcp) => {}
+                    () = until_refused(&state, &device.id, &name) => {
+                        eprintln!("closed the tunnel of {} to {name}: no longer theirs, or the device works no more", device.user);
+                    }
+                }
+            }
+            Err(e) => eprintln!("the tunnel of {} to {address}: {e}", device.user),
+        }
+    })
+}
+
+/// The workspace `name`, if the owner rule of the access check lets the
+/// device's person reach it, with the groups single sign-on last gave
+/// them.
+fn reachable(state: &AppState, device: &Device, name: &str) -> Option<workbench::config::Config> {
+    let viewer = state.viewer(&device.user, &device.groups)?;
+    super::authz::reachable_by(state, &viewer, name)
+}
+
+/// Whether the device `id` still works and may still reach the workspace
+/// `name`, as the device is now.
+pub(crate) fn still_reaches(state: &AppState, id: &str, name: &str) -> bool {
+    state.devices.working(id).is_some_and(|d| reachable(state, &d, name).is_some())
+}
+
+/// Ends once the device `id` no longer works or reaches `name`, asked
+/// every [`RECHECK_EVERY`].
+async fn until_refused(state: &AppState, id: &str, name: &str) {
+    let mut every = tokio::time::interval(RECHECK_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    every.tick().await;
+    loop {
+        every.tick().await;
+        if !still_reaches(state, id, name) {
+            return;
+        }
+    }
+}
+
+/// Passes the WebSocket's binary messages to the SSH server and its bytes
+/// back, until either end closes.
+async fn pump(socket: WebSocket, tcp: tokio::net::TcpStream) {
+    let (mut to_client, mut from_client) = socket.split();
+    let (mut from_server, mut to_server) = tcp.into_split();
+    let up = async {
+        while let Some(Ok(msg)) = from_client.next().await {
+            match msg {
+                Message::Binary(b) if to_server.write_all(&b).await.is_err() => break,
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        let _ = to_server.shutdown().await;
+    };
+    let down = async {
+        let mut buf = vec![0; 32 << 10];
+        loop {
+            match from_server.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if to_client.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = to_client.close().await;
+    };
+    tokio::select! {
+        () = up => {}
+        () = down => {}
     }
 }
 
