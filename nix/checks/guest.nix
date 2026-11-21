@@ -29,6 +29,7 @@ assert generated.inputs.workbench.url == "github:OSSystems/workbench-nix";
 assert generated.inputs.nixpkgs.url == "github:NixOS/nixpkgs/nixos-${lib.trivial.release}";
 assert config.users.users.alice.isNormalUser;
 assert lib.elem "wheel" config.users.users.alice.extraGroups;
+assert config.users.users.alice.linger;
 assert config.fileSystems."/nix/store" or null == null;
 assert config.fileSystems."/run/workspace/host/nix/store".fsType == "virtiofs";
 assert

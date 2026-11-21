@@ -210,6 +210,9 @@ pub struct GuestApp {
     pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Its `serve` starts what it runs and ends; its unit stays active.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oneshot: bool,
 }
 
 impl GuestConfig {
@@ -233,6 +236,7 @@ impl GuestConfig {
                     name: a.name.clone(),
                     port: a.port,
                     url: a.port.map(|_| app_url(&c.url, &a.id)),
+                    oneshot: a.oneshot,
                 })
                 .collect(),
         }

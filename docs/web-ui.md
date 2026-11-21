@@ -150,7 +150,7 @@ is everything that waits for a restart:
 |---|---|---|
 | `appAdded` | an app in the config, not in the VM | "T3 Code comes with the next restart." It doesn't open until then. |
 | `appRemoved` | an app in the VM, not in the config | "T3 Code goes with the next restart." It still opens until then. |
-| `appUpdated` | another bundle or port | "A new version of T3 Code comes with the next restart." |
+| `appUpdated` | another bundle, port or kind (oneshot) | "A new version of T3 Code comes with the next restart." |
 | `packages` | another packages bundle: what is on the PATH | "New packages come with the next restart." |
 
 The agent is apart from the packages: a newer workbench brings a newer

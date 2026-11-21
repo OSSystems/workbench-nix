@@ -17,6 +17,12 @@ let
   secretsDir = "/run/workspace/secrets";
   hostStore = "/run/workspace/host/nix/store";
   workspaceJSON = "${configDir}/workspace.json";
+  # Who the system's configuration says lingers, or not: the owner's choice.
+  lingerJSON = pkgs.writeText "workspace-linger.json" (
+    builtins.toJSON (
+      lib.mapAttrs (_: u: u.linger) (lib.filterAttrs (_: u: u.linger != null) config.users.users)
+    )
+  );
   app = "${configDir}/app";
   jq = lib.getExe pkgs.jq;
 
@@ -177,11 +183,18 @@ in
     };
 
     # The owner's account and, on a new disk, the flake they rebuild from.
+    # The owner lingers, so their user manager runs from boot for the
+    # apps, unless the owner's configuration says otherwise.
     workspace-init = {
       description = "Workspace owner and NixOS configuration";
       wantedBy = [ "multi-user.target" ];
+      after = [ "systemd-logind.service" ];
+      wants = [ "systemd-logind.service" ];
       unitConfig.RequiresMountsFor = [ configDir ];
-      path = [ pkgs.shadow ];
+      path = [
+        pkgs.shadow
+        config.systemd.package
+      ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -191,6 +204,9 @@ in
         name=$(${jq} -r .name ${workspaceJSON})
         if ! id "$owner" >/dev/null 2>&1; then
           useradd --create-home --groups wheel --shell /run/current-system/sw/bin/bash "$owner"
+        fi
+        if ${jq} -e --arg o "$owner" 'has($o) | not' ${lingerJSON} >/dev/null; then
+          loginctl enable-linger "$owner"
         fi
         if [ ! -e /etc/nixos/flake.nix ]; then
           mkdir -p /etc/nixos

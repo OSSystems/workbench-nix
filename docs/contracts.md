@@ -47,7 +47,7 @@ start: what the agent and `nixosModules.guest` set the guest up from.
 | `appPort` | The first port of an app, or 0: what guests from before apps read. Nothing reads it now. |
 | `controlPort` | The vsock port the agent reports memory to, on the host. |
 | `agentPort` | The vsock port the agent listens on for the host. |
-| `apps` | The apps the VM boots with: each one's id, name, port and address, without `port` and `url` for an app with no address, which people reach from a terminal. Its bundle is `config/apps/<id>`. |
+| `apps` | The apps the VM boots with: each one's id, name, port and address, without `port` and `url` for an app with no address, which people reach from a terminal, and `oneshot` for one whose `serve` starts what it runs and ends. Its bundle is `config/apps/<id>`. |
 
 ## The shares
 
@@ -63,9 +63,15 @@ The config share, `/run/workspace/config`, holds besides `workspace.json`:
 
 The agent starts each app at boot with `systemd-run`, as the unit
 `workspace-app-<id>`: its `bin/serve`, as the owner in their home, with
-`Restart=always`, the environment and secret environment files, the
-packages first on `PATH`, and `APP_PORT` and `APP_URL` for an app with an
-address. An agent that restarts leaves the units it finds.
+the environment and secret environment files, the packages first on
+`PATH`, `XDG_RUNTIME_DIR` of the owner's user manager, after it, and
+`APP_PORT` and `APP_URL` for an app with an address. A server has
+`Restart=always`; a oneshot app is `Type=oneshot` with `RemainAfterExit`.
+The owner lingers, so their user manager runs from boot: cloud-init
+enables it on Ubuntu, `nixosModules.guest` on NixOS unless the system's
+configuration says. The agent waits for the owner's account, which a
+NixOS guest makes as it boots. An agent that restarts leaves the units it
+finds.
 
 ## The agent
 

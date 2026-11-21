@@ -411,6 +411,7 @@ pub(crate) mod tests {
                 name: "T3 Code".into(),
                 port: Some(3773),
                 bundle: "/nix/store/x-t3code-app".into(),
+                oneshot: false,
             }],
             legacy_app_port: 0,
             environment: [("LLM_URL".to_owned(), "https://llm.example".to_owned())].into(),
