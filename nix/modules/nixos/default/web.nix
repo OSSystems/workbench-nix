@@ -439,10 +439,11 @@ in
             "--session-store-type=redis"
             "--redis-connection-url=unix://${redisSocket}"
             "--code-challenge-method=S256"
+            # Who signs in is preferred_username; the email decides nothing.
+            # Many directory users have none, and oauth2-proxy refuses a
+            # session without one, so the username stands in for it.
+            "--oidc-email-claim=preferred_username"
             "--email-domain=*"
-            # Who signs in is preferred_username; the email decides nothing,
-            # and Keycloak marks the emails it reads from LDAP unverified.
-            "--insecure-oidc-allow-unverified-email"
             "--set-xauthrequest"
             "--reverse-proxy"
             # Only nginx, on this host, may tell it the client's address.

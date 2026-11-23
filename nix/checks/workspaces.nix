@@ -270,7 +270,9 @@ pkgs.testers.runNixOSTest {
           };
           oidc = {
             provider = "oidc";
-            scope = "openid email profile groups offline_access";
+            # No email scope, so the ID token names no email, as Keycloak's
+            # doesn't for a directory user without a mail.
+            scope = "openid profile groups offline_access";
             issuerUrl = "https://${domain}/dex";
             clientSecretFile = "${pkgs.writeText "client-secret" "test-client-secret"}";
             cookieSecretFile = "${pkgs.writeText "cookie-secret" "0123456789abcdef0123456789abcdef"}";
