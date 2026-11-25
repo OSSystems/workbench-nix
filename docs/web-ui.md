@@ -816,8 +816,8 @@ module knows neither.
   shared console doesn't need it, but `workbench console` without
   `workbench-web` does.
 - T3 Code's `serve` and `openLink` are the workbench module's, around
-  `t3 serve` and `t3 auth pairing create --json`: llm-agents.nix packages
-  T3 Code without a NixOS module.
+  `t3 serve` and `t3 auth pairing create --json`: t3code-nix's NixOS
+  module is for a shared host, one server per person.
 - An app can't use paths under `/oauth2/`: oauth2-proxy has them.
 - A device's credential stands in for single sign-on for up to 7 days
   after the person last signed in to the UI: someone removed from the

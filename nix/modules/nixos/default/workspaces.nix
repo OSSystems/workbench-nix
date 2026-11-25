@@ -159,8 +159,12 @@ let
     name = lib.mkDefault "T3 Code";
     port = lib.mkDefault 3773;
     packages = [ cfg.package ];
+    # The host sizes the VM, which grows on demand from its boot memory:
+    # caps T3 Code took from the RAM of the moment would stop agents far
+    # below the VM's own limit.
     serve = ''
       export T3CODE_HOME=$HOME/.t3
+      export T3CODE_AGENT_SLICE_MEMORY_POLICY=host-managed
       exec ${t3} serve --host 0.0.0.0 --port "$APP_PORT"
     '';
     openLink = ''

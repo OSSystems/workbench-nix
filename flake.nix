@@ -18,6 +18,10 @@
     # The AI tools the apps run. Its own nixpkgs, so its packages are the
     # ones cache.numtide.com has built.
     llm-agents.url = "github:numtide/llm-agents.nix";
+    # T3 Code with OSSystems' patches, among them one that leaves the
+    # agents' memory to the VM's host. Its own nixpkgs, which it is built
+    # against.
+    t3code-nix.url = "github:OSSystems/t3code-nix";
     blueprint = {
       url = "github:numtide/blueprint";
       inputs.nixpkgs.follows = "nixpkgs";

@@ -130,11 +130,28 @@
         "type": "github"
       }
     },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1795234589,
+        "narHash": "sha256-f/VVvxf5RsQgWVhUtefoca5ktVg0DA2bnkMOcmSnozo=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2786a2a72088ecf32aea5b3ec52099e6a7cff78f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "blueprint": "blueprint",
         "llm-agents": "llm-agents",
         "nixpkgs": "nixpkgs_2",
+        "t3code-nix": "t3code-nix",
         "vmkit": "vmkit"
       }
     },
@@ -165,6 +182,24 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "t3code-nix": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_3"
+      },
+      "locked": {
+        "lastModified": 1795629971,
+        "narHash": "sha256-pLXqbTCcmD0JzCvUFEcaPFwowMe9luxAKWRLyUtQmY0=",
+        "owner": "OSSystems",
+        "repo": "t3code-nix",
+        "rev": "d162647fc59822ff21de086b86102230f22cfe84",
+        "type": "github"
+      },
+      "original": {
+        "owner": "OSSystems",
+        "repo": "t3code-nix",
         "type": "github"
       }
     },
