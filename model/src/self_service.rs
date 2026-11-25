@@ -115,6 +115,13 @@ impl Limits {
         (self.boot_mem_mib + 1023) / 1024
     }
 
+    /// Checks the most memory a VM may grow to: from its boot memory to
+    /// the host's most.
+    pub fn check_memory(&self, gib: i64) -> Result<(), String> {
+        let (lo, hi) = (self.min_memory_gib(), self.max_memory_gib);
+        if (lo..=hi).contains(&gib) { Ok(()) } else { Err(format!("Memory must be from {lo} to {hi} GiB.")) }
+    }
+
     /// Checks apps someone picked: offered ones, each once.
     pub fn check_apps(&self, apps: &[String]) -> Result<(), String> {
         for (i, id) in apps.iter().enumerate() {
@@ -165,10 +172,7 @@ impl Request {
         if keys != self.ssh_authorized_keys {
             return Err("SSH keys must be one per entry.".into());
         }
-        let (lo, hi) = (limits.min_memory_gib(), limits.max_memory_gib);
-        if !(lo..=hi).contains(&self.max_memory_gib) {
-            return Err(format!("Memory must be from {lo} to {hi} GiB."));
-        }
+        limits.check_memory(self.max_memory_gib)?;
         if !(MIN_DISK_GIB..=limits.max_disk_gib).contains(&self.disk_gib) {
             return Err(format!("Disk must be from {MIN_DISK_GIB} to {} GiB.", limits.max_disk_gib));
         }
@@ -183,6 +187,16 @@ impl Request {
 #[serde(deny_unknown_fields)]
 pub struct AppsRequest {
     pub apps: Vec<String>,
+}
+
+/// The most memory an admin wants a workspace made at run time to grow to:
+/// what the web UI writes and `workbench self-service memory` puts in its
+/// config. The VM grows to it after its next start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRequest {
+    #[serde(rename = "maxMemoryGiB")]
+    pub max_memory_gib: i64,
 }
 
 /// How a request ended, for the web UI to say.

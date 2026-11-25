@@ -453,8 +453,8 @@ in
       };
     };
 
-    # Start, stop and restart workspaces, make and destroy those made at
-    # run time, and nothing else.
+    # Start, stop and restart workspaces, make, change and destroy those
+    # made at run time, and nothing else.
     security.polkit.enable = true;
     security.polkit.extraConfig = ''
       polkit.addRule(function(action, subject) {
@@ -465,7 +465,7 @@ in
             return polkit.Result.YES;
           }
           ${lib.optionalString ss.enable ''
-            if (/^workbench-(create|destroy|apps)@[a-z][a-z0-9-]*\.service$/.test(unit) && verb == "start") {
+            if (/^workbench-(create|destroy|apps|memory)@[a-z][a-z0-9-]*\.service$/.test(unit) && verb == "start") {
               return polkit.Result.YES;
             }
           ''}

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use vmkit::hostutil::{self, Account};
 use workbench_model::apps::{AppInfo, BootApp};
-use workbench_model::self_service::{AppsRequest, Limits, Outcome, Request, quota_of};
+use workbench_model::self_service::{AppsRequest, Limits, MemoryRequest, Outcome, Request, quota_of};
 use workbench_model::{is_user_name, is_workspace_name};
 
 use crate::config::{self, Config};
@@ -180,6 +180,18 @@ impl Paths {
     #[must_use]
     pub fn apps_outcome(&self, name: &str) -> PathBuf {
         self.dir().join("results").join(format!("{name}.apps.json"))
+    }
+
+    /// A request to change the most memory a workspace grows to, and how
+    /// it went.
+    #[must_use]
+    pub fn memory_request(&self, name: &str) -> PathBuf {
+        self.dir().join("requests").join(format!("{name}.memory.json"))
+    }
+
+    #[must_use]
+    pub fn memory_outcome(&self, name: &str) -> PathBuf {
+        self.dir().join("results").join(format!("{name}.memory.json"))
     }
 
     /// The config of a workspace being made or taken away, root's: if the
@@ -740,6 +752,42 @@ async fn change_apps(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<
     write_config(paths, &next)
 }
 
+/// `workbench self-service memory <ws>`: gives a workspace made at run time
+/// the most memory an admin asked for in the web UI, in its config. The VM
+/// grows to it after its next start; whether that is now is the UI's to
+/// ask.
+pub async fn memory(t: &Template, name: &str) -> anyhow::Result<()> {
+    ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
+    let paths = t.paths();
+    remove(&paths.memory_outcome(name))?;
+    let result = change_memory(t, &paths, name).await;
+    write_outcome_at(&paths.memory_outcome(name), &outcome_of(&result, "The host couldn't change it"))?;
+    let _ = fs::remove_file(paths.memory_request(name));
+    result
+}
+
+async fn change_memory(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
+    let raw = read_theirs(&paths.memory_request(name)).context("the request")?;
+    let r: MemoryRequest = serde_json::from_slice(&raw).context("the request")?;
+    let _lock = paths.lock()?;
+    finish_pending(paths).await?;
+    let Some(c) = config::load(&[paths.configs()], name).ok().filter(|c| c.self_service) else {
+        bail!(Refused(format!("{name} wasn't made at run time: its memory is in the Nix configuration.")));
+    };
+    write_config(paths, &with_memory(t, &c, r.max_memory_gib)?)
+}
+
+/// A workspace's config growing to `gib` at most, within the template's
+/// limits. It boots with no more than that.
+fn with_memory(t: &Template, c: &Config, gib: i64) -> anyhow::Result<Config> {
+    t.limits.check_memory(gib).map_err(refuse)?;
+    let mut next = c.clone();
+    next.max_mem_mib = gib * 1024;
+    next.boot_mem_mib = next.boot_mem_mib.min(next.max_mem_mib);
+    next.validate()?;
+    Ok(next)
+}
+
 /// Writes a workspace's config where the host reads it after the Nix ones.
 fn write_config(paths: &Paths, c: &Config) -> anyhow::Result<()> {
     fs::create_dir_all(paths.configs())?;
@@ -1091,6 +1139,22 @@ pub(crate) mod tests {
         assert!(bare.apps.is_empty(), "a workspace with no app");
         let nixos = config_of(&t, &request("nixos"), "10.232.0.12", 60_601).unwrap();
         assert!(nixos.seed.is_empty(), "NixOS takes no seed");
+    }
+
+    /// An admin changes the most a workspace grows to within the limits,
+    /// which every later deploy keeps.
+    #[test]
+    fn memory_changes_within_the_limits() {
+        let t = template();
+        let c = config_of(&t, &request("ubuntu"), "10.232.0.11", 60_600).unwrap();
+        let more = with_memory(&t, &c, 16).unwrap();
+        assert_eq!((more.max_mem_mib, more.boot_mem_mib), (16_384, 2048));
+        assert_eq!(Config { max_mem_mib: c.max_mem_mib, ..more.clone() }, c, "nothing else changes");
+        assert_eq!(refreshed(&t, &more).unwrap().max_mem_mib, 16_384, "a deploy keeps it");
+        for gib in [1, 17] {
+            let e = with_memory(&t, &c, gib).unwrap_err();
+            assert_eq!(e.downcast_ref::<Refused>().unwrap().0, "Memory must be from 2 to 16 GiB.", "{gib}");
+        }
     }
 
     /// Every config is made again from a new template: the host's paths

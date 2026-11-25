@@ -834,11 +834,23 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                     {(!ws.os.is_empty()).then(|| view! { <dt>"System"</dt><dd>{os_name(&ws.os)}</dd> })}
                     {(ws.max_memory_bytes > 0)
                         .then(|| {
+                            // An admin changes how far one made at run time grows.
+                            let change = snap.with_untracked(|s| s.viewer.admin && s.memory_gib.is_some())
+                                && ws.self_service;
                             view! {
                                 <dt>"Memory"</dt>
                                 <dd>
                                     {if ws.memory_bytes > 0 { gib(ws.memory_bytes) } else { "—".into() }}
                                     {format!(" of {} GiB", gib(ws.max_memory_bytes))}
+                                    {change
+                                        .then(|| {
+                                            view! {
+                                                " · "
+                                                <a href=format!("/w/{}/memory", ws.name) rel="external">
+                                                    "Change…"
+                                                </a>
+                                            }
+                                        })}
                                     <span class="meter">
                                         <i style=format!("width: {}%", pct(ws.memory_bytes, ws.max_memory_bytes))></i>
                                         <b
@@ -1313,6 +1325,48 @@ fn AppsForm(
     }
 }
 
+/// The most memory a workspace made at run time grows to, which an admin
+/// changes within `range`, in GiB.
+#[component]
+fn MemoryForm(ws: Workspace, range: (i64, i64), error: String) -> impl IntoView {
+    let name = ws.name.clone();
+    let (lo, hi) = range;
+    let now = (ws.max_memory_bytes + (1 << 30) - 1) >> 30;
+    let stopped = ws.state == State::Stopped;
+    let save = if stopped {
+        view! { <button class="btn p">"Save"</button> }.into_any()
+    } else {
+        view! {
+            <button class="btn">"Save"</button>
+            <button class="btn p" name="restart" value="true">"Save and restart"</button>
+        }
+        .into_any()
+    };
+    view! {
+        <h2>"Memory of " <span class="mono">{name.clone()}</span></h2>
+        {(!error.is_empty()).then(|| view! { <div class="err"><b>{error.clone()}</b></div> })}
+        <form class="form" method="post" action="/api/memory">
+            <input type="hidden" name="ws" value=name.clone() />
+            <label>
+                <span>"Memory, at most"</span>
+                <input name="memory_gib" type="number" min=lo max=hi required value=now.to_string() />
+                <small>{format!("GiB, {lo} to {hi}; it boots with {} GiB and grows as it needs", gib(ws.boot_memory_bytes))}</small>
+            </label>
+            <p class="small">
+                {if stopped {
+                    "It grows up to it once it starts. Nothing on its disk changes."
+                } else {
+                    "The VM grows up to it once it restarts. Nothing on its disk changes."
+                }}
+            </p>
+            <div class="acts">
+                <a class="btn q" href=format!("/?w={name}")>"Cancel"</a>
+                {save}
+            </div>
+        </form>
+    }
+}
+
 /// The menus, the ⋯ of an app and the viewer's, close as a press lands
 /// outside them, or on Escape, like any other menu.
 fn close_menus_outside() {
@@ -1641,6 +1695,12 @@ fn ActionPage() -> impl IntoView {
                 set_status(422);
             }
             view! { <AppsForm ws offered=snap.apps.clone() error /> }.into_any()
+        } else if let (true, true, Some(range)) = (action == "memory", ws.self_service && viewer.admin, snap.memory_gib)
+        {
+            if !error.is_empty() {
+                set_status(422);
+            }
+            view! { <MemoryForm ws range error /> }.into_any()
         } else if action == "destroy" && ws.self_service {
             view! { <DestroyPage ws error detail /> }.into_any()
         } else if let Ok(verb) = action.parse::<Verb>() {
@@ -1650,6 +1710,8 @@ fn ActionPage() -> impl IntoView {
         };
         let title = if action == "apps" {
             format!("Apps in {name} · workbench")
+        } else if action == "memory" {
+            format!("Memory of {name} · workbench")
         } else if action == "destroy" {
             format!("Destroy {name} · workbench")
         } else {
