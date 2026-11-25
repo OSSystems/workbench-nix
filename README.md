@@ -388,12 +388,20 @@ comes with its next restart, and the web UI says what waits for it.
 ### T3 Code
 
 [T3 Code](https://github.com/pingdotgg/t3code) is the app `t3code` when
-`package` is set, by default to the `t3code` of
+`package` is set, by default to the `t3code-server` of
+[t3code-nix](https://github.com/OSSystems/t3code-nix), T3 Code with
+OSSystems' patches, with the agents of
 [llm-agents.nix](https://github.com/numtide/llm-agents.nix), where
-workbench's AI tools come from; it runs `t3 serve` on port 3773. It has no
-accounts: a browser gets in by following a one-time pairing link, made for
-the owner inside the guest. The module gives it the sign-in hook below,
-around `t3 auth pairing create`.
+workbench's other AI tools come from, on its PATH. It runs `t3 serve` on
+port 3773. It has no accounts: a browser gets in by following a one-time
+pairing link, made for the owner inside the guest. The module gives it the
+sign-in hook below, around `t3 auth pairing create`.
+
+T3 Code caps its agents' memory at a share of the RAM the machine has when
+an agent starts. A workspace boots with its boot memory and grows on demand
+up to its most, so that cap would stop agents long before the VM's own
+limit: the app runs with `T3CODE_AGENT_SLICE_MEMORY_POLICY=host-managed`,
+one of t3code-nix's patches, and the VM's most is the only cap.
 
 ### Herdr and Herdr app
 
@@ -490,5 +498,5 @@ rebuilds. `checks.workspaces` boots two workspaces in a NixOS VM test, one
 Ubuntu and one NixOS, each with T3 Code and herdr's two runtimes; it needs
 nested virtualization on the machine that builds it (`kvm_amd`/`kvm_intel`
 with `nested=1`). The test runs the default
-app, T3 Code, from llm-agents.nix: with `https://cache.numtide.com` among
-the substituters, it is downloaded rather than built.
+app, T3 Code, from t3code-nix, which OSSystems' Garnix builds and caches:
+a machine without that cache among its substituters builds it.
