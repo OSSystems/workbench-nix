@@ -1,5 +1,5 @@
 //! What people do with workspaces of their own: the New workspace page,
-//! creating, changing their apps, destroying, and the admins' quotas. The UI has no privilege:
+//! creating, changing their apps, destroying, and the admins' quotas and memory. The UI has no privilege:
 //! it writes the request, then starts the unit that makes or destroys the
 //! workspace as root, and reads how it went.
 
@@ -9,7 +9,9 @@ use axum::http::StatusCode;
 use leptos::prelude::ServerFnError;
 use vmkit::hostutil;
 use workbench::self_service::read_quotas;
-use workbench_model::self_service::{AppsRequest, NewView, Outcome, QuotaRow, Request, parse_ssh_keys, quota_of, slug};
+use workbench_model::self_service::{
+    AppsRequest, MemoryRequest, NewView, Outcome, QuotaRow, Request, parse_ssh_keys, quota_of, slug,
+};
 use workbench_model::{Quotas, State, Verb, Viewer, Workspace, is_user_name};
 
 use super::{AppState, SelfService, encode, refuse, see_other, status};
@@ -175,25 +177,97 @@ impl AppState {
         if let Err(e) = ss.limits.check_apps(&apps) {
             return refused(&e, StatusCode::UNPROCESSABLE_ENTITY);
         }
+        let change = Change {
+            what: "apps",
+            busy: format!("{name}'s apps are being changed just now: try again."),
+            request: ss.paths.apps_request(name),
+            outcome: ss.paths.apps_outcome(name),
+            unit: format!("workbench-apps@{name}.service"),
+        };
+        match self.change(ss, &ws, &change, &AppsRequest { apps }, restart).await {
+            Ok(()) => {
+                see_other(&format!("/?w={name}"));
+                Ok(())
+            }
+            Err((msg, code)) => refused(&msg, code),
+        }
+    }
+
+    /// The `memory` server function, for admins: gives a workspace made at
+    /// run time the most memory it grows to, through the unit that changes
+    /// its config as root, and with `restart` restarts it into it. Then
+    /// the list with it selected, or the memory page with why not.
+    pub async fn memory_action(
+        &self,
+        viewer: &Viewer,
+        name: &str,
+        memory_gib: &str,
+        restart: bool,
+    ) -> Result<(), ServerFnError> {
+        let ss = self.self_service()?;
+        if !viewer.admin {
+            return Err(refuse("a workspace's memory is for admins", StatusCode::FORBIDDEN));
+        }
+        let ws = self.find(viewer, name).await?;
+        if !ws.self_service {
+            return Err(refuse("only the Nix configuration changes this workspace's memory", StatusCode::FORBIDDEN));
+        }
+        let refused = |msg: &str, code: StatusCode| {
+            status(code);
+            see_other(&format!("/w/{name}/memory?error={}", encode(msg)));
+            Err(ServerFnError::new(msg))
+        };
+        let Ok(gib) = memory_gib.trim().parse::<i64>() else {
+            return refused("Memory must be a whole number of GiB.", StatusCode::UNPROCESSABLE_ENTITY);
+        };
+        if let Err(e) = ss.limits.check_memory(gib) {
+            return refused(&e, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let change = Change {
+            what: "memory",
+            busy: format!("{name}'s memory is being changed just now: try again."),
+            request: ss.paths.memory_request(name),
+            outcome: ss.paths.memory_outcome(name),
+            unit: format!("workbench-memory@{name}.service"),
+        };
+        match self.change(ss, &ws, &change, &MemoryRequest { max_memory_gib: gib }, restart).await {
+            Ok(()) => {
+                see_other(&format!("/?w={name}"));
+                Ok(())
+            }
+            Err((msg, code)) => refused(&msg, code),
+        }
+    }
+
+    /// Writes a change's request, runs its unit and reads how it went;
+    /// with `restart`, restarts a running workspace into it. Why not, and
+    /// the status that says it, otherwise.
+    async fn change(
+        &self,
+        ss: &SelfService,
+        ws: &Workspace,
+        change: &Change,
+        request: &impl serde::Serialize,
+        restart: bool,
+    ) -> Result<(), (String, StatusCode)> {
+        let name = &ws.name;
         // Another request would join this one's run, which takes only one.
         // Held until the unit is done, even if the browser goes away.
-        let Some(changing) = Making::start(self, &format!("{name}/apps")) else {
-            return refused(&format!("{name}'s apps are being changed just now: try again."), StatusCode::CONFLICT);
+        let Some(changing) = Making::start(self, &format!("{name}/{}", change.what)) else {
+            return Err((change.busy.clone(), StatusCode::CONFLICT));
         };
-        let request = ss.paths.apps_request(name);
         let written = (|| {
-            std::fs::create_dir_all(request.parent().unwrap_or(&ss.paths.dir()))?;
-            hostutil::atomic_write(&request, &serde_json::to_vec(&AppsRequest { apps })?, 0o640)?;
+            std::fs::create_dir_all(change.request.parent().unwrap_or(&ss.paths.dir()))?;
+            hostutil::atomic_write(&change.request, &serde_json::to_vec(request)?, 0o640)?;
             anyhow::Ok(())
         })();
         if let Err(e) = written {
-            return refused(&format!("The host couldn't take the request: {e:#}"), StatusCode::BAD_GATEWAY);
+            return Err((format!("The host couldn't take the request: {e:#}"), StatusCode::BAD_GATEWAY));
         }
         // On the clock the outcome is stamped with.
-        let asked = std::fs::metadata(&request).and_then(|m| m.modified()).ok();
-        let unit = format!("workbench-apps@{name}.service");
+        let asked = std::fs::metadata(&change.request).and_then(|m| m.modified()).ok();
         let run = {
-            let state = self.clone();
+            let (state, unit) = (self.clone(), change.unit.clone());
             tokio::spawn(async move {
                 let _changing = changing;
                 state.backend.run_unit(&unit).await
@@ -203,21 +277,20 @@ impl AppState {
         self.forget().await;
         // The unit writes its outcome anew; one from before this request
         // says nothing of it.
-        match (ran, asked.and_then(|at| read_outcome_since(&ss.paths.apps_outcome(name), at))) {
-            (_, Some(o)) if !o.ok => return refused(&o.error, StatusCode::UNPROCESSABLE_ENTITY),
+        match (ran, asked.and_then(|at| read_outcome_since(&change.outcome, at))) {
+            (_, Some(o)) if !o.ok => return Err((o.error, StatusCode::UNPROCESSABLE_ENTITY)),
             (Ok(()), Some(_)) => {}
-            (Err(e), _) => return refused(&format!("{e:#}"), StatusCode::BAD_GATEWAY),
-            (Ok(()), None) => return refused("The host said nothing of it.", StatusCode::BAD_GATEWAY),
+            (Err(e), _) => return Err((format!("{e:#}"), StatusCode::BAD_GATEWAY)),
+            (Ok(()), None) => return Err(("The host said nothing of it.".into(), StatusCode::BAD_GATEWAY)),
         }
-        // A stopped VM boots with them anyway; one on its way somewhere is
+        // A stopped VM boots with it anyway; one on its way somewhere is
         // left alone.
         if restart && !ws.state.changing() && ws.state != State::Stopped {
             if let Err(e) = self.backend.control(Verb::Restart, name).await {
-                return refused(&format!("Saved, but the restart failed: {e:#}"), StatusCode::BAD_GATEWAY);
+                return Err((format!("Saved, but the restart failed: {e:#}"), StatusCode::BAD_GATEWAY));
             }
             self.restarted(name).await;
         }
-        see_other(&format!("/?w={name}"));
         Ok(())
     }
 
@@ -310,8 +383,18 @@ fn read_outcome_since(path: &std::path::Path, since: std::time::SystemTime) -> O
     (at >= since).then(|| read_outcome(path)).flatten()
 }
 
-/// A name being made, or `<name>/apps` its apps being changed, until the
-/// request is answered.
+/// A change to a workspace made at run time: `what` changes, its request
+/// and outcome files, and the unit that makes it as root.
+struct Change {
+    what: &'static str,
+    busy: String,
+    request: std::path::PathBuf,
+    outcome: std::path::PathBuf,
+    unit: String,
+}
+
+/// A name being made, or `<name>/<what>` a change of it, until the request
+/// is answered.
 struct Making(AppState, String);
 
 impl Making {

@@ -1238,6 +1238,10 @@ in
             "apps"
             "%i"
           ];
+          "workbench-memory@" = selfServiceUnit "Change the memory of workspace %i" [
+            "memory"
+            "%i"
+          ];
           workbench-self-service =
             lib.recursiveUpdate
               (selfServiceUnit "Users, taps and starts of workspaces made at run time" [ "setup" ])

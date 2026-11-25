@@ -316,6 +316,10 @@ pub struct Snapshot {
     /// The apps a workspace made at run time may have.
     #[serde(default)]
     pub apps: Vec<apps::AppInfo>,
+    /// The least and the most memory, in GiB, a workspace made at run time
+    /// may grow to; none without workspaces made at run time.
+    #[serde(default)]
+    pub memory_gib: Option<(i64, i64)>,
 }
 
 impl Snapshot {
@@ -332,7 +336,7 @@ impl Snapshot {
                 r
             })
             .collect();
-        Snapshot { viewer, rows, apps: vec![] }
+        Snapshot { viewer, rows, apps: vec![], memory_gib: None }
     }
 
     #[must_use]

@@ -127,7 +127,7 @@ terminal.
 | Owner of a workspace from the Nix configuration | that workspace | — |
 | Owner of a workspace made at run time | that workspace, while in a self-service group | — |
 | Member of `web.selfService.groups` | their own | their own, within their quota |
-| Admin: in `web.adminGroups`, or named in `web.admins` | every workspace, the host page, the quotas | their own, within their quota |
+| Admin: in `web.adminGroups`, or named in `web.admins` | every workspace, the host page, the quotas, the memory of workspaces made at run time | their own, within their quota |
 
 A workspace made at run time is reachable by its owner only while the
 owner is in a self-service group: leaving the group cuts it off at the next
@@ -310,8 +310,9 @@ amber while starting, red while failing; a stopped workspace has none.
 
 **The side panel** shows the selected workspace: name, status and since
 when, what waits for a restart, then Owner (admins), System, Memory (a
-meter with a tick at the boot size), Disk on host, its apps and the
-actions:
+meter with a tick at the boot size, and for an admin on a workspace made
+at run time **Change…**, to its memory page), Disk on host, its apps and
+the actions:
 
 - **Apps**: each app's **Open `<app>`**, the first primary (`↵`), and a ⋯
   menu with **Open on another device…**, **Open with a new link** and
@@ -426,6 +427,25 @@ leaves the change waiting for the next start, and the panel says so.
 Every deploy makes the configs again from the template, keeping what each
 workspace was given: its system, even one no longer offered, and its
 memory.
+
+### The memory of a workspace (`/w/<ws>/memory`, admins)
+
+The most a workspace made at run time grows to, which its owner picked on
+**New workspace**: an admin changes it here, from the boot size to
+`web.selfService.maxMemoryGiB`, then **Save** or **Save and restart**; a
+stopped workspace has only **Save**. The VM boots with its boot memory
+and the host plugs more as it runs short, up to that most, which is the
+only cap: T3 Code leaves its agents' memory to the VM. A workspace from
+the Nix configuration has its memory there. Its owner sees the memory, not
+the page.
+
+As with apps, `workbench-web` writes
+`<stateDir>/self-service/requests/<ws>.memory.json` and starts
+`workbench-memory@<ws>.service`, which runs `workbench self-service memory
+<ws>` as root: under the self-service lock, it checks the limits, puts the
+most in the config, with a boot size no larger, and says how it went in
+`results/<ws>.memory.json`. One change at a time, and **Save** leaves it
+for the next start. Later deploys keep it.
 
 ### Connect to an app (`/w/<ws>/connect/<app>`)
 
@@ -621,8 +641,8 @@ Host memory, from `/proc/meminfo` and `/run/vmkit/memory/<pool>.json`:
   unit's `ExecStartPost`, `workbench share-sockets`, makes the API, vsock
   and serial sockets `0660` once cloud-hypervisor has made them.
 - A polkit rule lets it start, stop and restart `workbench@*.service`,
-  start `workbench-create@`, `workbench-destroy@` and `workbench-apps@`, and
-  nothing else.
+  start `workbench-create@`, `workbench-destroy@`, `workbench-apps@` and
+  `workbench-memory@`, and nothing else.
 - It owns `/var/lib/workbench/.stopped/`.
 - It listens on `/run/workbench-web/ui.sock`,
   `/run/workbench-web/authz.sock` and `/run/workbench-web/connect.sock`,
@@ -647,6 +667,7 @@ stop them; the `Origin` check does.
 | Create | the request file, `systemctl start workbench-create@<ws>`, 5 min |
 | Destroy | `systemctl start workbench-destroy@<ws>` |
 | Apps | the request file, `systemctl start workbench-apps@<ws>`, then a restart if asked |
+| Memory | the request file, `systemctl start workbench-memory@<ws>`, then a restart if asked |
 | Quota | `<stateDir>/self-service/quotas.json`, written in place |
 | Open | the agent's `open-link` over vsock, 90 s |
 | Connect | a code in memory; `devices.json`; `ssh-keygen -s` with the user CA; a TCP connection to `<ip>:22` |
@@ -675,6 +696,8 @@ just a page, current when loaded.
 | `POST` | `/api/device-link` | server function: `ws`, `app`; the link and its QR code as JSON |
 | `GET` | `/w/<ws>/apps` | the apps page of a workspace made at run time |
 | `POST` | `/api/apps` | server function: `ws`, `apps[<i>]`, `restart`; `303` to `/?w=<ws>` |
+| `GET` | `/w/<ws>/memory` | the memory page, admins |
+| `POST` | `/api/memory` | server function, admins: `ws`, `memory_gib`, `restart`; `303` to `/?w=<ws>` |
 | `GET` | `/new` | the New workspace page |
 | `POST` | `/api/create` | server function: `name`, `os`, `ssh_keys`, `memory_gib`, `disk_gib`, `apps[<i>]`; `303` to `/?w=<ws>` |
 | `GET` | `/w/<ws>/destroy` | the Destroy page |

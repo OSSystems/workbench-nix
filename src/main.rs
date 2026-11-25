@@ -123,6 +123,9 @@ enum SelfServiceCommand {
     Create { workspace: String },
     /// Give a workspace made at run time the apps the web UI asked for
     Apps { workspace: String },
+    /// Give a workspace made at run time the most memory an admin asked for
+    /// in the web UI
+    Memory { workspace: String },
     /// Stop a workspace made at run time and delete it
     Destroy { workspace: String },
     /// Put back, at boot, the users and taps of workspaces made at run time,
@@ -176,6 +179,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                     SelfServiceCommand::Create { workspace } => self_service::create(&dirs, &t, &workspace).await,
                     SelfServiceCommand::Destroy { workspace } => self_service::destroy(&t, &workspace).await,
                     SelfServiceCommand::Apps { workspace } => self_service::apps(&t, &workspace).await,
+                    SelfServiceCommand::Memory { workspace } => self_service::memory(&t, &workspace).await,
                     SelfServiceCommand::Setup => self_service::setup(&t).await,
                     SelfServiceCommand::Reconcile => self_service::reconcile(&t).await,
                 }

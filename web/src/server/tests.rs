@@ -11,7 +11,7 @@ use workbench::config::Config;
 use workbench::self_service::Paths;
 use workbench::state::OpenLinkError;
 use workbench_model::apps::{AppInfo, BootApp};
-use workbench_model::self_service::{AppsRequest, Limits, Outcome, Request as Asked};
+use workbench_model::self_service::{AppsRequest, Limits, MemoryRequest, Outcome, Request as Asked};
 use workbench_model::{App, State, Verb, Workspace};
 
 use super::*;
@@ -158,7 +158,13 @@ impl Backend for Fake {
         let name = unit.split_once('@').map(|(_, r)| r.trim_end_matches(".service")).unwrap_or_default();
         let outcome = self.outcome.lock().unwrap().clone();
         if let (Some(paths), Some(o)) = (&self.paths, &outcome) {
-            let out = if unit.starts_with("workbench-apps@") { paths.apps_outcome(name) } else { paths.outcome(name) };
+            let out = if unit.starts_with("workbench-apps@") {
+                paths.apps_outcome(name)
+            } else if unit.starts_with("workbench-memory@") {
+                paths.memory_outcome(name)
+            } else {
+                paths.outcome(name)
+            };
             std::fs::create_dir_all(out.parent().unwrap()).unwrap();
             std::fs::write(out, serde_json::to_vec(o).unwrap()).unwrap();
         }
@@ -584,6 +590,56 @@ async fn apps_of_a_workspace_made_at_run_time() {
     let (_, h, _) = send(ui(&s), as_alice("ws=alice-dev")).await;
     let to = h[header::LOCATION].to_str().unwrap();
     assert!(to.contains("said%20nothing") && !to.contains("old%20refusal"), "{to}");
+}
+
+/// An admin changes how far a workspace made at run time grows, through
+/// the host's unit; its owner doesn't, and a declared one's is Nix's.
+#[tokio::test]
+async fn admins_change_a_workspaces_memory() {
+    let _turn = TURN.lock().await;
+    let sized = Workspace { boot_memory_bytes: 2 << 30, max_memory_bytes: 8 << 30, ..made("alice-dev", "alice") };
+    let (dir, fake) = self_serve(vec![sized], Some(Outcome { ok: true, error: String::new() }));
+    let (units, calls) = (fake.units.clone(), fake.controlled.clone());
+    let s = state(fake);
+    let paths = Paths(dir.path().to_owned());
+    let page = r#"href="/w/alice-dev/memory""#;
+
+    let (_, _, panel) = send(ui(&s), with_groups(get("/?w=alice-dev", "alice"), "workbench")).await;
+    assert!(panel.contains("8 GiB") && !panel.contains(page), "the owner sees it, not the way to change it");
+    let (code, _, _) = send(ui(&s), with_groups(get("/w/alice-dev/memory", "alice"), "workbench")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let form = "ws=alice-dev&memory_gib=16";
+    let (code, _, _) = send(ui(&s), with_groups(post("/api/memory", "alice", ORIGIN, form), "workbench")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "for admins");
+
+    let (_, _, panel) = send(ui(&s), get("/?w=alice-dev", "carol")).await;
+    assert!(panel.contains(page), "{panel}");
+    let (code, _, body) = send(ui(&s), get("/w/alice-dev/memory", "carol")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body.contains("Memory of") && body.contains(r#"value="8""#) && body.contains("Save and restart"), "{body}");
+    let as_carol = |form: &str| post("/api/memory", "carol", ORIGIN, form);
+    let (_, h, _) = send(ui(&s), as_carol(form)).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-dev");
+    let asked: MemoryRequest =
+        serde_json::from_slice(&std::fs::read(paths.memory_request("alice-dev")).unwrap()).unwrap();
+    assert_eq!(asked.max_memory_gib, 16);
+    assert!(calls.lock().unwrap().is_empty(), "saved for the next start");
+    let (_, h, _) = send(ui(&s), as_carol("ws=alice-dev&memory_gib=12&restart=true")).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-dev");
+    assert_eq!(*calls.lock().unwrap(), [(Verb::Restart, "alice-dev".to_owned())], "and now");
+    assert_eq!(*units.lock().unwrap(), ["workbench-memory@alice-dev.service", "workbench-memory@alice-dev.service"]);
+
+    for (form, why) in
+        [("ws=alice-dev&memory_gib=17", "Memory%20must"), ("ws=alice-dev&memory_gib=x", "whole%20number")]
+    {
+        let (code, h, _) = send(ui(&s), as_carol(form)).await;
+        assert_eq!(code, StatusCode::SEE_OTHER);
+        let to = h[header::LOCATION].to_str().unwrap();
+        assert!(to.starts_with("/w/alice-dev/memory?error=") && to.contains(why), "{to}");
+    }
+    let (code, _, _) = send(ui(&s), as_carol("ws=alice&memory_gib=8")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "a declared workspace's memory is Nix's");
+    assert_eq!(units.lock().unwrap().len(), 2, "nothing refused reaches the host");
 }
 
 #[tokio::test]

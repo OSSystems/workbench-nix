@@ -69,6 +69,15 @@ pub async fn set_apps(
     state.apps_action(&viewer, &ws, apps, restart).await
 }
 
+/// For admins: gives a workspace made at run time the most memory it grows
+/// to, and with `restart` restarts it into it. A form comes back to the
+/// list with it selected, or to its memory page with why not.
+#[server(prefix = "/api", endpoint = "memory")]
+pub async fn set_memory(ws: String, memory_gib: String, #[server(default)] restart: bool) -> Result<(), ServerFnError> {
+    let (state, viewer) = crate::server::request()?;
+    state.memory_action(&viewer, &ws, &memory_gib, restart).await
+}
+
 /// What the New workspace page offers the viewer.
 #[server(prefix = "/api", endpoint = "new", input = GetUrl)]
 pub async fn get_new() -> Result<(Snapshot, NewView), ServerFnError> {
