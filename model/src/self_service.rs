@@ -171,6 +171,23 @@ impl Limits {
         }
     }
 
+    /// The most memory New workspace starts with: `auto` where the host
+    /// offers it, else 8 GiB within the limits.
+    #[must_use]
+    pub fn first_memory(&self) -> Ceiling {
+        if self.memory_auto() {
+            Ceiling::Auto
+        } else {
+            Ceiling::Size(self.max_memory_gib().min(8).max(self.min_memory_gib()))
+        }
+    }
+
+    /// The disk New workspace starts with, in GiB.
+    #[must_use]
+    pub fn first_disk_gib(&self) -> i64 {
+        64.min(self.max_disk_gib)
+    }
+
     /// Checks apps someone picked: offered ones, each once.
     pub fn check_apps(&self, apps: &[String]) -> Result<(), String> {
         for (i, id) in apps.iter().enumerate() {
@@ -274,6 +291,13 @@ pub struct NewView {
     /// Workspaces made at run time the viewer owns, and their quota.
     pub owned: u32,
     pub quota: u32,
+    /// On a front, for an admin: every node, to pick one from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<crate::fleet::NodeView>,
+    /// The node placement takes for the form as it starts, which is
+    /// preselected; empty for none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node: String,
 }
 
 /// A person on the host page's quotas.

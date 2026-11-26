@@ -4,6 +4,7 @@
 use jiff::{SignedDuration, Timestamp, ZonedDateTime, tz::TimeZone};
 use vmkit::hostutil;
 use vmkit::memory::{self, Status};
+use workbench_model::fleet::{NodeSection, NodeView, PoolStatus};
 use workbench_model::{HostView, PoolView, Row, Stage, State, Workspace};
 
 use super::Options;
@@ -125,7 +126,24 @@ pub fn host(opts: &Options, all: &[Workspace]) -> anyhow::Result<HostView> {
         workspaces: all.iter().filter(|ws| ws.memory_bytes > 0).cloned().collect(),
         at: local(now).strftime("%H:%M:%S").to_string(),
         quotas: None,
+        nodes: None,
     })
+}
+
+/// A front's host page: a section per node, with what it said of itself,
+/// whether it is `closed`, and the workspaces on it.
+pub fn fleet(nodes: &[NodeView], all: &[Workspace], closed: impl Fn(&str) -> bool) -> HostView {
+    let now = Timestamp::now();
+    let sections = nodes
+        .iter()
+        .map(|n| NodeSection {
+            node: n.clone(),
+            closed: closed(&n.name),
+            pools: n.host.iter().flat_map(|h| &h.pools).map(|p| pool_of(&p.name, p.status.as_ref(), now)).collect(),
+            workspaces: all.iter().filter(|w| w.node == n.name).cloned().collect(),
+        })
+        .collect();
+    HostView { at: local(now).strftime("%H:%M:%S").to_string(), nodes: Some(sections), ..HostView::default() }
 }
 
 /// One pool, from its status file; a stale one still shows when it last
@@ -133,7 +151,18 @@ pub fn host(opts: &Options, all: &[Workspace]) -> anyhow::Result<HostView> {
 fn pool(name: &str, file: &std::path::Path, now: Timestamp) -> PoolView {
     let status = hostutil::read_bounded(file, memory::STATUS_MAX_BYTES)
         .ok()
-        .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok());
+        .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok())
+        .map(|s| PoolStatus {
+            updated_at: s.updated_at,
+            committed_bytes: s.committed_bytes,
+            pending_bytes: s.pending_bytes,
+            denied_at: s.denied_at,
+        });
+    pool_of(name, status.as_ref(), now)
+}
+
+/// One pool, from its status, here or on a node.
+fn pool_of(name: &str, status: Option<&PoolStatus>, now: Timestamp) -> PoolView {
     let mut p = PoolView { name: name.to_owned(), ..PoolView::default() };
     match status {
         None => {

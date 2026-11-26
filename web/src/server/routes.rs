@@ -186,6 +186,11 @@ async fn denied(
     let domain = state.opts.domain().to_owned();
     let theirs =
         ws.as_ref().and_then(|n| state.backend.config(n).ok()).filter(|c| viewer.may_use(&c.owner, c.self_service));
+    if let Some(c) = &theirs
+        && authz::moving(&state, &c.name)
+    {
+        return moving_page(&state, &c.name);
+    }
     if let (Some(c), false) = (theirs, app.is_empty()) {
         let terminal = state.backend.reachable(&c).iter().any(|a| a.id == app && a.port.is_none());
         return no_app(&state, &c.name, &app, terminal);
@@ -230,6 +235,43 @@ async fn denied(
     .to_html();
     let policy = format!("default-src 'none'; style-src {origin}; img-src {origin}; frame-ancestors 'none'");
     (StatusCode::FORBIDDEN, [(header::CONTENT_SECURITY_POLICY, policy)], Html(page)).into_response()
+}
+
+/// The page at the address of an app of a workspace of the viewer's that
+/// moves: its VM is down while its disk is copied.
+fn moving_page(state: &AppState, name: &str) -> Response {
+    let origin = state.opts.origin.clone();
+    let page = view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
+                <meta name="color-scheme" content="light dark" />
+                <title>"Moving · workbench"</title>
+                <link rel="icon" href=format!("{origin}{}", asset(&state.leptos, "mark.svg")) type="image/svg+xml" />
+                <link rel="stylesheet" href=format!("{origin}{}", asset(&state.leptos, "app.css")) />
+            </head>
+            <body>
+                <div class="app">
+                    <main class="solo">
+                        <div class="card">
+                            <h1><span class="mono">{name.to_owned()}</span>" is moving to another node"</h1>
+                            <p>"It is down while its disk is copied, and its apps answer again once it's there."</p>
+                            <div class="acts">
+                                <a class="btn p" href=format!("{origin}/?w={name}")>
+                                    {format!("Open {name}'s panel")}
+                                </a>
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            </body>
+        </html>
+    }
+    .to_html();
+    let policy = format!("default-src 'none'; style-src {origin}; img-src {origin}; frame-ancestors 'none'");
+    (StatusCode::SERVICE_UNAVAILABLE, [(header::CONTENT_SECURITY_POLICY, policy)], Html(page)).into_response()
 }
 
 /// The page at the address of an app a workspace of the viewer's hasn't,

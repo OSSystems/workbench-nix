@@ -46,9 +46,23 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
         refused.insert("x-workbench-groups", v);
     }
     let Some(c) = reachable_by(&state, &viewer, name) else { return (StatusCode::FORBIDDEN, refused).into_response() };
+    // While it moves its VM is down, wherever the registry says it is: the
+    // UI's page says it moves.
+    if moving(&state, name) {
+        return (StatusCode::FORBIDDEN, refused).into_response();
+    }
+    // An app the record no longer has opens while the VM that runs still
+    // has it, as a state a second old at most says, so it goes with the
+    // restart: without one, it is refused. Only an app the last list saw
+    // run, or any before the first list, asks for one.
+    let mut reachable = state.backend.reachable(&c);
+    let ran = reachable.iter().any(|a| a.id == app) || !state.collected().await;
+    if !c.apps.iter().any(|a| a.id == app) && ran {
+        reachable = if state.refresh().await { state.backend.reachable(&c) } else { c.apps.clone() };
+    }
     // The UI's page for a workspace without the app tells the two apart.
     // An app without an address has nothing here to reach.
-    let Some(port) = state.backend.reachable(&c).into_iter().find(|a| a.id == app).and_then(|a| a.port) else {
+    let Some(port) = reachable.into_iter().find(|a| a.id == app).and_then(|a| a.port) else {
         return (StatusCode::FORBIDDEN, refused).into_response();
     };
     if let Ok(v) = HeaderValue::from_str(&format!("{}:{port}", c.ip)) {
@@ -66,6 +80,11 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap) -> Respon
 /// server through the tunnel are reached by this one rule.
 pub(crate) fn reachable_by(state: &AppState, viewer: &Viewer, name: &str) -> Option<Config> {
     state.backend.config(name).ok().filter(|c| viewer.may_use(&c.owner, c.self_service))
+}
+
+/// Whether a workspace moves, on a front: the registry says so.
+pub(crate) fn moving(state: &AppState, name: &str) -> bool {
+    state.backend.fleet().and_then(|f| f.record(name).ok()).is_some_and(|r| r.is_moving())
 }
 
 /// Who the single sign-on cookie is signed in as, and their groups, asked

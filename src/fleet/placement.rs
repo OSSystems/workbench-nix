@@ -36,7 +36,7 @@ pub fn place(nodes: &[NodeView], needs: Needs, chosen: &str) -> Result<String, S
             return Err(format!("{chosen:?} isn't a node of this fleet."));
         };
         if !n.takes() {
-            return Err(format!("Node {chosen} takes no new workspaces now: it is {:?}.", n.state));
+            return Err(format!("Node {chosen} takes no new workspaces now: it is {}.", n.state.label()));
         }
         if !has_room(n, needs) {
             return Err(format!("Node {chosen} has no room for it now."));

@@ -11,10 +11,11 @@ use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::{SsrMode, path};
 use workbench_model::apps::{AppInfo, connect_step, copyable_step};
 use workbench_model::connect::{CODE_MINUTES, ConnectView, DEVICE_DAYS, DeviceRow, GROUPS_DAYS, NO_TERMINAL_APP};
+use workbench_model::fleet::{NodeSection, NodeState, NodeView};
 use workbench_model::self_service::{MIN_DISK_GIB, NewView};
 use workbench_model::{
-    App, Change, Filter, HostView, List, OpenBlocker, Quotas, Row, Snapshot, Stage, State, Verb, Viewer, Workspace,
-    gib, pct,
+    App, Change, Filter, HostView, List, OpenBlocker, PoolView, Quotas, Row, Snapshot, Stage, State, Verb, Viewer,
+    Workspace, gib, pct,
 };
 
 use crate::api::{self, Control, MakeDeviceLink};
@@ -68,6 +69,7 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/w/:ws/open/:app") view=OpenPage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/connect/:app") view=ConnectPage ssr=SsrMode::Async />
                 <Route path=path!("/devices") view=DevicesPage ssr=SsrMode::Async />
+                <Route path=path!("/w/:ws/move") view=MovePage ssr=SsrMode::Async />
                 <Route path=path!("/w/:ws/:action") view=ActionPage ssr=SsrMode::Async />
             </Routes>
         </Router>
@@ -527,7 +529,8 @@ fn RowView(snap: RwSignal<Snapshot>, list: Memo<List>, name: String, select: Cal
                     .map(|r| {
                         let ws = r.ws;
                         let state = ws.state;
-                        let memory = (ws.memory_bytes > 0 && ws.max_memory_bytes > 0)
+                        // What a node that doesn't answer last said is no line.
+                        let memory = (ws.memory_bytes > 0 && ws.max_memory_bytes > 0 && !waits_for_node(state))
                             .then(|| {
                                 view! {
                                     <i
@@ -679,8 +682,20 @@ fn Primary(ws: Workspace) -> impl IntoView {
             view! { <ControlForm ws=ws.name.clone() verb=Verb::Start>"Start"</ControlForm> }.into_any()
         }
         (State::Stopping | State::Restarting, _) => view! { <span class="wait">"up to 2 min"</span> }.into_any(),
-        (State::Moving | State::Unreachable, _) => view! { <span class="wait">"waiting for its node"</span> }.into_any(),
+        (State::Moving, _) => view! { <span class="wait">"until it's there"</span> }.into_any(),
+        (State::Unreachable, _) => view! { <span class="wait">"waiting for its node"</span> }.into_any(),
     }
+}
+
+/// Whether a workspace's actions wait for its node: it moves, or its node
+/// doesn't answer.
+fn waits_for_node(state: State) -> bool {
+    matches!(state, State::Moving | State::Unreachable)
+}
+
+/// A button that is shown and does nothing: an action that waits.
+fn off(label: &'static str) -> impl IntoView {
+    view! { <span class="btn" aria-disabled="true"><span>{label}</span></span> }
 }
 
 /// Opens the `<dialog>` with this id, if the browser has dialogs; the
@@ -795,7 +810,7 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
     };
     let make = (make, for_app);
     let ws = move || row.with(|r| r.as_ref().map(|r| r.ws.clone()).unwrap_or_default());
-    // An admin sizes one made at run time, where the host offers sizes.
+    // An admin sizes one made at run time, where the front offers sizes.
     let resizable = row.with_untracked(|r| r.as_ref().is_some_and(|r| r.ws.self_service))
         && snap.with_untracked(|s| s.viewer.admin && s.memory_gib.is_some());
     let head = move || {
@@ -822,26 +837,48 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                             </div>
                         }
                     })}
+                {(st == State::Unreachable)
+                    .then(|| {
+                        view! {
+                            <div class="note bad">
+                                <b>"Its node doesn't answer."</b>
+                                " What it shows is what it last said. Its actions wait until its node is back."
+                            </div>
+                        }
+                    })}
+                {(st == State::Moving)
+                    .then(|| {
+                        view! {
+                            <div class="note">
+                                <b>"Moving to another node."</b>
+                                " It is down while its disk is copied. Its actions wait until it's there."
+                            </div>
+                        }
+                    })}
                 {(!ws.configured)
                     .then(|| {
                         view! {
                             <div class="note bad">
                                 <b>"Removed."</b>
-                                " This workspace is no longer in the configuration; its disk is kept until "
+                                {format!(
+                                    " This workspace is no longer in the configuration; its disk is kept on {} until ",
+                                    if ws.node.is_empty() { "its node".to_owned() } else { format!("node {}", ws.node) },
+                                )}
                                 <code>{format!("workbench destroy {}", ws.name)}</code>
-                                "."
+                                " runs there, and the front forgets it at its next boot or deploy."
                             </div>
                         }
                     })}
-                <dl class="kv">
+                <dl class="kv" class:gone=st == State::Unreachable>
                     {(!ws.owner.is_empty()).then(|| view! { <dt>"Owner"</dt><dd>{ws.owner.clone()}</dd> })}
+                    {(!ws.node.is_empty()).then(|| view! { <dt>"Node"</dt><dd class="mono">{ws.node.clone()}</dd> })}
                     {(!ws.ip.is_empty()).then(|| view! { <dt>"IP"</dt><dd class="mono">{ws.ip.clone()}</dd> })}
                     {(!ws.os.is_empty()).then(|| view! { <dt>"System"</dt><dd>{os_name(&ws.os)}</dd> })}
                     {(ws.max_memory_bytes > 0)
                         .then(|| {
                             // An admin changes how far one made at run time grows,
                             // in its dialog.
-                            let edit = resizable.then(|| {
+                            let edit = (resizable && !waits_for_node(ws.state)).then(|| {
                                 let id = format!("memory-{}", ws.name);
                                 view! {
                                     <a
@@ -865,7 +902,7 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                                             {format!(
                                                 " of {} GiB{}",
                                                 gib(ws.max_memory_bytes),
-                                                if ws.memory_auto { ", the host's" } else { "" },
+                                                if ws.memory_auto { ", its node's" } else { "" },
                                             )}
                                         </span>
                                         {edit}
@@ -880,7 +917,7 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                                 </dd>
                             }
                         })}
-                    <dt>"Disk on host"</dt>
+                    <dt>{if ws.node.is_empty() { "Disk on host" } else { "Disk on its node" }}</dt>
                     <dd>
                         {format!(
                             "{} of {} GiB",
@@ -901,6 +938,19 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
         let name = ws.name.clone();
         let (offered, owns) = snap.with(|s| (s.apps.clone(), s.viewer.owns(&ws)));
         let apps = view! { <AppsSection ws=ws.clone() offered owns device /> };
+        if waits_for_node(st) {
+            let destroy = ws.self_service.then(|| {
+                view! { <span class="btn q bad" aria-disabled="true">"Destroy…"</span> }
+            });
+            return Some(
+                view! {
+                    {apps}
+                    <div class="stack">{off("Console")} {off("Restart…")}</div>
+                    <div class="foot">{off("Stop…")} {destroy}</div>
+                }
+                .into_any(),
+            );
+        }
         let start = (st == State::Stopped).then(|| {
             let label = format!("Start {name}");
             view! {
@@ -960,11 +1010,14 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
             }
         });
         let foot = (stop.is_some() || destroy.is_some()).then(|| view! { <div class="foot">{stop} {destroy}</div> });
-        Some(view! {
-            {apps}
-            <div class="stack">{start} {console} {restart}</div>
-            {foot}
-        })
+        Some(
+            view! {
+                {apps}
+                <div class="stack">{start} {console} {restart}</div>
+                {foot}
+            }
+            .into_any(),
+        )
     };
     // The dialogs stay put while the panel changes, so live updates never
     // close one someone is reading.
@@ -1018,8 +1071,8 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                             {move || {
                                 memory_of.track();
                                 let ws = row.with_untracked(|r| r.as_ref().map(|r| r.ws.clone()).unwrap_or_default());
-                                let (range, auto) =
-                                    snap.with_untracked(|s| (s.memory_gib.unwrap_or_default(), s.memory_auto));
+                                let (range, auto) = snap
+                                    .with_untracked(|s| (s.memory_gib_on(&ws.node).unwrap_or_default(), s.memory_auto));
                                 view! { <MemoryForm ws range auto dialog=true /> }
                             }}
                         </dialog>
@@ -1078,7 +1131,8 @@ fn capitalized(s: &str) -> String {
 #[component]
 fn AppsSection(ws: Workspace, offered: Vec<AppInfo>, owns: bool, device: Callback<(String, String)>) -> impl IntoView {
     let name = ws.name.clone();
-    let editable = ws.self_service && !offered.is_empty();
+    // Its apps change once its node answers again, or it's there.
+    let editable = ws.self_service && !offered.is_empty() && !waits_for_node(ws.state);
     let dialog = format!("apps-{name}");
     let edit = editable.then(|| {
         let id = dialog.clone();
@@ -1127,6 +1181,14 @@ fn AppRow(ws: Workspace, app: App, first: bool, owns: bool, device: Callback<(St
     let stage = ws.stage(&app.id);
     let until = (stage == Stage::Going).then_some(" · until a restart");
     let dot = if ws.state == State::Running { "dot on" } else { "dot go" };
+    if waits_for_node(ws.state) {
+        return view! {
+            <div class="appo">
+                <span class="btn" aria-disabled="true"><span><span class="dot off"></span>{app.name.clone()}</span></span>
+            </div>
+        }
+        .into_any();
+    }
     match ws.open_blocker(&app.id) {
         None => {
             let label = format!("Open {}", app.name);
@@ -1378,8 +1440,8 @@ fn AppsForm(
 }
 
 /// The field of the most memory a VM grows to, in GiB from `lo` to `hi`,
-/// or `auto` where the host offers it: as far as the host has memory, `hi`
-/// GiB now. `then` follows its hint, and `list` names its suggestions,
+/// or `auto` where the front offers it: as far as its node has memory, at
+/// most `hi` GiB now. `then` follows its hint, and `list` names its suggestions,
 /// one per page.
 fn memory_input(lo: i64, hi: i64, auto: bool, value: String, then: &str, list: String) -> AnyView {
     if auto {
@@ -1388,7 +1450,7 @@ fn memory_input(lo: i64, hi: i64, auto: bool, value: String, then: &str, list: S
             <datalist id=list>
                 <option value="auto"></option>
             </datalist>
-            <small>{format!("GiB, {lo} to {hi}, or auto: as far as the host has memory, {hi} GiB now; {then}")}</small>
+            <small>{format!("GiB, {lo} to {hi}, or auto: as far as its node has memory, at most {hi} GiB now; {then}")}</small>
         }
         .into_any()
     } else {
@@ -1401,7 +1463,7 @@ fn memory_input(lo: i64, hi: i64, auto: bool, value: String, then: &str, list: S
 }
 
 /// The most memory a workspace made at run time grows to, which an admin
-/// changes within `range`, in GiB, or to `auto` where the host offers it:
+/// changes within `range`, in GiB, or to `auto` where the front offers it:
 /// in its dialog on the panel, or on its own page.
 #[component]
 fn MemoryForm(
@@ -1626,18 +1688,103 @@ fn HostPage() -> impl IntoView {
 fn Host(snap: Snapshot, host: HostView) -> impl IntoView {
     let viewer = snap.viewer.clone();
     let snap = Signal::stored(snap);
-    let total = host.total;
+    // A front's page is its nodes'; a host on its own's, its memory.
+    let body = if let Some(nodes) = host.nodes {
+        let targets: Vec<Target> = nodes.iter().filter(|n| n.node.takes()).map(Target::of).collect();
+        nodes.into_iter().map(|n| view! { <NodePanel n targets=targets.clone() /> }).collect_view().into_any()
+    } else {
+        let ws_rows = if host.workspaces.is_empty() {
+            view! {
+                <div>
+                    <span></span>
+                    <span class="small">"No workspace is running."</span>
+                </div>
+            }
+            .into_any()
+        } else {
+            host.workspaces
+                .iter()
+                .map(|w| {
+                    view! {
+                        <div role="row">
+                            <span class=format!("dot {}", w.state.dot())></span>
+                            <a class="mono" href=format!("/?w={}", w.name)>{w.name.clone()}</a>
+                            <span>{w.owner.clone()}</span>
+                            <span class="num">{format!("{} GiB", gib(w.memory_bytes))}</span>
+                            <span class="num">{format!("{} GiB", gib(w.boot_memory_bytes))}</span>
+                            <span class="num">{format!("{} GiB", gib(w.max_memory_bytes))}</span>
+                            <span class="num">
+                                {format!("{} GiB", gib(i64::try_from(w.disk_used_bytes).unwrap_or(i64::MAX)))}
+                            </span>
+                        </div>
+                    }
+                })
+                .collect_view()
+                .into_any()
+        };
+        view! {
+            <section class="panel">
+                <header>
+                    <h2>"Memory"</h2>
+                    <span>{format!("{} GiB total", gib(host.total))}</span>
+                    <span class="rt">{format!("{} GiB free", gib(host.free))}</span>
+                </header>
+                <Memory total=host.total reserve=host.reserve free=host.free pools=host.pools />
+            </section>
+            <section class="panel">
+                <header>
+                    <h2>"Workspaces"</h2>
+                    <span>"memory now, at boot and at most"</span>
+                </header>
+                <div class="tbl ws" role="table">
+                    <div class="hd" role="row">
+                        <span></span>
+                        <span>"Workspace"</span>
+                        <span>"Owner"</span>
+                        <span class="num">"Now"</span>
+                        <span class="num">"Boot"</span>
+                        <span class="num">"Most"</span>
+                        <span class="num">"Disk"</span>
+                    </div>
+                    {ws_rows}
+                </div>
+            </section>
+        }
+        .into_any()
+    };
+    view! {
+        <div class="app">
+            <Top viewer />
+            <div class="lay np">
+                <Side snap nav="host" />
+                <section class="main">
+                    <div class="bar">
+                        <h1>"Host"</h1>
+                        <span class="chips small">{format!("updated {}", host.at)}</span>
+                    </div>
+                    <div class="hostw">
+                        {body}
+                        {host.quotas.map(|q| view! { <QuotasPanel q /> })}
+                    </div>
+                </section>
+            </div>
+        </div>
+    }
+}
+
+/// A host's or a node's memory: one bar of its total, what each pool holds
+/// and waits for, the reserve and what's free, then a row per pool.
+#[component]
+fn Memory(total: i64, reserve: i64, free: i64, pools: Vec<PoolView>) -> impl IntoView {
     let bar = |i: usize| if i == 0 { "sw1" } else { "sw2" };
-    let committed = host
-        .pools
+    let committed = pools
         .iter()
         .enumerate()
         .map(|(i, p)| {
             view! { <i class=bar(i) style=format!("width: {}%", pct(p.committed, total)) title=p.name.clone()></i> }
         })
         .collect_view();
-    let pending = host
-        .pools
+    let pending = pools
         .iter()
         .filter(|p| p.pending > 0)
         .map(|p| {
@@ -1646,15 +1793,13 @@ fn Host(snap: Snapshot, host: HostView) -> impl IntoView {
             }
         })
         .collect_view();
-    let waiting: i64 = host.pools.iter().map(|p| p.pending).sum();
-    let legend = host
-        .pools
+    let waiting: i64 = pools.iter().map(|p| p.pending).sum();
+    let legend = pools
         .iter()
         .enumerate()
         .map(|(i, p)| view! { <span><i class=bar(i)></i>{format!("{} {} GiB", p.name, gib(p.committed))}</span> })
         .collect_view();
-    let pool_rows = host
-        .pools
+    let pool_rows = pools
         .iter()
         .map(|p| {
             view! {
@@ -1672,97 +1817,308 @@ fn Host(snap: Snapshot, host: HostView) -> impl IntoView {
             }
         })
         .collect_view();
-    let ws_rows = if host.workspaces.is_empty() {
+    view! {
+        <div class="hbar">
+            {committed}
+            {pending}
+            <i class="sw4" style=format!("width: {}%", pct(reserve, total)) title="reserve"></i>
+        </div>
+        <div class="legend">
+            {legend}
+            <span><i class="sw3"></i>{format!("waiting {} GiB", gib(waiting))}</span>
+            <span><i class="sw4"></i>{format!("reserve {} GiB", gib(reserve))}</span>
+            <span><i class="sw5"></i>{format!("free {} GiB", gib(free))}</span>
+        </div>
+        <div class="tbl" role="table">
+            <div class="hd" role="row">
+                <span>"Pool"</span>
+                <span class="num">"Holds"</span>
+                <span class="num">"Waiting"</span>
+                <span>"Last denied"</span>
+                <span>"Report"</span>
+            </div>
+            {pool_rows}
+        </div>
+    }
+}
+
+/// A disk's size, in bytes, as whole GiB or with one decimal.
+fn disk_gib(bytes: u64) -> String {
+    gib(i64::try_from(bytes).unwrap_or(i64::MAX))
+}
+
+/// A node a workspace may move to: one that takes moves, with its free
+/// memory and disk.
+#[derive(Debug, Clone)]
+struct Target {
+    name: String,
+    free: i64,
+    disk_free: u64,
+}
+
+impl Target {
+    fn of(n: &NodeSection) -> Self {
+        let (free, disk_free) = n.node.host.as_ref().map_or((0, 0), |h| (h.free(), h.disk_free));
+        Target { name: n.node.name.clone(), free, disk_free }
+    }
+}
+
+/// A node's section of a front's host page: its state, Close or Reopen,
+/// its memory and disk as it says them, and its workspaces, each made at
+/// run time with Move….
+#[component]
+fn NodePanel(n: NodeSection, targets: Vec<Target>) -> impl IntoView {
+    let NodeSection { node: n, closed, pools, workspaces } = n;
+    let name = n.name.clone();
+    // Closed or not, whether it answers: a node closed for maintenance stays
+    // closed while it is down.
+    let (label, value, title) = if closed {
+        ("Reopen", "false", "It takes new workspaces and moves again.")
+    } else {
+        ("Close", "true", "It runs what it has, and takes neither new workspaces nor moves.")
+    };
+    let toggle = view! {
+        <form method="post" action="/api/node">
+            <input type="hidden" name="node" value=name.clone() />
+            <input type="hidden" name="closed" value=value />
+            <button class="btn" title=title>{format!("{label} {name}")}</button>
+        </form>
+    };
+    let also_closed =
+        (closed && n.state != NodeState::Closed).then(|| view! { <span class="ns closed">"closed"</span> });
+    let says = match n.state {
+        NodeState::Up => None,
+        NodeState::Closed => Some("Closed: it runs what it has, and takes neither new workspaces nor moves."),
+        NodeState::Unreachable => Some(
+            "It doesn't answer: its workspaces are Unreachable and their actions wait. Their apps answer while their VMs run.",
+        ),
+        NodeState::OtherVersion => Some(
+            "It is of another build, and isn't controlled until it's deployed. Its VMs run, and their apps answer.",
+        ),
+    };
+    let note = says.map(|text| {
+        let class = if n.state == NodeState::Closed { "note" } else { "note bad" };
+        let detail = (!n.detail.is_empty()).then(|| view! { <span class="small">{format!(" {}", n.detail)}</span> });
+        view! { <div class=class><b>{text}</b>{detail}</div> }
+    });
+    let memory = n.host.as_ref().map(|h| {
+        view! {
+            <Memory total=h.mem_total reserve=h.reserve free=h.free() pools />
+            <p class="nodedisk">
+                {format!(
+                    "Disk: {} GiB free of {} GiB. Its workspaces may grow to {} GiB together.",
+                    disk_gib(h.disk_free),
+                    disk_gib(h.disk_total),
+                    gib(h.max_memory),
+                )}
+            </p>
+        }
+    });
+    let sizes = n.host.as_ref().map(|h| {
+        view! {
+            <span>{format!("{} GiB total", gib(h.mem_total))}</span>
+            <span class="rt">{format!("{} GiB free", gib(h.free()))}</span>
+        }
+    });
+    let rows = if workspaces.is_empty() {
         view! {
             <div>
                 <span></span>
-                <span class="small">"No workspace is running."</span>
+                <span class="small">"No workspace here."</span>
             </div>
         }
         .into_any()
     } else {
-        host.workspaces
+        workspaces
             .iter()
             .map(|w| {
+                let to: Vec<Target> = targets.iter().filter(|t| t.name != w.node).cloned().collect();
+                view! { <NodeRow ws=w.clone() targets=to /> }
+            })
+            .collect_view()
+            .into_any()
+    };
+    view! {
+        <section class="panel" aria-label=format!("Node {name}")>
+            <header>
+                <h2>"Node " <span class="mono">{name.clone()}</span></h2>
+                <span class=format!("ns {}", n.state.label().replace(' ', "-"))>{n.state.label()}</span>
+                {also_closed}
+                {sizes}
+                <span class:rt=n.host.is_none()>{toggle}</span>
+            </header>
+            {note}
+            {memory}
+            <div class="tbl nws" role="table">
+                <div class="hd" role="row">
+                    <span></span>
+                    <span>"Workspace"</span>
+                    <span>"Owner"</span>
+                    <span class="num">"Now"</span>
+                    <span class="num">"Boot"</span>
+                    <span class="num">"Most"</span>
+                    <span class="num">"Disk"</span>
+                    <span></span>
+                </div>
+                {rows}
+            </div>
+        </section>
+    }
+}
+
+/// A workspace on a node's section: its memory and disk, and Move… for
+/// one made at run time, in a dialog or on its own page.
+#[component]
+fn NodeRow(ws: Workspace, targets: Vec<Target>) -> impl IntoView {
+    let name = ws.name.clone();
+    let act = if !ws.configured {
+        view! { <span class="small">"not in the registry"</span> }.into_any()
+    } else if !ws.self_service {
+        view! { <span class="small" title="Nix places it: change its node there and deploy.">"declared in Nix"</span> }
+            .into_any()
+    } else if waits_for_node(ws.state) {
+        view! { <span class="btn" aria-disabled="true">"Move…"</span> }.into_any()
+    } else {
+        let id = format!("move-{name}");
+        let click = id.clone();
+        view! {
+            <a class="btn" href=format!("/w/{name}/move") data-dialog=id.clone() on:click=move |ev| open_dialog(&ev, &click)>
+                "Move…"
+            </a>
+            <dialog id=id class="dlg" aria-labelledby=format!("move-{name}-h")>
+                <MoveForm ws=ws.clone() targets dialog=true />
+            </dialog>
+        }
+        .into_any()
+    };
+    let sized = |b: i64| if b > 0 { format!("{} GiB", gib(b)) } else { "—".into() };
+    view! {
+        <div role="row">
+            <span class=format!("dot {}", ws.state.dot()) title=ws.state.label()></span>
+            <a class="mono" href=format!("/?w={name}")>{name.clone()}</a>
+            <span>{if ws.owner.is_empty() { "—".to_owned() } else { ws.owner.clone() }}</span>
+            <span class="num">{sized(ws.memory_bytes)}</span>
+            <span class="num">{sized(ws.boot_memory_bytes)}</span>
+            <span class="num">{sized(ws.max_memory_bytes)}</span>
+            <span class="num">{format!("{} GiB", disk_gib(ws.disk_bytes))}</span>
+            <span class="act">{act}</span>
+        </div>
+    }
+}
+
+/// Where a workspace made at run time may move: each open node of the same
+/// build but its own, with its free memory and disk. A declared one moves
+/// by changing Nix.
+#[component]
+fn MoveForm(
+    ws: Workspace,
+    targets: Vec<Target>,
+    #[prop(optional)] dialog: bool,
+    #[prop(optional)] error: String,
+) -> impl IntoView {
+    let name = ws.name.clone();
+    let head = view! { <h2 id=format!("move-{name}-h")>"Move " <span class="mono">{name.clone()}</span></h2> };
+    let cancel = if dialog {
+        view! { <button type="button" class="btn q" on:click=move |ev| close_dialog(&ev)>"Cancel"</button> }.into_any()
+    } else {
+        view! { <a class="btn q" href="/host">"Cancel"</a> }.into_any()
+    };
+    if !ws.self_service {
+        return view! {
+            {head}
+            <p>"Nix places it: change its " <code>"node"</code> " there and deploy, and the front moves it."</p>
+            <div class="acts">{cancel}</div>
+        }
+        .into_any();
+    }
+    let none = targets.is_empty();
+    let choices = if none {
+        view! {
+            <div class="none">
+                <b>"No other node takes it now."</b>
+                "Every other node is closed, doesn't answer or is of another build."
+            </div>
+        }
+        .into_any()
+    } else {
+        targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
                 view! {
-                    <div role="row">
-                        <span class=format!("dot {}", w.state.dot())></span>
-                        <a class="mono" href=format!("/?w={}", w.name)>{w.name.clone()}</a>
-                        <span>{w.owner.clone()}</span>
-                        <span class="num">{format!("{} GiB", gib(w.memory_bytes))}</span>
-                        <span class="num">{format!("{} GiB", gib(w.boot_memory_bytes))}</span>
-                        <span class="num">{format!("{} GiB", gib(w.max_memory_bytes))}</span>
-                        <span class="num">
-                            {format!("{} GiB", gib(i64::try_from(w.disk_used_bytes).unwrap_or(i64::MAX)))}
-                        </span>
-                    </div>
+                    <label class="check">
+                        <input type="radio" name="node" value=t.name.clone() checked=i == 0 required />
+                        <span><b class="mono">{t.name.clone()}</b></span>
+                        <small>{format!("{} GiB of memory free · {} GiB of disk free", gib(t.free), disk_gib(t.disk_free))}</small>
+                    </label>
                 }
             })
             .collect_view()
             .into_any()
     };
     view! {
-        <div class="app">
-            <Top viewer />
-            <div class="lay np">
-                <Side snap nav="host" />
-                <section class="main">
-                    <div class="bar">
-                        <h1>"Host"</h1>
-                        <span class="chips small">{format!("updated {}", host.at)}</span>
-                    </div>
-                    <div class="hostw">
-                        <section class="panel">
-                            <header>
-                                <h2>"Memory"</h2>
-                                <span>{format!("{} GiB total", gib(host.total))}</span>
-                                <span class="rt">{format!("{} GiB free", gib(host.free))}</span>
-                            </header>
-                            <div class="hbar">
-                                {committed}
-                                {pending}
-                                <i class="sw4" style=format!("width: {}%", pct(host.reserve, total)) title="reserve"></i>
-                            </div>
-                            <div class="legend">
-                                {legend}
-                                <span><i class="sw3"></i>{format!("waiting {} GiB", gib(waiting))}</span>
-                                <span><i class="sw4"></i>{format!("reserve {} GiB", gib(host.reserve))}</span>
-                                <span><i class="sw5"></i>{format!("free {} GiB", gib(host.free))}</span>
-                            </div>
-                            <div class="tbl" role="table">
-                                <div class="hd" role="row">
-                                    <span>"Pool"</span>
-                                    <span class="num">"Holds"</span>
-                                    <span class="num">"Waiting"</span>
-                                    <span>"Last denied"</span>
-                                    <span>"Report"</span>
-                                </div>
-                                {pool_rows}
-                            </div>
-                        </section>
-                        <section class="panel">
-                            <header>
-                                <h2>"Workspaces"</h2>
-                                <span>"memory now, at boot and at most"</span>
-                            </header>
-                            <div class="tbl ws" role="table">
-                                <div class="hd" role="row">
-                                    <span></span>
-                                    <span>"Workspace"</span>
-                                    <span>"Owner"</span>
-                                    <span class="num">"Now"</span>
-                                    <span class="num">"Boot"</span>
-                                    <span class="num">"Most"</span>
-                                    <span class="num">"Disk"</span>
-                                </div>
-                                {ws_rows}
-                            </div>
-                        </section>
-                        {host.quotas.map(|q| view! { <QuotasPanel q /> })}
-                    </div>
-                </section>
+        {head}
+        <p class="small">
+            {format!("On {} now. ", ws.node)}
+            "It is down while its disk is copied through the front, about 6 minutes for 40 GiB, and starts on the new node if it ran. Its address changes; its disk and apps don't."
+        </p>
+        {(!error.is_empty()).then(|| view! { <div class="err"><b>{error.clone()}</b></div> })}
+        <form class="form" method="post" action="/api/move">
+            <input type="hidden" name="ws" value=name.clone() />
+            <fieldset>
+                <legend>"To"</legend>
+                {choices}
+            </fieldset>
+            <div class="acts">
+                {cancel}
+                <button class="btn p" disabled=none>{format!("Move {name}")}</button>
             </div>
-        </div>
+        </form>
+    }
+    .into_any()
+}
+
+/// A workspace's move page, `/w/<ws>/move`, for admins on a front: the
+/// host page's dialog without JavaScript, and where a refused move comes
+/// back to.
+#[component]
+fn MovePage() -> impl IntoView {
+    let params = use_params_map();
+    let query = use_query_map();
+    let data = Resource::new_blocking(|| (), |()| api::get_host());
+    view! {
+        <Suspense>
+            {move || Suspend::new(async move {
+                let name = params.with_untracked(|p| p.get("ws").unwrap_or_default());
+                let error = query.with_untracked(|q| q.get("error").unwrap_or_default());
+                match data.await {
+                    Ok((snap, host)) => {
+                        let nodes = host.nodes.unwrap_or_default();
+                        let found = nodes.iter().flat_map(|n| &n.workspaces).find(|w| w.name == name && w.configured);
+                        let Some(ws) = found.cloned() else {
+                            return view! { <Forbidden viewer=Some(snap.viewer) /> }.into_any();
+                        };
+                        if !error.is_empty() {
+                            set_status(422);
+                        }
+                        let targets =
+                            nodes.iter().filter(|n| n.node.takes() && n.node.name != ws.node).map(Target::of).collect();
+                        view! {
+                            <Title text=format!("Move {name} · workbench") />
+                            <div class="app">
+                                <Top viewer=snap.viewer />
+                                <main class="solo">
+                                    <div class="card"><MoveForm ws targets error /></div>
+                                </main>
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    Err(e) if e.to_string().contains("for admins") => view! { <Forbidden viewer=None /> }.into_any(),
+                    Err(e) => view! { <Unreachable detail=e.to_string() /> }.into_any(),
+                }
+            })}
+        </Suspense>
     }
 }
 
@@ -1786,8 +2142,11 @@ fn ActionPage() -> impl IntoView {
                 set_status(422);
             }
             view! { <AppsForm ws offered=snap.apps.clone() error /> }.into_any()
-        } else if let (true, true, Some(range)) = (action == "memory", ws.self_service && viewer.admin, snap.memory_gib)
-        {
+        } else if let (true, true, Some(range)) = (
+            action == "memory",
+            ws.self_service && viewer.admin && !waits_for_node(ws.state),
+            snap.memory_gib_on(&ws.node),
+        ) {
             if !error.is_empty() {
                 set_status(422);
             }
@@ -1830,8 +2189,14 @@ fn ConfirmPage(ws: Workspace, verb: Verb, error: String, detail: String) -> impl
         "busy" => {
             set_status(409);
             view! {
-                <h1><span class="mono">{name.clone()}</span>{format!(" is already {}", ws.state)}</h1>
-                <p>"Wait until it's done, then try again."</p>
+                <h1><span class="mono">{name.clone()}</span>{ws.state.busy_suffix()}</h1>
+                <p>
+                    {match ws.state {
+                        State::Moving => "Try again once it's there.",
+                        State::Unreachable => "Try again once its node answers.",
+                        _ => "Wait until it's done, then try again.",
+                    }}
+                </p>
                 <div class="acts"><a class="btn p" href=back>"Back to workspaces"</a></div>
             }
             .into_any()
@@ -2362,6 +2727,7 @@ fn NewPage() -> impl IntoView {
                             disk: get("disk"),
                             keys: get("keys"),
                             apps: query.with_untracked(|q| q.get("apps")),
+                            node: get("node"),
                         };
                         view! { <NewForm viewer=snap.viewer new filled /> }.into_any()
                     }
@@ -2384,6 +2750,23 @@ struct Filled {
     keys: String,
     /// The apps picked, by id and comma: none when the form wasn't sent.
     apps: Option<String>,
+    node: String,
+}
+
+/// A node as New workspace offers it: what it has free and what its
+/// workspaces may grow to, or why it takes none.
+fn node_choice(n: &NodeView) -> String {
+    let state = if n.state == NodeState::Up { String::new() } else { format!(" · {}", n.state.label()) };
+    match &n.host {
+        Some(h) => format!(
+            "{}{state} · {} GiB free · its workspaces up to {} GiB · {} GiB of disk free",
+            n.name,
+            gib(h.free()),
+            gib(h.max_memory),
+            disk_gib(h.disk_free),
+        ),
+        None => format!("{}{state}", n.name),
+    }
 }
 
 #[component]
@@ -2392,12 +2775,9 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
     let left = new.quota.saturating_sub(new.owned);
     let or = |v: &str, d: String| if v.is_empty() { d } else { v.to_owned() };
     let name = or(&filled.name, if new.owned == 0 { new.slug.clone() } else { format!("{}-", new.slug) });
-    // Where the host offers it, a new workspace grows as far as the host has memory.
-    let memory = or(
-        &filled.memory,
-        if l.memory_auto() { "auto".into() } else { l.max_memory_gib().min(8).max(l.min_memory_gib()).to_string() },
-    );
-    let disk = or(&filled.disk, 64.min(l.max_disk_gib).to_string());
+    // Where the front offers it, a new workspace grows as far as its node has memory.
+    let memory = or(&filled.memory, l.first_memory().to_string());
+    let disk = or(&filled.disk, l.first_disk_gib().to_string());
     let chosen = if filled.os.is_empty() { l.os.first().cloned().unwrap_or_default() } else { filled.os.clone() };
     let systems =
         l.os.iter()
@@ -2437,6 +2817,24 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
             </fieldset>
         }
     });
+    // An admin on a front picks the node, from the one placement takes.
+    let node = (!new.nodes.is_empty()).then(|| {
+        let chosen = if filled.node.is_empty() { new.node.clone() } else { filled.node.clone() };
+        let options = new
+            .nodes
+            .iter()
+            .map(|n| {
+                view! { <option value=n.name.clone() selected=n.name == chosen disabled=!n.takes()>{node_choice(n)}</option> }
+            })
+            .collect_view();
+        view! {
+            <label>
+                <span>"Node"</span>
+                <select name="node">{options}</select>
+                <small>"Where its VM runs and its disk stays, until an admin moves it. It starts on the one with the most memory free."</small>
+            </label>
+        }
+    });
     if !filled.error.is_empty() {
         set_status(422);
     }
@@ -2470,6 +2868,7 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
                         <select name="os">{systems}</select>
                     </label>
                     {apps}
+                    {node}
                     <label>
                         <span>"SSH keys"</span>
                         <textarea name="ssh_keys" class="mono" rows="3" spellcheck="false" placeholder="ssh-ed25519 AAAA… you@laptop">

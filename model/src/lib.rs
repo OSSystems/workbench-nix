@@ -9,6 +9,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use jiff::Timestamp;
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub mod apps;
@@ -94,6 +96,20 @@ impl State {
     #[must_use]
     pub fn changing(self) -> bool {
         matches!(self, State::Stopping | State::Restarting | State::Moving | State::Unreachable)
+    }
+}
+
+impl State {
+    /// What follows a workspace's name to say why no action starts now:
+    /// " is already stopping", " is moving to another node", "'s node
+    /// doesn't answer".
+    #[must_use]
+    pub fn busy_suffix(self) -> String {
+        match self {
+            State::Moving => " is moving to another node".into(),
+            State::Unreachable => "'s node doesn't answer".into(),
+            s => format!(" is already {s}"),
+        }
     }
 }
 
@@ -334,13 +350,18 @@ pub struct Snapshot {
     /// may grow to; none without workspaces made at run time.
     #[serde(default)]
     pub memory_gib: Option<(i64, i64)>,
-    /// Whether such a workspace may grow to `auto`, the host's memory.
+    /// Whether such a workspace may grow to `auto`, its node's memory.
     #[serde(default)]
     pub memory_auto: bool,
+    /// For an admin: each node's memory, in whole GiB, as far as a
+    /// workspace on it may grow.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_memory_gib: BTreeMap<String, i64>,
 }
 
 impl Snapshot {
-    /// The workspaces `viewer` may see; only admins see their addresses.
+    /// The workspaces `viewer` may see; only admins see their addresses
+    /// and nodes.
     #[must_use]
     pub fn of(viewer: Viewer, rows: impl IntoIterator<Item = Row>) -> Self {
         let rows = rows
@@ -349,11 +370,20 @@ impl Snapshot {
             .map(|mut r| {
                 if !viewer.admin {
                     r.ws.ip.clear();
+                    r.ws.node.clear();
                 }
                 r
             })
             .collect();
-        Snapshot { viewer, rows, apps: vec![], memory_gib: None, memory_auto: false }
+        Snapshot { viewer, rows, apps: vec![], memory_gib: None, memory_auto: false, node_memory_gib: BTreeMap::new() }
+    }
+
+    /// The least and the most memory, in GiB, a workspace made at run time
+    /// on `node` may grow to: no more than that node has.
+    #[must_use]
+    pub fn memory_gib_on(&self, node: &str) -> Option<(i64, i64)> {
+        let (lo, hi) = self.memory_gib?;
+        Some((lo, self.node_memory_gib.get(node).map_or(hi, |&has| hi.min(has).max(lo))))
     }
 
     #[must_use]
@@ -429,9 +459,10 @@ pub struct List {
     pub mine: Vec<usize>,
 }
 
-const GROUPS: [(&str, &[State]); 5] = [
+const GROUPS: [(&str, &[State]); 6] = [
     ("Failing", &[State::Failing]),
-    ("Changing", &[State::Restarting, State::Stopping]),
+    ("Unreachable", &[State::Unreachable]),
+    ("Changing", &[State::Restarting, State::Stopping, State::Moving]),
     ("Starting", &[State::Starting]),
     ("Running", &[State::Running]),
     ("Stopped", &[State::Stopped]),
@@ -500,6 +531,9 @@ pub struct HostView {
     /// People's quotas, when the host lets people make workspaces.
     #[serde(default)]
     pub quotas: Option<Quotas>,
+    /// On a front, each node's section instead of the host's memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<Vec<fleet::NodeSection>>,
 }
 
 /// The host page's quotas: the host's, and each person's.
@@ -598,6 +632,24 @@ mod tests {
         assert_eq!(labels, ["Failing"], "a search leaves no empty group");
         assert_eq!(l.selected.as_deref(), Some("b"), "nor a selection it does not match");
         assert_eq!(Filter::parse("mine", false), Filter::All, "only admins filter for their own");
+    }
+
+    /// On a front, a moving workspace is changing, one whose node doesn't
+    /// answer has a group of its own, and only admins see nodes.
+    #[test]
+    fn moving_and_unreachable() {
+        let mut rows = [ws("a", "alice", State::Moving), ws("b", "alice", State::Unreachable)];
+        for r in &mut rows {
+            r.ws.node = "n1".into();
+        }
+        let admin = Snapshot::of(Viewer { name: "carol".into(), admin: true, creates: true }, rows.clone());
+        let l = List::build(&admin, Filter::All, "", "");
+        let labels: Vec<_> = l.groups.iter().map(|g| (g.label, g.state.dot())).collect();
+        assert_eq!(labels, [("Unreachable", "bad"), ("Changing", "go")]);
+        assert!(admin.rows.iter().all(|r| r.ws.node == "n1"));
+        let owner = Snapshot::of(Viewer { name: "alice".into(), admin: false, creates: true }, rows);
+        assert_eq!(owner.rows.len(), 2);
+        assert!(owner.rows.iter().all(|r| r.ws.node.is_empty()), "owners see nothing of nodes");
     }
 
     #[test]

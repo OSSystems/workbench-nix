@@ -210,6 +210,20 @@ dialog.dlg::backdrop { background: var(--scrim); }
 .tbl.ws > div { grid-template-columns: 16px 1.2fr 1fr .8fr 1fr .8fr .8fr; }
 .tbl .num { text-align: right; }
 .stale { color: var(--go); }
+/* A front's nodes: each its section, with its state and its workspaces. */
+.ns { padding: 1px 8px; border-radius: 999px; border: 1px solid var(--ok-edge); background: var(--ok-soft); color: var(--ok) !important; font-weight: 600; }
+.ns.closed, .ns.other-build { border-color: var(--go-edge); background: var(--go-soft); color: var(--go) !important; }
+.ns.unreachable { border-color: var(--bad-edge); background: var(--bad-soft); color: var(--bad) !important; }
+.panel > header > span:last-child:not(.rt) { margin-left: 8px; }
+.panel > .note { margin: 12px 16px 0; }
+.nodedisk { padding: 0 16px 14px; font-size: 12.5px; color: var(--t2); }
+.tbl.nws { min-width: 640px; }
+.tbl.nws > div { grid-template-columns: 16px 1.2fr 1fr .7fr .7fr .7fr .7fr 104px; }
+.tbl.nws .act .btn { height: 28px; }
+/* What waits for a node: shown, greyed, never sent. */
+.btn[aria-disabled] { opacity: .5; cursor: default; }
+.btn[aria-disabled]:hover { border-color: var(--line2); }
+.kv.gone dd { color: var(--t3); }
 
 /* Phone: the list is the page; a picked workspace's panel is a page of
    its own. */

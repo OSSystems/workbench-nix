@@ -306,6 +306,19 @@ pub enum NodeState {
     OtherVersion,
 }
 
+impl NodeState {
+    /// The word for it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeState::Up => "up",
+            NodeState::Closed => "closed",
+            NodeState::Unreachable => "unreachable",
+            NodeState::OtherVersion => "other build",
+        }
+    }
+}
+
 /// One node on the host page and in New workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -326,6 +339,21 @@ impl NodeView {
     pub fn takes(&self) -> bool {
         self.state == NodeState::Up && self.host.is_some()
     }
+}
+
+/// One node's section of a front's host page: what it said of itself,
+/// whether an admin closed it, its pools as a host's page shows them, and
+/// its workspaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSection {
+    pub node: NodeView,
+    /// An admin closed it: its state says so only while it answers.
+    pub closed: bool,
+    pub pools: Vec<crate::PoolView>,
+    /// The workspaces the registry has on it, and the disks it has that
+    /// the registry doesn't.
+    pub workspaces: Vec<Workspace>,
 }
 
 /// Why a workspace's node didn't do what it was asked, as people are

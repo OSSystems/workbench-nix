@@ -1,21 +1,25 @@
 //! What people do with workspaces of their own: the New workspace page,
-//! creating, changing their apps, destroying, and the admins' quotas and memory. The UI has no privilege:
-//! it writes the request, then starts the unit that makes or destroys the
-//! workspace as root, and reads how it went.
+//! creating, changing their apps, destroying, and the admins' quotas and
+//! memory; on a front, the admins' nodes and moves too. The UI has no
+//! privilege: it writes the request, then starts the unit that makes,
+//! destroys or moves the workspace as root, and reads how it went.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use axum::http::StatusCode;
 use leptos::prelude::ServerFnError;
 use vmkit::hostutil;
-use workbench::self_service::read_quotas;
+use workbench::fleet::placement;
+use workbench::self_service::{read_outcome, read_outcome_since, read_quotas};
+use workbench_model::fleet::{NodeState, NodeView};
 use workbench_model::memory::Ceiling;
 use workbench_model::self_service::{
-    AppsRequest, MemoryRequest, NewView, Outcome, QuotaRow, Request, parse_ssh_keys, quota_of, slug,
+    AppsRequest, Limits, MemoryRequest, NewView, Outcome, QuotaRow, Request, parse_ssh_keys, quota_of, slug,
 };
-use workbench_model::{Quotas, State, Verb, Viewer, Workspace, is_user_name};
+use workbench_model::{GIB, Quotas, State, Verb, Viewer, Workspace, is_user_name};
 
-use super::{AppState, SelfService, encode, refuse, see_other, status};
+use super::{AppState, SelfService, encode, refuse, see_other, status, told_error, told_outcome};
 
 /// The most a quota may be.
 const MAX_QUOTA: u32 = 100;
@@ -31,6 +35,8 @@ pub struct CreateForm {
     pub memory_gib: String,
     pub disk_gib: String,
     pub apps: Vec<String>,
+    /// On a front, the node an admin picked.
+    pub node: String,
 }
 
 impl CreateForm {
@@ -41,14 +47,52 @@ impl CreateForm {
         let keys = if keys.len() <= MAX_KEYS_BACK { keys } else { String::new() };
         let apps: Vec<&str> = self.apps.iter().take(16).map(String::as_str).collect();
         format!(
-            "/new?error={}&name={}&os={}&memory={}&disk={}&apps={}&keys={keys}",
+            "/new?error={}&name={}&os={}&memory={}&disk={}&apps={}&node={}&keys={keys}",
             encode(error),
             encode(&self.name.chars().take(64).collect::<String>()),
             encode(&self.os.chars().take(16).collect::<String>()),
             encode(&self.memory_gib.chars().take(8).collect::<String>()),
             encode(&self.disk_gib.chars().take(8).collect::<String>()),
             encode(&apps.join(",").chars().take(256).collect::<String>()),
+            encode(&self.node.chars().take(32).collect::<String>()),
         )
+    }
+}
+
+/// Why `picked` takes no `what` now, if it doesn't: it isn't one of the
+/// fleet's, or it is closed, silent or of another build.
+fn why_not_on(nodes: &[NodeView], picked: &str, what: &str) -> Option<String> {
+    match nodes.iter().find(|n| n.name == picked) {
+        None => Some(format!("{picked:?} isn't a node of this fleet.")),
+        Some(n) => why_not(n, what),
+    }
+}
+
+/// Why a node takes no `what` now, if it doesn't: closed, silent or of
+/// another build.
+fn why_not(n: &NodeView, what: &str) -> Option<String> {
+    let name = &n.name;
+    match n.state {
+        _ if n.takes() => None,
+        NodeState::Closed => Some(format!("Node {name} is closed: it takes no {what}.")),
+        NodeState::OtherVersion => {
+            Some(format!("Node {name} is of another build: it takes no {what} until it's deployed."))
+        }
+        NodeState::Up | NodeState::Unreachable => {
+            Some(format!("Node {name} doesn't answer just now: it takes no {what}."))
+        }
+    }
+}
+
+/// What a new workspace needs of its node, as New workspace starts.
+fn first_needs(l: &Limits) -> placement::Needs {
+    placement::Needs {
+        boot: l.boot_mem_mib << 20,
+        disk: u64::try_from(l.first_disk_gib()).unwrap_or(0) << 30,
+        ceiling: match l.first_memory() {
+            Ceiling::Size(gib) => Some(gib * GIB),
+            Ceiling::Auto => None,
+        },
     }
 }
 
@@ -73,11 +117,17 @@ impl AppState {
         }
         let all = self.all().await.map_err(super::failed)?;
         let quotas = read_quotas(&ss.paths.quotas()).map_err(super::failed)?;
+        let limits = self.limits_of(ss).await;
+        // An admin picks the node, from the one placement takes.
+        let nodes = if viewer.admin { self.nodes().await.unwrap_or_default() } else { vec![] };
+        let node = placement::place(&nodes, first_needs(&limits), "").unwrap_or_default();
         Ok(NewView {
-            limits: ss.limits.clone(),
             slug: slug(&viewer.name),
             owned: owned(&all, &viewer.name),
             quota: quota_of(&quotas, ss.limits.quota, &viewer.name),
+            limits,
+            nodes,
+            node,
         })
     }
 
@@ -102,6 +152,17 @@ impl AppState {
         let (Ok(memory), Ok(disk)) = (form.memory_gib.trim().parse::<Ceiling>(), form.disk_gib.trim().parse()) else {
             return refused("Memory and disk must be whole numbers of GiB, or memory auto.");
         };
+        // Only an admin picks a node, and only on a front.
+        let node = match self.nodes().await {
+            Some(nodes) if viewer.admin && !form.node.trim().is_empty() => {
+                let picked = form.node.trim();
+                if let Some(why) = why_not_on(&nodes, picked, "new workspaces") {
+                    return refused(&why);
+                }
+                picked.to_owned()
+            }
+            _ => String::new(),
+        };
         let r = Request {
             name: form.name.trim().to_owned(),
             owner: viewer.name.clone(),
@@ -110,9 +171,10 @@ impl AppState {
             max_memory: memory,
             disk_gib: disk,
             apps: form.apps.clone(),
-            node: String::new(),
+            node,
         };
-        if let Err(e) = r.check(&ss.limits) {
+        let limits = self.limits_of(ss).await;
+        if let Err(e) = r.check(&limits) {
             return refused(&e);
         }
         let all = self.all().await.map_err(super::failed)?;
@@ -146,7 +208,7 @@ impl AppState {
                 see_other(&format!("/?w={}", r.name));
                 Ok(())
             }
-            Some(o) => refused(&o.error),
+            Some(o) => refused(&told_outcome(viewer, &o)),
             None => refused(&ran.err().map_or_else(
                 || "The host said nothing of it.".to_owned(),
                 |e| format!("The host hasn't finished it, or couldn't: {e:#}. If it shows up in the list, it's yours."),
@@ -186,7 +248,7 @@ impl AppState {
             outcome: ss.paths.apps_outcome(name),
             unit: format!("workbench-apps@{name}.service"),
         };
-        match self.change(ss, &ws, &change, &AppsRequest { apps }, restart).await {
+        match self.change(viewer, ss, &ws, &change, &AppsRequest { apps }, restart).await {
             Ok(()) => {
                 see_other(&format!("/?w={name}"));
                 Ok(())
@@ -222,7 +284,8 @@ impl AppState {
         let Ok(max) = memory_gib.trim().parse::<Ceiling>() else {
             return refused("Memory must be a whole number of GiB, or auto.", StatusCode::UNPROCESSABLE_ENTITY);
         };
-        if let Err(e) = ss.limits.check_memory(max) {
+        let limits = self.limits_of(ss).await;
+        if let Err(e) = limits.check_memory(max) {
             return refused(&e, StatusCode::UNPROCESSABLE_ENTITY);
         }
         let change = Change {
@@ -232,7 +295,7 @@ impl AppState {
             outcome: ss.paths.memory_outcome(name),
             unit: format!("workbench-memory@{name}.service"),
         };
-        match self.change(ss, &ws, &change, &MemoryRequest { max_memory: max }, restart).await {
+        match self.change(viewer, ss, &ws, &change, &MemoryRequest { max_memory: max }, restart).await {
             Ok(()) => {
                 see_other(&format!("/?w={name}"));
                 Ok(())
@@ -246,6 +309,7 @@ impl AppState {
     /// the status that says it, otherwise.
     async fn change(
         &self,
+        viewer: &Viewer,
         ss: &SelfService,
         ws: &Workspace,
         change: &Change,
@@ -266,24 +330,11 @@ impl AppState {
         if let Err(e) = written {
             return Err((format!("The host couldn't take the request: {e:#}"), StatusCode::BAD_GATEWAY));
         }
-        // On the clock the outcome is stamped with.
-        let asked = std::fs::metadata(&change.request).and_then(|m| m.modified()).ok();
-        let run = {
-            let (state, unit) = (self.clone(), change.unit.clone());
-            tokio::spawn(async move {
-                let _changing = changing;
-                state.backend.run_unit(&unit).await
-            })
-        };
-        let ran = run.await.unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
-        self.forget().await;
-        // The unit writes its outcome anew; one from before this request
-        // says nothing of it.
-        match (ran, asked.and_then(|at| read_outcome_since(&change.outcome, at))) {
-            (_, Some(o)) if !o.ok => return Err((o.error, StatusCode::UNPROCESSABLE_ENTITY)),
-            (Ok(()), Some(_)) => {}
-            (Err(e), _) => return Err((format!("{e:#}"), StatusCode::BAD_GATEWAY)),
-            (Ok(()), None) => return Err(("The host said nothing of it.".into(), StatusCode::BAD_GATEWAY)),
+        match self.run_request(changing, change.unit.clone(), &change.request, &change.outcome).await {
+            Ok(()) => {}
+            Err(Ran::Refused(o)) => return Err((told_outcome(viewer, &o), StatusCode::UNPROCESSABLE_ENTITY)),
+            Err(Ran::Failed(e)) => return Err((told_error(viewer, &e), StatusCode::BAD_GATEWAY)),
+            Err(Ran::Silent) => return Err(("The host said nothing of it.".into(), StatusCode::BAD_GATEWAY)),
         }
         // A stopped VM boots with it anyway; one on its way somewhere is
         // left alone.
@@ -314,13 +365,110 @@ impl AppState {
         let ran = self.backend.run_unit(&format!("workbench-destroy@{name}.service")).await;
         self.forget().await;
         if let Err(e) = ran {
-            let detail = read_outcome(&outcome).map_or_else(|| format!("{e:#}"), |o| o.error);
+            let detail = read_outcome(&outcome).map_or_else(|| told_error(viewer, &e), |o| told_outcome(viewer, &o));
             status(StatusCode::BAD_GATEWAY);
             see_other(&format!("{back}?error=failed&detail={}", encode(&detail)));
             return Err(ServerFnError::new(detail));
         }
         see_other("/");
         Ok(())
+    }
+
+    /// The `node` server function, for admins on a front: closes a node,
+    /// which then takes neither new workspaces nor moves, or reopens it.
+    pub async fn node_action(&self, viewer: &Viewer, node: &str, closed: bool) -> Result<(), ServerFnError> {
+        let Some(fleet) = self.backend.fleet() else {
+            return Err(refuse("this host has no nodes", StatusCode::NOT_FOUND));
+        };
+        if !viewer.admin {
+            return Err(refuse("nodes are for admins", StatusCode::FORBIDDEN));
+        }
+        fleet.set_closed(node, closed).map_err(|e| refuse(&format!("{e:#}"), StatusCode::UNPROCESSABLE_ENTITY))?;
+        self.forget().await;
+        see_other("/host");
+        Ok(())
+    }
+
+    /// The `move` server function, for admins on a front: asks for a
+    /// workspace made at run time's move to another node and starts the
+    /// unit that moves it as root; then the host page, or the move's page
+    /// with why not. A declared workspace moves by changing Nix.
+    pub async fn move_action(&self, viewer: &Viewer, name: &str, node: &str) -> Result<(), ServerFnError> {
+        let Some(fleet) = self.backend.fleet() else {
+            return Err(refuse("this host has no other nodes", StatusCode::NOT_FOUND));
+        };
+        if !viewer.admin {
+            return Err(refuse("moving a workspace is for admins", StatusCode::FORBIDDEN));
+        }
+        let ws = self.find(viewer, name).await?;
+        let refused = |msg: &str, code: StatusCode| {
+            status(code);
+            see_other(&format!("/w/{name}/move?error={}", encode(msg)));
+            Err(ServerFnError::new(msg))
+        };
+        if !ws.self_service {
+            return refused(
+                &format!("{name} is declared in Nix: change its node there and deploy."),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            );
+        }
+        if matches!(ws.state, State::Moving | State::Unreachable) {
+            return refused(&format!("{name}{}: it can't move now.", ws.state.busy_suffix()), StatusCode::CONFLICT);
+        }
+        if node == ws.node {
+            return refused(&format!("{name} is on {node} already."), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        if let Some(why) = why_not_on(&self.nodes().await.unwrap_or_default(), node, "moves") {
+            return refused(&why, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        // One move of a workspace at a time, held until its unit is done.
+        let Some(moving) = Making::start(self, &format!("{name}/move")) else {
+            return refused(&format!("{name} is being moved just now."), StatusCode::CONFLICT);
+        };
+        if let Err(e) = fleet.ask_move(name, node) {
+            return refused(&format!("The front couldn't take the request: {e:#}"), StatusCode::BAD_GATEWAY);
+        }
+        let paths = fleet.paths();
+        let unit = format!("workbench-move@{name}.service");
+        match self.run_request(moving, unit, &paths.move_request(name), &paths.move_outcome(name)).await {
+            Ok(()) => {
+                see_other("/host");
+                Ok(())
+            }
+            Err(Ran::Refused(o)) => refused(&o.error, StatusCode::UNPROCESSABLE_ENTITY),
+            Err(Ran::Failed(e)) => refused(
+                &format!(
+                    "The front hasn't finished moving it, or couldn't: {e:#}. While it moves, the list shows it Moving."
+                ),
+                StatusCode::BAD_GATEWAY,
+            ),
+            Err(Ran::Silent) => refused("The front said nothing of it.", StatusCode::BAD_GATEWAY),
+        }
+    }
+
+    /// Starts the unit of a request written at `request` and waits for it,
+    /// held by `guard` until it is done even if the browser goes away, then
+    /// reads the outcome it wrote at `outcome` since the request.
+    async fn run_request(&self, guard: Making, unit: String, request: &Path, outcome: &Path) -> Result<(), Ran> {
+        // On the clock the outcome is stamped with.
+        let asked = std::fs::metadata(request).and_then(|m| m.modified()).ok();
+        let run = {
+            let state = self.clone();
+            tokio::spawn(async move {
+                let _guard = guard;
+                state.backend.run_unit(&unit).await
+            })
+        };
+        let ran = run.await.unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+        self.forget().await;
+        // The unit writes its outcome anew; one from before this request
+        // says nothing of it.
+        match (ran, asked.and_then(|at| read_outcome_since(outcome, at))) {
+            (_, Some(o)) if !o.ok => Err(Ran::Refused(o)),
+            (Err(e), _) => Err(Ran::Failed(e)),
+            (Ok(()), Some(_)) => Ok(()),
+            (Ok(()), None) => Err(Ran::Silent),
+        }
     }
 
     /// The `quota` server function, for admins: sets a person's quota.
@@ -374,15 +522,14 @@ impl AppState {
     }
 }
 
-fn read_outcome(path: &std::path::Path) -> Option<Outcome> {
-    let raw = hostutil::read_bounded(path, 1 << 16).ok()?;
-    serde_json::from_slice(&raw).ok()
-}
-
-/// An outcome written at `since` or after.
-fn read_outcome_since(path: &std::path::Path, since: std::time::SystemTime) -> Option<Outcome> {
-    let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-    (at >= since).then(|| read_outcome(path)).flatten()
+/// How a request's unit went, when not well.
+enum Ran {
+    /// It refused, saying why in its outcome.
+    Refused(Outcome),
+    /// It failed, or the UI stopped waiting for it.
+    Failed(anyhow::Error),
+    /// It wrote no outcome.
+    Silent,
 }
 
 /// A change to a workspace made at run time: `what` changes, its request

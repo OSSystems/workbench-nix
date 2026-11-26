@@ -131,12 +131,8 @@ impl Backend for Fake {
         Box::pin(async move { answer })
     }
 
-    /// The cookie is `<user>` or `<user>:<group>,<group>`.
     fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>> {
-        let value =
-            cookie.split(';').map(str::trim).find_map(|c| c.strip_prefix("_workbench_auth=")).unwrap_or_default();
-        let (user, groups) = value.split_once(':').unwrap_or((value, ""));
-        let who = Identity { user: user.to_owned(), groups: authz::groups(groups) };
+        let who = who_is(cookie);
         Box::pin(async move { Ok(who) })
     }
 
@@ -156,24 +152,35 @@ impl Backend for Fake {
 
     fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
         self.units.lock().unwrap().push(unit.to_owned());
-        let name = unit.split_once('@').map(|(_, r)| r.trim_end_matches(".service")).unwrap_or_default();
         let outcome = self.outcome.lock().unwrap().clone();
-        if let (Some(paths), Some(o)) = (&self.paths, &outcome) {
-            let out = if unit.starts_with("workbench-apps@") {
-                paths.apps_outcome(name)
-            } else if unit.starts_with("workbench-memory@") {
-                paths.memory_outcome(name)
-            } else {
-                paths.outcome(name)
-            };
-            std::fs::create_dir_all(out.parent().unwrap()).unwrap();
-            std::fs::write(out, serde_json::to_vec(o).unwrap()).unwrap();
-        }
-        Box::pin(async move {
-            anyhow::ensure!(outcome.is_none_or(|o| o.ok), "the unit failed");
-            Ok(())
-        })
+        let ran = ran_unit(self.paths.as_ref(), unit, outcome.as_ref());
+        Box::pin(async move { ran })
     }
+}
+
+/// Who a fake cookie names: `<user>` or `<user>:<group>,<group>`.
+fn who_is(cookie: &str) -> Identity {
+    let value = cookie.split(';').map(str::trim).find_map(|c| c.strip_prefix("_workbench_auth=")).unwrap_or_default();
+    let (user, groups) = value.split_once(':').unwrap_or((value, ""));
+    Identity { user: user.to_owned(), groups: authz::groups(groups) }
+}
+
+/// A unit as the fakes run it: it writes `outcome` where its kind's go,
+/// and fails when that says so.
+fn ran_unit(paths: Option<&Paths>, unit: &str, outcome: Option<&Outcome>) -> anyhow::Result<()> {
+    let name = unit.split_once('@').map(|(_, r)| r.trim_end_matches(".service")).unwrap_or_default();
+    if let (Some(paths), Some(o)) = (paths, outcome) {
+        let out = match unit.split_once('@').map_or("", |(kind, _)| kind) {
+            "workbench-apps" => paths.apps_outcome(name),
+            "workbench-memory" => paths.memory_outcome(name),
+            "workbench-move" => paths.move_outcome(name),
+            _ => paths.outcome(name),
+        };
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(out, serde_json::to_vec(o).unwrap()).unwrap();
+    }
+    anyhow::ensure!(outcome.is_none_or(|o| o.ok), "the unit failed");
+    Ok(())
 }
 
 fn t3code() -> BootApp {
@@ -681,7 +688,7 @@ async fn auto_where_the_host_offers_it() {
     assert_eq!(asked.max_memory, Ceiling::Auto);
 
     let (_, _, panel) = send(ui(&s), get("/?w=alice-dev", "carol")).await;
-    assert!(panel.contains("of 64 GiB, the host's"), "{panel}");
+    assert!(panel.contains("of 64 GiB, its node's"), "{panel}");
     let (_, _, body) = send(ui(&s), get("/w/alice-dev/memory", "carol")).await;
     assert!(body.contains(r#"value="auto""#), "{body}");
     let (_, h, _) = send(ui(&s), post("/api/memory", "carol", ORIGIN, "ws=alice-dev&memory_gib=24")).await;
@@ -1058,3 +1065,5 @@ fn assets_carry_the_build_version() {
     );
     assert!(a.len() == 12 && a != b, "{a} {b}");
 }
+
+mod front;

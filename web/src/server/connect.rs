@@ -479,12 +479,23 @@ async fn tunnel(
     let Some(c) = reachable(&state, &device, &name) else {
         return refused(StatusCode::FORBIDDEN, &format!("{name} isn't yours, or doesn't exist."));
     };
-    let runs = match state.all().await {
-        Ok(all) => all.iter().any(|ws| ws.name == c.name && ws.vm == "Running"),
+    let ws = match state.all().await {
+        Ok(all) => all.into_iter().find(|ws| ws.name == c.name),
         Err(e) => return refused(StatusCode::BAD_GATEWAY, &format!("couldn't read the workspaces: {e:#}")),
     };
-    if !runs {
-        return refused(StatusCode::CONFLICT, &format!("{name} isn't running. Start it from its panel."));
+    // On a front, a node that doesn't answer can't say its VM runs.
+    match ws {
+        Some(ws) if ws.vm == "Running" => {}
+        Some(ws) if ws.state == workbench_model::State::Unreachable => {
+            let why =
+                format!("{name}{} just now, so the UI can't tell it runs. Try again later.", ws.state.busy_suffix());
+            return refused(StatusCode::SERVICE_UNAVAILABLE, &why);
+        }
+        Some(ws) if ws.state == workbench_model::State::Moving => {
+            let why = format!("{name}{}. Try again once it's there.", ws.state.busy_suffix());
+            return refused(StatusCode::CONFLICT, &why);
+        }
+        _ => return refused(StatusCode::CONFLICT, &format!("{name} isn't running. Start it from its panel.")),
     }
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         Ok(ws) => ws,

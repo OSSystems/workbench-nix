@@ -3,6 +3,10 @@
 //! access check for every workspace. It runs as its own user: systemd
 //! state and the VMs' sockets are readable to it, and polkit lets it start,
 //! stop and restart workspace units and nothing else.
+//!
+//! On a front, [`FleetBackend`] runs it on [`Fleet`]: the registry and the
+//! nodes; on a host on its own, [`HostBackend`] (until the modules render a
+//! fleet).
 
 pub mod authz;
 pub mod connect;
@@ -23,11 +27,13 @@ use anyhow::Context as _;
 use leptos::config::LeptosOptions;
 use leptos::prelude::*;
 use workbench::config::{self, Config};
+pub use workbench::fleet::front::Fleet;
 use workbench::self_service::Paths;
 use workbench::state::{self, OpenLinkError};
 use workbench_model::apps::{BootApp, DeviceLink};
+use workbench_model::fleet::{NodeRefusal, NodeView};
 use workbench_model::self_service::Limits;
-use workbench_model::{HostView, OpenBlocker, Snapshot, State, Verb, Viewer, Workspace, is_user_name};
+use workbench_model::{GIB, HostView, OpenBlocker, Snapshot, State, Verb, Viewer, Workspace, is_user_name};
 
 pub use connect::connect_router;
 pub use routes::{authz_router, ui_router};
@@ -62,6 +68,11 @@ pub trait Backend: Send + Sync + 'static {
     fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
     /// Where a workspace's SSH server listens: its address, port 22.
     fn ssh_address(&self, c: &Config) -> String;
+    /// The fleet, on a front: the nodes, closing them, moves and the
+    /// consoles go through it. None on a host on its own.
+    fn fleet(&self) -> Option<&Fleet> {
+        None
+    }
 }
 
 /// The groups single sign-on gave the person asking, as the UI's
@@ -183,6 +194,87 @@ impl Backend for HostBackend {
     }
 }
 
+/// A front as the UI sees it: every workspace from the registry and its
+/// node, and what is done to one done through its node. Who owns a
+/// workspace and where it is are the registry's, never a node's: the
+/// access check and the tunnel read it, and answer while a node doesn't.
+pub struct FleetBackend {
+    /// Who a cookie is, the units, the SSH CAs and the guests' SSH servers,
+    /// as on a host on its own.
+    pub host: HostBackend,
+    pub fleet: Fleet,
+    /// The apps each workspace's VM ran at the last list, by id: one that
+    /// goes with its next restart still opens until then.
+    running: Mutex<HashMap<String, Vec<String>>>,
+}
+
+impl FleetBackend {
+    #[must_use]
+    pub fn new(opts: Options, fleet: Fleet) -> Self {
+        FleetBackend { host: HostBackend { opts }, fleet, running: Mutex::default() }
+    }
+}
+
+impl Backend for FleetBackend {
+    fn list(&self) -> BoxFuture<'_, anyhow::Result<Vec<Workspace>>> {
+        Box::pin(async move {
+            let all = self.fleet.list().await?;
+            let running = all
+                .iter()
+                .filter(|w| w.vm != "-")
+                .map(|w| (w.name.clone(), w.running_apps().map(|a| a.id.clone()).collect()))
+                .collect();
+            *lock(&self.running) = running;
+            Ok(all)
+        })
+    }
+
+    fn control<'a>(&'a self, verb: Verb, name: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.fleet.control(name, verb))
+    }
+
+    fn config(&self, name: &str) -> anyhow::Result<Config> {
+        self.fleet.config(name)
+    }
+
+    /// The registry's apps, then those the VM ran at the last list that
+    /// the registry no longer has, as the fleet offers them.
+    fn reachable(&self, c: &Config) -> Vec<BootApp> {
+        let ran = lock(&self.running).get(&c.name).cloned().unwrap_or_default();
+        let gone: Vec<String> = ran.into_iter().filter(|id| !c.apps.iter().any(|a| a.id == *id)).collect();
+        c.apps.iter().cloned().chain(self.fleet.settings.apps_of(&gone)).collect()
+    }
+
+    fn open_link(&self, c: Config, app: String) -> BoxFuture<'_, Result<String, OpenLinkError>> {
+        Box::pin(async move { self.fleet.open_link(&c.name, &app).await })
+    }
+
+    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>> {
+        self.host.whoami(cookie)
+    }
+
+    fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.host.run_unit(unit)
+    }
+
+    fn host_ca(&self) -> anyhow::Result<String> {
+        self.host.host_ca()
+    }
+
+    fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        self.host.sign_user_key(user, id, key)
+    }
+
+    /// The registry's address, which the front reaches through `WireGuard`.
+    fn ssh_address(&self, c: &Config) -> String {
+        self.host.ssh_address(c)
+    }
+
+    fn fleet(&self) -> Option<&Fleet> {
+        Some(&self.fleet)
+    }
+}
+
 /// How long the UI waits for making or destroying a workspace: a new disk
 /// is a copy of the image. Longer than the units' own 10 minutes, so their
 /// outcome is there to read.
@@ -190,6 +282,14 @@ const UNIT_TIMEOUT: Duration = Duration::from_secs(660);
 
 /// How long a collected state is reused, whoever asks.
 const SNAPSHOT_FOR: Duration = Duration::from_secs(1);
+/// How old a state may be and still be shown at once while a new one is
+/// collected: older, no one has looked for a while, the live updates
+/// included, and a new one is waited for as an action's answer is.
+const SHOWN_FOR: Duration = Duration::from_secs(5);
+/// How long an answer after an action waits for the state it left, before
+/// it makes do with the last: a node that doesn't answer holds the
+/// collection up to its timeouts.
+const COLLECT_WAIT: Duration = Duration::from_secs(3);
 /// How long a restart someone asked for shows as restarting at most.
 const RESTART_SHOWN: Duration = Duration::from_secs(180);
 /// How long after asking a workspace may still look as it did before.
@@ -207,6 +307,9 @@ pub struct Inner {
     pub leptos: LeptosOptions,
     pub consoles: console::Consoles,
     cache: tokio::sync::Mutex<Cache>,
+    /// Held while the state is collected: one collection at a time, which
+    /// no one but who waits for it waits for.
+    collecting: Arc<tokio::sync::Mutex<()>>,
     pub(crate) authz: Mutex<HashMap<String, (Identity, Instant)>>,
     /// The names being made now, so two requests for one never overwrite
     /// each other's.
@@ -214,16 +317,54 @@ pub struct Inner {
 }
 
 struct Cache {
+    /// When the state was collected; none once an action changed it.
     at: Option<Instant>,
+    /// One more at each action: a collection begun before it is no answer
+    /// to it.
+    era: u64,
+    /// Whether the state was ever collected.
+    collected: bool,
     all: Result<Vec<Workspace>, String>,
     /// When someone asked for a restart, by workspace.
     restarts: HashMap<String, Instant>,
+    /// On a front: every node, as it said of itself with the list.
+    nodes: Option<Vec<NodeView>>,
+    /// On a front: what each workspace's node last said of it, which it
+    /// keeps while its node doesn't answer.
+    known: HashMap<String, Workspace>,
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Cache { at: None, all: Ok(vec![]), restarts: HashMap::new() }
+        Cache {
+            at: None,
+            era: 0,
+            collected: false,
+            all: Ok(vec![]),
+            restarts: HashMap::new(),
+            nodes: None,
+            known: HashMap::new(),
+        }
     }
+}
+
+/// A workspace its node said nothing of just now, with what it last said:
+/// its system, its sizes and its apps.
+fn keep_known(ws: &mut Workspace, known: &Workspace) {
+    if ws.os.is_empty() {
+        ws.os.clone_from(&known.os);
+    }
+    if ws.apps.is_empty() {
+        ws.apps.clone_from(&known.apps);
+    }
+    ws.memory_bytes = known.memory_bytes;
+    ws.boot_memory_bytes = known.boot_memory_bytes;
+    if ws.max_memory_bytes == 0 {
+        ws.max_memory_bytes = known.max_memory_bytes;
+        ws.memory_auto = known.memory_auto;
+    }
+    ws.disk_bytes = known.disk_bytes;
+    ws.disk_used_bytes = known.disk_used_bytes;
 }
 
 impl std::ops::Deref for AppState {
@@ -238,6 +379,26 @@ impl axum::extract::FromRef<AppState> for LeptosOptions {
     fn from_ref(state: &AppState) -> Self {
         state.leptos.clone()
     }
+}
+
+/// What a text says to `viewer`: an admin reads it as it is; anyone else
+/// reads the node's refusal in it as `NodeRefusal::told` words it for
+/// them, with no node's name.
+pub(crate) fn told(viewer: &Viewer, text: String, node: Option<&NodeRefusal>) -> String {
+    match node {
+        Some(n) if !viewer.admin => text.replace(&n.told(true), &n.told(false)),
+        _ => text,
+    }
+}
+
+/// An error, as `viewer` is told it.
+pub(crate) fn told_error(viewer: &Viewer, e: &anyhow::Error) -> String {
+    told(viewer, format!("{e:#}"), e.chain().find_map(|c| c.downcast_ref::<NodeRefusal>()))
+}
+
+/// How a unit's request went, as `viewer` is told it.
+pub(crate) fn told_outcome(viewer: &Viewer, o: &workbench_model::self_service::Outcome) -> String {
+    told(viewer, o.error.clone(), o.node.as_ref())
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -303,6 +464,7 @@ impl AppState {
             leptos,
             consoles,
             cache: tokio::sync::Mutex::default(),
+            collecting: Arc::default(),
             authz: Mutex::default(),
             making: Mutex::default(),
         })))
@@ -318,13 +480,99 @@ impl AppState {
         is_user_name(name).then(|| Viewer { name: name.to_owned(), admin, creates })
     }
 
-    /// Every workspace, collected at most once a second whoever asks.
+    /// Every workspace, collected at most once a second whoever asks; on a
+    /// front, with every node. The collection runs apart: while it does,
+    /// everyone gets the last state, so a node slow to answer slows no
+    /// page. Only the first ever, the answer to an action and a state
+    /// older than [`SHOWN_FOR`], which no one looked at since, wait for a
+    /// new one, all but the first no longer than [`COLLECT_WAIT`].
     pub async fn all(&self) -> anyhow::Result<Vec<Workspace>> {
+        loop {
+            let (wait, collected) = {
+                let cache = self.cache.lock().await;
+                match cache.at {
+                    Some(at) if at.elapsed() < SNAPSHOT_FOR => return cache.all.clone().map_err(anyhow::Error::msg),
+                    at => (at.is_none_or(|at| at.elapsed() >= SHOWN_FOR), cache.collected),
+                }
+            };
+            if let Ok(one) = Arc::clone(&self.collecting).try_lock_owned() {
+                let state = self.clone();
+                tokio::spawn(async move {
+                    state.collect().await;
+                    drop(one);
+                });
+            }
+            if !wait {
+                return self.last().await;
+            }
+            match tokio::time::timeout(COLLECT_WAIT, self.collecting.lock()).await {
+                Ok(done) => drop(done),
+                Err(_) if collected => return self.last().await,
+                Err(_) => drop(self.collecting.lock().await),
+            }
+        }
+    }
+
+    /// Whether the state was ever collected.
+    pub(crate) async fn collected(&self) -> bool {
+        self.cache.lock().await.collected
+    }
+
+    /// Collects the state again unless it is under a second old, and waits
+    /// for it at most [`COLLECT_WAIT`]; everyone else keeps the state they
+    /// had meanwhile. Whether the state is under a second old now.
+    pub(crate) async fn refresh(&self) -> bool {
+        let fresh = |c: &Cache| c.at.is_some_and(|at| at.elapsed() < SNAPSHOT_FOR);
+        let collected = async {
+            loop {
+                if fresh(&*self.cache.lock().await) {
+                    return;
+                }
+                let one = Arc::clone(&self.collecting).lock_owned().await;
+                if fresh(&*self.cache.lock().await) {
+                    return;
+                }
+                self.collect().await;
+                drop(one);
+            }
+        };
+        tokio::time::timeout(COLLECT_WAIT, collected).await.is_ok()
+    }
+
+    /// The state last collected.
+    async fn last(&self) -> anyhow::Result<Vec<Workspace>> {
+        self.cache.lock().await.all.clone().map_err(anyhow::Error::msg)
+    }
+
+    /// Collects the state, outside the cache's lock, then keeps it.
+    async fn collect(&self) {
+        let era = self.cache.lock().await.era;
+        let (all, nodes) = match self.backend.fleet() {
+            Some(fleet) => {
+                let (all, nodes) = tokio::join!(self.backend.list(), fleet.nodes_view());
+                (all, Some(nodes))
+            }
+            None => (self.backend.list().await, None),
+        };
         let mut cache = self.cache.lock().await;
-        if cache.at.is_none_or(|at| at.elapsed() >= SNAPSHOT_FOR) {
-            cache.all = self.backend.list().await.map_err(|e| format!("{e:#}"));
-            cache.at = Some(Instant::now());
-            let Cache { all, restarts, .. } = &mut *cache;
+        cache.all = all.map_err(|e| format!("{e:#}"));
+        cache.nodes = nodes;
+        cache.collected = true;
+        // One begun before an action says nothing of it.
+        cache.at = (cache.era == era).then(Instant::now);
+        {
+            let Cache { all, restarts, known, nodes, .. } = &mut *cache;
+            if let (Ok(all), Some(_)) = (&mut *all, nodes) {
+                for ws in all.iter_mut() {
+                    // Its node has it now, or said nothing of it.
+                    if ws.unit != "-" {
+                        known.insert(ws.name.clone(), ws.clone());
+                    } else if let (State::Unreachable | State::Moving, Some(k)) = (ws.state, known.get(&ws.name)) {
+                        keep_known(ws, k);
+                    }
+                }
+                known.retain(|name, _| all.iter().any(|w| w.name == *name));
+            }
             if let Ok(all) = all {
                 for ws in all.iter_mut() {
                     let Some(at) = restarts.get(&ws.name) else { continue };
@@ -343,7 +591,31 @@ impl AppState {
                 }
             }
         }
-        cache.all.clone().map_err(anyhow::Error::msg)
+    }
+
+    /// On a front, every node as it said of itself with the list.
+    pub async fn nodes(&self) -> Option<Vec<NodeView>> {
+        self.backend.fleet()?;
+        let _ = self.all().await;
+        self.cache.lock().await.nodes.clone()
+    }
+
+    /// What people may make, with `auto` the host's memory: on a front, the
+    /// largest node's.
+    pub async fn limits(&self) -> Option<Limits> {
+        Some(self.limits_of(self.opts.self_service.as_ref()?).await)
+    }
+
+    /// What `ss` lets people make, with `auto` the host's memory: on a
+    /// front, the largest node's.
+    async fn limits_of(&self, ss: &SelfService) -> Limits {
+        if ss.limits.memory_auto()
+            && let Some(nodes) = self.nodes().await
+        {
+            ss.limits.resolved(&nodes)
+        } else {
+            ss.limits.clone()
+        }
     }
 
     /// Shows a workspace as restarting until it is up again, after asking
@@ -355,7 +627,9 @@ impl AppState {
 
     /// Forgets the collected state, after an action changed it.
     async fn forget(&self) {
-        self.cache.lock().await.at = None;
+        let mut cache = self.cache.lock().await;
+        cache.at = None;
+        cache.era += 1;
     }
 
     /// What `viewer` sees, and the apps a workspace made at run time may
@@ -363,18 +637,29 @@ impl AppState {
     pub async fn snapshot_for(&self, viewer: &Viewer) -> anyhow::Result<Snapshot> {
         let all = self.all().await?;
         let mut snap = Snapshot::of(viewer.clone(), all.into_iter().map(view::row));
-        if let Some(ss) = &self.opts.self_service {
-            snap.apps.clone_from(&ss.limits.apps);
-            snap.memory_gib = Some((ss.limits.min_memory_gib(), ss.limits.max_memory_gib()));
-            snap.memory_auto = ss.limits.memory_auto();
+        if let Some(limits) = self.limits().await {
+            snap.apps.clone_from(&limits.apps);
+            snap.memory_gib = Some((limits.min_memory_gib(), limits.max_memory_gib()));
+            snap.memory_auto = limits.memory_auto();
+            if viewer.admin {
+                let nodes = self.nodes().await.unwrap_or_default();
+                snap.node_memory_gib =
+                    nodes.into_iter().filter_map(|n| Some((n.name, n.host?.mem_total / GIB))).collect();
+            }
         }
         Ok(snap)
     }
 
-    /// The host page.
+    /// The host page: on a front, a section per node.
     pub async fn host_view(&self) -> anyhow::Result<HostView> {
         let all = self.all().await?;
-        let mut host = view::host(&self.opts, &all)?;
+        let mut host = match (self.backend.fleet(), self.nodes().await) {
+            (Some(fleet), Some(nodes)) => {
+                let root = fleet.state_root();
+                view::fleet(&nodes, &all, |node| workbench::fleet::is_closed(&root, node))
+            }
+            _ => view::host(&self.opts, &all)?,
+        };
         host.quotas = self.quotas(&all)?;
         Ok(host)
     }
@@ -404,10 +689,10 @@ impl AppState {
             if !stay {
                 see_other(&format!("{back}?error=busy"));
             }
-            return Err(ServerFnError::new(format!("{name} is already {}", ws.state)));
+            return Err(ServerFnError::new(format!("{name}{}", ws.state.busy_suffix())));
         }
         if let Err(e) = self.backend.control(verb, name).await {
-            let detail = format!("{e:#}");
+            let detail = told_error(viewer, &e);
             status(axum::http::StatusCode::BAD_GATEWAY);
             if !stay {
                 see_other(&format!("{back}?error=failed&detail={}", encode(&detail)));
