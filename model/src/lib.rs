@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod apps;
 pub mod connect;
+pub mod memory;
 pub mod self_service;
 
 pub use apps::{App, Change, OpenBlocker, Stage};
@@ -137,6 +138,9 @@ pub struct Workspace {
     pub boot_memory_bytes: i64,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub max_memory_bytes: i64,
+    /// Its most memory is `auto`: the host's, which `max_memory_bytes` is now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub memory_auto: bool,
     pub disk_bytes: u64,
     pub disk_used_bytes: u64,
     /// `up` or `down` while the VM runs.
@@ -320,6 +324,9 @@ pub struct Snapshot {
     /// may grow to; none without workspaces made at run time.
     #[serde(default)]
     pub memory_gib: Option<(i64, i64)>,
+    /// Whether such a workspace may grow to `auto`, the host's memory.
+    #[serde(default)]
+    pub memory_auto: bool,
 }
 
 impl Snapshot {
@@ -336,7 +343,7 @@ impl Snapshot {
                 r
             })
             .collect();
-        Snapshot { viewer, rows, apps: vec![], memory_gib: None }
+        Snapshot { viewer, rows, apps: vec![], memory_gib: None, memory_auto: false }
     }
 
     #[must_use]

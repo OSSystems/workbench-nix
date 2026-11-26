@@ -432,7 +432,9 @@ memory.
 
 The most a workspace made at run time grows to, which its owner picked on
 **New workspace**: an admin changes it here, from the boot size to
-`web.selfService.maxMemoryGiB`, then **Save** or **Save and restart**; a
+`web.selfService.maxMemoryGiB`, or to `auto` where that is `auto` too:
+as far as the host has memory, read at every start. Then **Save** or
+**Save and restart**; a
 stopped workspace has only **Save**. The VM boots with its boot memory
 and the host plugs more as it runs short, up to that most, which is the
 only cap: T3 Code leaves its agents' memory to the VM. A workspace from
@@ -524,7 +526,7 @@ bar and the empty state. A page with one form:
 | Name | `<slug>` or `<slug>-<suffix>`, where the slug is the uid with `.` and `_` turned into `-`: `samuel.silva` makes `samuel-silva` or `samuel-silva-data`. It is still a workspace name, a DNS label of at most 28 characters, so a uid with a dot never becomes a host name. |
 | System | the systems `web.selfService.os` allows |
 | SSH keys | pasted, one per line, `<type> <key> [comment]`; the directory has no SSH keys to take |
-| Memory | the most the VM grows to, from the boot size up to `web.selfService.maxMemoryGiB` |
+| Memory | the most the VM grows to, from the boot size up to `web.selfService.maxMemoryGiB`; where that is `auto`, `auto` too, which the form starts with |
 | Disk | from 16 GiB up to `web.selfService.maxDiskGiB` |
 | Apps | checkboxes of `web.selfService.apps`, those whose `default` is true checked; none is fine, and they can change later |
 

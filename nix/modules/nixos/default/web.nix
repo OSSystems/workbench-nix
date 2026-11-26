@@ -200,10 +200,10 @@ in
         description = "The guest systems offered.";
       };
       maxMemoryGiB = mkOption {
-        type = types.ints.positive;
+        type = types.either types.ints.positive (types.enum [ "auto" ]);
         default = cfg.memory.maxGiB;
         defaultText = lib.literalExpression "config.services.workbench.memory.maxGiB";
-        description = "The most memory people may let their VM grow to.";
+        description = "The most memory people may let their VM grow to; `auto` is the host's.";
       };
       maxDiskGiB = mkOption {
         type = types.ints.positive;

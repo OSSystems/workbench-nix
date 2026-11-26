@@ -164,7 +164,8 @@ async fn probe(dirs: &[PathBuf], state_root: &Path, name: String, u: UnitInfo) -
         ws.os.clone_from(&c.os);
         disk = c.disk();
         ws.boot_memory_bytes = c.boot_mem_mib * MIB;
-        ws.max_memory_bytes = c.max_mem_mib * MIB;
+        ws.max_memory_bytes = c.max_mem_mib() * MIB;
+        ws.memory_auto = c.max_mem == crate::config::Ceiling::Auto;
         let mut open_links = vec![];
         let mut running = None;
         if matches!(u.active.as_str(), "active" | "deactivating") {

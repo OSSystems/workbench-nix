@@ -420,7 +420,7 @@ pub(crate) fn cloud_hypervisor_argv(c: &Config, host_cpus: u32) -> Vec<String> {
         firmware: c.firmware.clone(),
         cpus: if cpus == 0 || cpus > host_cpus { host_cpus } else { cpus },
         memory_mib: c.boot_mem_mib,
-        hotplug_mib: (c.max_mem_mib - c.boot_mem_mib).max(0),
+        hotplug_mib: (c.max_mem_mib() - c.boot_mem_mib).max(0),
         disks,
         nets: vec![Net { tap: c.tap.clone(), mac: c.mac.clone() }],
         vsock_cid: 3,
@@ -534,8 +534,15 @@ mod tests {
             ["boot=16,max=16,nested=off"],
             "more vCPUs than host CPUs"
         );
-        c.max_mem_mib = c.boot_mem_mib;
+        c.max_mem = config::Ceiling::Size(c.boot_mem_mib);
         assert_eq!(flag_values(&cloud_hypervisor_argv(&c, 16), "--memory"), ["size=2048M,shared=on"]);
+        c.max_mem = config::Ceiling::Auto;
+        let hotplug = config::host_mem_mib().unwrap() - 2048;
+        assert_eq!(
+            flag_values(&cloud_hypervisor_argv(&c, 16), "--memory"),
+            [format!("size=2048M,hotplug_method=virtio-mem,hotplug_size={hotplug}M,shared=on")],
+            "auto grows to the host's memory"
+        );
     }
 
     #[test]

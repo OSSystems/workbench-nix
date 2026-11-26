@@ -11,6 +11,7 @@ use workbench::config::Config;
 use workbench::self_service::Paths;
 use workbench::state::OpenLinkError;
 use workbench_model::apps::{AppInfo, BootApp};
+use workbench_model::memory::Ceiling;
 use workbench_model::self_service::{AppsRequest, Limits, MemoryRequest, Outcome, Request as Asked};
 use workbench_model::{App, State, Verb, Workspace};
 
@@ -186,20 +187,25 @@ fn t3code() -> BootApp {
 }
 
 fn state(fake: Fake) -> AppState {
-    let self_service = fake.paths.clone().map(|paths| SelfService {
-        paths,
-        limits: Limits {
-            os: vec!["ubuntu".into()],
-            boot_mem_mib: 2048,
-            max_memory_gib: 16,
-            max_disk_gib: 128,
-            quota: 1,
-            apps: vec![
-                AppInfo { id: "t3code".into(), name: "T3 Code".into(), terminal: false, default: true },
-                AppInfo { id: "herdr".into(), name: "Herdr".into(), terminal: true, default: false },
-            ],
-        },
-    });
+    state_with(fake, |_| {})
+}
+
+/// The state with the host's limits as `limits` leaves them.
+fn state_with(fake: Fake, limits: impl FnOnce(&mut Limits)) -> AppState {
+    let mut l = Limits {
+        os: vec!["ubuntu".into()],
+        boot_mem_mib: 2048,
+        max_memory: Ceiling::Size(16),
+        host_memory_gib: 0,
+        max_disk_gib: 128,
+        quota: 1,
+        apps: vec![
+            AppInfo { id: "t3code".into(), name: "T3 Code".into(), terminal: false, default: true },
+            AppInfo { id: "herdr".into(), name: "Herdr".into(), terminal: true, default: false },
+        ],
+    };
+    limits(&mut l);
+    let self_service = fake.paths.clone().map(|paths| SelfService { paths, limits: l });
     let opts = Options {
         origin: ORIGIN.into(),
         admins: vec!["carol".into()],
@@ -622,16 +628,18 @@ async fn admins_change_a_workspaces_memory() {
     assert_eq!(h[header::LOCATION], "/?w=alice-dev");
     let asked: MemoryRequest =
         serde_json::from_slice(&std::fs::read(paths.memory_request("alice-dev")).unwrap()).unwrap();
-    assert_eq!(asked.max_memory_gib, 16);
+    assert_eq!(asked.max_memory, Ceiling::Size(16));
     assert!(calls.lock().unwrap().is_empty(), "saved for the next start");
     let (_, h, _) = send(ui(&s), as_carol("ws=alice-dev&memory_gib=12&restart=true")).await;
     assert_eq!(h[header::LOCATION], "/?w=alice-dev");
     assert_eq!(*calls.lock().unwrap(), [(Verb::Restart, "alice-dev".to_owned())], "and now");
     assert_eq!(*units.lock().unwrap(), ["workbench-memory@alice-dev.service", "workbench-memory@alice-dev.service"]);
 
-    for (form, why) in
-        [("ws=alice-dev&memory_gib=17", "Memory%20must"), ("ws=alice-dev&memory_gib=x", "whole%20number")]
-    {
+    for (form, why) in [
+        ("ws=alice-dev&memory_gib=17", "Memory%20must"),
+        ("ws=alice-dev&memory_gib=x", "whole%20number"),
+        ("ws=alice-dev&memory_gib=auto", "no%20auto"),
+    ] {
         let (code, h, _) = send(ui(&s), as_carol(form)).await;
         assert_eq!(code, StatusCode::SEE_OTHER);
         let to = h[header::LOCATION].to_str().unwrap();
@@ -640,6 +648,50 @@ async fn admins_change_a_workspaces_memory() {
     let (code, _, _) = send(ui(&s), as_carol("ws=alice&memory_gib=8")).await;
     assert_eq!(code, StatusCode::FORBIDDEN, "a declared workspace's memory is Nix's");
     assert_eq!(units.lock().unwrap().len(), 2, "nothing refused reaches the host");
+}
+
+/// Where the host's most is its memory, a workspace may follow it: new
+/// ones do unless their owner picks a size, and an admin sets it.
+#[tokio::test]
+async fn auto_where_the_host_offers_it() {
+    let _turn = TURN.lock().await;
+    let following = Workspace {
+        boot_memory_bytes: 2 << 30,
+        max_memory_bytes: 64 << 30,
+        memory_auto: true,
+        ..made("alice-dev", "alice")
+    };
+    let (dir, fake) = self_serve(vec![following], Some(Outcome { ok: true, error: String::new() }));
+    let s = state_with(fake, |l| {
+        l.max_memory = Ceiling::Auto;
+        l.host_memory_gib = 64;
+        l.quota = 2;
+    });
+    let paths = Paths(dir.path().to_owned());
+
+    let (_, _, body) = send(ui(&s), with_groups(get("/new", "alice"), "workbench")).await;
+    assert!(body.contains(r#"pattern="auto|[0-9]+""#) && body.contains("2 to 64, or auto"), "{body}");
+    assert!(body.contains(r#"name="memory_gib" type="text""#) && body.contains(r#"value="auto""#), "auto by default");
+    let form = "name=alice-two&os=ubuntu&memory_gib=auto&disk_gib=64";
+    let (_, h, _) = send(ui(&s), with_groups(post("/api/create", "alice", ORIGIN, form), "workbench")).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-two");
+    let asked: Asked = serde_json::from_slice(&std::fs::read(paths.request("alice-two")).unwrap()).unwrap();
+    assert_eq!(asked.max_memory, Ceiling::Auto);
+
+    let (_, _, panel) = send(ui(&s), get("/?w=alice-dev", "carol")).await;
+    assert!(panel.contains("of 64 GiB, the host's"), "{panel}");
+    let (_, _, body) = send(ui(&s), get("/w/alice-dev/memory", "carol")).await;
+    assert!(body.contains(r#"value="auto""#), "{body}");
+    let (_, h, _) = send(ui(&s), post("/api/memory", "carol", ORIGIN, "ws=alice-dev&memory_gib=24")).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-dev");
+    let asked: MemoryRequest =
+        serde_json::from_slice(&std::fs::read(paths.memory_request("alice-dev")).unwrap()).unwrap();
+    assert_eq!(asked.max_memory, Ceiling::Size(24));
+    let (_, h, _) = send(ui(&s), post("/api/memory", "carol", ORIGIN, "ws=alice-dev&memory_gib=auto")).await;
+    assert_eq!(h[header::LOCATION], "/?w=alice-dev");
+    let asked: MemoryRequest =
+        serde_json::from_slice(&std::fs::read(paths.memory_request("alice-dev")).unwrap()).unwrap();
+    assert_eq!(asked.max_memory, Ceiling::Auto);
 }
 
 #[tokio::test]

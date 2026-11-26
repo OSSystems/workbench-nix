@@ -10,6 +10,7 @@ use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use vmkit::hostutil;
 use workbench_model::apps::{Boot, BootApp, is_app_id};
+pub use workbench_model::memory::Ceiling;
 pub use workbench_model::{is_user_name, is_workspace_name};
 
 /// Searched in order for `<workspace>.json`: the declarative configs Nix
@@ -60,8 +61,9 @@ pub struct Config {
     pub cpus: i64,
     #[serde(rename = "bootMemMiB")]
     pub boot_mem_mib: i64,
+    /// MiB, or `auto`: the host's memory, read whenever it is asked for.
     #[serde(rename = "maxMemMiB")]
-    pub max_mem_mib: i64,
+    pub max_mem: Ceiling,
 
     pub tap: String,
     pub mac: String,
@@ -230,13 +232,15 @@ impl Config {
             (1..=MAX_DISK_GIB).contains(&self.disk_gib) && (0..=i64::from(u32::MAX)).contains(&self.cpus),
             "diskGiB must be positive and at most {MAX_DISK_GIB}, and cpus nonnegative"
         );
+        let max = self.max_mem.or_host(MAX_MEM_MIB);
         ensure!(
             self.boot_mem_mib > 0
                 && self.boot_mem_mib % 128 == 0
-                && self.max_mem_mib >= self.boot_mem_mib
-                && self.max_mem_mib % 128 == 0
-                && self.max_mem_mib <= MAX_MEM_MIB,
-            "bootMemMiB and maxMemMiB must be multiples of 128 with bootMemMiB <= maxMemMiB <= {MAX_MEM_MIB}"
+                && max >= self.boot_mem_mib
+                && max % 128 == 0
+                && max <= MAX_MEM_MIB,
+            "bootMemMiB and maxMemMiB must be multiples of 128 with bootMemMiB <= maxMemMiB <= {MAX_MEM_MIB}, \
+             or maxMemMiB auto"
         );
         ensure!(
             !self.tap.is_empty() && self.tap.len() <= 15 && !self.tap.contains(['/', ' ', '\t', '\n']),
@@ -284,6 +288,16 @@ impl Config {
             "runtimeDir too long for its sockets"
         );
         Ok(())
+    }
+
+    /// The most memory the VM grows to, in MiB: for `auto`, the host's as
+    /// it is now, and no less than it boots with.
+    #[must_use]
+    pub fn max_mem_mib(&self) -> i64 {
+        match self.max_mem {
+            Ceiling::Size(n) => n,
+            Ceiling::Auto => host_mem_mib().map_or(self.boot_mem_mib, |host| host.max(self.boot_mem_mib)),
+        }
     }
 
     /// The persistent disk.
@@ -392,6 +406,17 @@ pub fn parse(raw: &[u8]) -> anyhow::Result<Config> {
     Ok(c)
 }
 
+/// The host's memory in whole 128 MiB: how far `auto` lets a VM grow. The
+/// memory daemon still keeps the host's reserve out of its reach.
+pub fn host_mem_mib() -> anyhow::Result<i64> {
+    let total = hostutil::meminfo_kib()?.get("MemTotal").copied().context("no MemTotal in /proc/meminfo")?;
+    Ok(mem_mib_of(total))
+}
+
+fn mem_mib_of(total_kib: i64) -> i64 {
+    (total_kib / 1024 / 128 * 128).min(MAX_MEM_MIB)
+}
+
 /// Finds a workspace's config in the first directory that has it.
 pub fn load(dirs: &[PathBuf], name: &str) -> anyhow::Result<Config> {
     ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
@@ -455,7 +480,7 @@ pub(crate) mod tests {
             disk_gib: 64,
             cpus: 0,
             boot_mem_mib: 2048,
-            max_mem_mib: 16384,
+            max_mem: Ceiling::Size(16384),
             tap: "wb0ae8000a".into(),
             mac: "02:00:0a:e8:00:0a".into(),
             ip: "10.232.0.10".into(),
@@ -512,7 +537,8 @@ pub(crate) mod tests {
             ("trailing slash", |c| c.image = "/nix/store/x/".into()),
             ("root as state dir", |c| c.state_dir = "/".into()),
             ("huge disk", |c| c.disk_gib = 9_000_000_000),
-            ("huge memory", |c| c.max_mem_mib = 1 << 40),
+            ("huge memory", |c| c.max_mem = Ceiling::Size(1 << 40)),
+            ("max not aligned", |c| c.max_mem = Ceiling::Size(16_100)),
             ("unknown format", |c| c.image_format = "vmdk".into()),
             ("boot over max", |c| c.boot_mem_mib = 32768),
             ("boot not aligned", |c| c.boot_mem_mib = 1000),
@@ -572,6 +598,22 @@ pub(crate) mod tests {
         assert_eq!((c.packages.as_str(), c.apps.len(), c.legacy_app_port), ("/nix/store/x-packages", 0, 3773));
         let again = serde_json::to_value(&c).unwrap();
         assert!(again.get("appPort").is_none() && again.get("app").is_none(), "{again}");
+    }
+
+    /// `auto` grows to the host's memory, in whole 128 MiB.
+    #[test]
+    fn auto_memory_is_the_hosts() {
+        assert_eq!(mem_mib_of(8_388_608), 8192);
+        assert_eq!(mem_mib_of(72_019_512), 70_272);
+        assert_eq!(mem_mib_of(1 << 40), MAX_MEM_MIB);
+        let mut v = serde_json::to_value(test_config()).unwrap();
+        v["maxMemMiB"] = "auto".into();
+        let c = parse(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!((c.max_mem, c.max_mem_mib()), (Ceiling::Auto, host_mem_mib().unwrap()));
+        assert_eq!(serde_json::to_value(&c).unwrap()["maxMemMiB"], "auto", "it is written back as auto");
+        assert_eq!(test_config().max_mem_mib(), 16384);
+        v["maxMemMiB"] = "most".into();
+        assert!(parse(&serde_json::to_vec(&v).unwrap()).is_err(), "only auto stands for a size");
     }
 
     #[test]

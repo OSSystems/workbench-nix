@@ -841,7 +841,11 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                                 <dt>"Memory"</dt>
                                 <dd>
                                     {if ws.memory_bytes > 0 { gib(ws.memory_bytes) } else { "—".into() }}
-                                    {format!(" of {} GiB", gib(ws.max_memory_bytes))}
+                                    {format!(
+                                        " of {} GiB{}",
+                                        gib(ws.max_memory_bytes),
+                                        if ws.memory_auto { ", the host's" } else { "" },
+                                    )}
                                     {change
                                         .then(|| {
                                             view! {
@@ -1325,13 +1329,36 @@ fn AppsForm(
     }
 }
 
+/// The field of the most memory a VM grows to, in GiB from `lo` to `hi`,
+/// or `auto` where the host offers it: as far as the host has memory, `hi`
+/// GiB now. `then` follows its hint.
+fn memory_input(lo: i64, hi: i64, auto: bool, value: String, then: &str) -> AnyView {
+    if auto {
+        view! {
+            <input name="memory_gib" type="text" inputmode="numeric" pattern="auto|[0-9]+" list="memory-sizes" required value=value />
+            <datalist id="memory-sizes">
+                <option value="auto"></option>
+            </datalist>
+            <small>{format!("GiB, {lo} to {hi}, or auto: as far as the host has memory, {hi} GiB now; {then}")}</small>
+        }
+        .into_any()
+    } else {
+        view! {
+            <input name="memory_gib" type="number" min=lo max=hi required value=value />
+            <small>{format!("GiB, {lo} to {hi}; {then}")}</small>
+        }
+        .into_any()
+    }
+}
+
 /// The most memory a workspace made at run time grows to, which an admin
-/// changes within `range`, in GiB.
+/// changes within `range`, in GiB, or to `auto` where the host offers it.
 #[component]
-fn MemoryForm(ws: Workspace, range: (i64, i64), error: String) -> impl IntoView {
+fn MemoryForm(ws: Workspace, range: (i64, i64), auto: bool, error: String) -> impl IntoView {
     let name = ws.name.clone();
     let (lo, hi) = range;
-    let now = (ws.max_memory_bytes + (1 << 30) - 1) >> 30;
+    let now =
+        if ws.memory_auto { "auto".to_owned() } else { ((ws.max_memory_bytes + (1 << 30) - 1) >> 30).to_string() };
     let stopped = ws.state == State::Stopped;
     let save = if stopped {
         view! { <button class="btn p">"Save"</button> }.into_any()
@@ -1349,8 +1376,7 @@ fn MemoryForm(ws: Workspace, range: (i64, i64), error: String) -> impl IntoView 
             <input type="hidden" name="ws" value=name.clone() />
             <label>
                 <span>"Memory, at most"</span>
-                <input name="memory_gib" type="number" min=lo max=hi required value=now.to_string() />
-                <small>{format!("GiB, {lo} to {hi}; it boots with {} GiB and grows as it needs", gib(ws.boot_memory_bytes))}</small>
+                {memory_input(lo, hi, auto, now, &format!("it boots with {} GiB and grows as it needs", gib(ws.boot_memory_bytes)))}
             </label>
             <p class="small">
                 {if stopped {
@@ -1700,7 +1726,8 @@ fn ActionPage() -> impl IntoView {
             if !error.is_empty() {
                 set_status(422);
             }
-            view! { <MemoryForm ws range error /> }.into_any()
+            let auto = snap.memory_auto;
+            view! { <MemoryForm ws range auto error /> }.into_any()
         } else if action == "destroy" && ws.self_service {
             view! { <DestroyPage ws error detail /> }.into_any()
         } else if let Ok(verb) = action.parse::<Verb>() {
@@ -2273,7 +2300,11 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
     let left = new.quota.saturating_sub(new.owned);
     let or = |v: &str, d: String| if v.is_empty() { d } else { v.to_owned() };
     let name = or(&filled.name, if new.owned == 0 { new.slug.clone() } else { format!("{}-", new.slug) });
-    let memory = or(&filled.memory, l.max_memory_gib.min(8).max(l.min_memory_gib()).to_string());
+    // Where the host offers it, a new workspace grows as far as the host has memory.
+    let memory = or(
+        &filled.memory,
+        if l.memory_auto() { "auto".into() } else { l.max_memory_gib().min(8).max(l.min_memory_gib()).to_string() },
+    );
     let disk = or(&filled.disk, 64.min(l.max_disk_gib).to_string());
     let chosen = if filled.os.is_empty() { l.os.first().cloned().unwrap_or_default() } else { filled.os.clone() };
     let systems =
@@ -2357,8 +2388,13 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
                     <div class="pair">
                         <label>
                             <span>"Memory, at most"</span>
-                            <input name="memory_gib" type="number" min=l.min_memory_gib() max=l.max_memory_gib value=memory />
-                            <small>{format!("GiB, {} to {}; it boots with {}", l.min_memory_gib(), l.max_memory_gib, gib(l.boot_mem_mib << 20))}</small>
+                            {memory_input(
+                                l.min_memory_gib(),
+                                l.max_memory_gib(),
+                                l.memory_auto(),
+                                memory,
+                                &format!("it boots with {} GiB", gib(l.boot_mem_mib << 20)),
+                            )}
                         </label>
                         <label>
                             <span>"Disk"</span>

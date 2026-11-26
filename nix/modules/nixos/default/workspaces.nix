@@ -13,6 +13,8 @@ let
   poolName = "workbench";
   # Pools that yield to workspaces, and what they keep.
   behind = lib.filterAttrs (_: p: p.rank == "yielding") vmkit.memory.pools;
+  # GiB, or `auto`: the host's memory, which the launcher reads.
+  maxGiB = types.either types.ints.positive (types.enum [ "auto" ]);
   package = pkgs.callPackage ../../../package.nix { vmkit = cfg.vmkitSource; };
   exe = lib.getExe' package "workbench";
 
@@ -91,10 +93,15 @@ let
     )
     + lib.concatMapStrings (allowRule "") (cfg.allowedEndpoints ++ nameserverEndpoints);
 
-  memMiB = ws: {
-    boot = if ws.memory.bootMiB != null then ws.memory.bootMiB else cfg.memory.bootMiB;
-    max = (if ws.memory.maxGiB != null then ws.memory.maxGiB else cfg.memory.maxGiB) * 1024;
-  };
+  memMiB =
+    ws:
+    let
+      maxGiB = if ws.memory.maxGiB != null then ws.memory.maxGiB else cfg.memory.maxGiB;
+    in
+    {
+      boot = if ws.memory.bootMiB != null then ws.memory.bootMiB else cfg.memory.bootMiB;
+      max = if maxGiB == "auto" then "auto" else maxGiB * 1024;
+    };
 
   # A workspace's packages, those of its apps among them: what the guest
   # finds at config/app. Its `bin/workspace-agent` starts the agent at
@@ -744,9 +751,9 @@ let
             description = "Boot memory; null uses `memory.bootMiB`.";
           };
           maxGiB = mkOption {
-            type = types.nullOr types.ints.positive;
+            type = types.nullOr maxGiB;
             default = null;
-            description = "Most memory the VM grows to; null uses `memory.maxGiB`.";
+            description = "Most memory the VM grows to, or `auto`; null uses `memory.maxGiB`.";
           };
         };
         sshAuthorizedKeys = mkOption {
@@ -928,9 +935,12 @@ in
         description = "Memory a workspace boots with; it grows through virtio-mem under pressure.";
       };
       maxGiB = mkOption {
-        type = types.ints.positive;
+        type = maxGiB;
         default = 16;
-        description = "Most memory a workspace grows to.";
+        description = ''
+          Most memory a workspace grows to. `auto` is the host's memory, read
+          at every start: growth still stops at `reservePercent`.
+        '';
       };
       reservePercent = mkOption {
         type = types.ints.between 0 99;

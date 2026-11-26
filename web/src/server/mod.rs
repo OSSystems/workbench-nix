@@ -365,7 +365,8 @@ impl AppState {
         let mut snap = Snapshot::of(viewer.clone(), all.into_iter().map(view::row));
         if let Some(ss) = &self.opts.self_service {
             snap.apps.clone_from(&ss.limits.apps);
-            snap.memory_gib = Some((ss.limits.min_memory_gib(), ss.limits.max_memory_gib));
+            snap.memory_gib = Some((ss.limits.min_memory_gib(), ss.limits.max_memory_gib()));
+            snap.memory_auto = ss.limits.memory_auto();
         }
         Ok(snap)
     }

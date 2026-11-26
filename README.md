@@ -102,6 +102,12 @@ memory pools.
   guest's port 22.
 - **Memory.** Workspaces boot with `memory.bootMiB` and grow through
   virtio-mem up to `memory.maxGiB` under pressure, with free page reporting.
+  `auto`, there or in one workspace's `memory.maxGiB`, is the host's
+  memory, read at every start; growth still stops short of the host's
+  `memory.reservePercent`, so a ceiling in GiB is what keeps one workspace
+  from taking what the others would grow into. Where
+  `web.selfService.maxMemoryGiB` is `auto`, workspaces made at run time
+  may be `auto` too, and new ones are unless their owner picks a size.
   They are a `first` pool in vmkit's `services.vmkit.memory.pools`: on a
   host with `yielding` pools, those only boot into and grow into memory
   workspaces leave, except for what each is guaranteed.
