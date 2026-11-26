@@ -213,6 +213,16 @@ kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; 
 .tbl > div.hd { color: var(--t3); font-size: 12px; font-weight: 600; }
 .tbl.ws > div { grid-template-columns: 16px 1.2fr 1fr .8fr 1fr .8fr .8fr; }
 .tbl .num { text-align: right; }
+/* A front's nodes. */
+.ns { padding: 1px 8px; border-radius: 999px; border: 1px solid var(--ok-edge); background: var(--ok-soft); color: var(--ok) !important; font-weight: 600; }
+.ns.bad { border-color: var(--bad-edge); background: var(--bad-soft); color: var(--bad) !important; }
+.panel > .note { margin: 12px 16px 0; }
+.nodedisk { padding: 0 16px 14px; font-size: 12.5px; color: var(--t2); }
+.tbl.nws > div { grid-template-columns: 16px 1.2fr 1fr .7fr .7fr .7fr .7fr 96px; }
+.tbl.nws .btn { height: 28px; justify-self: end; }
+.pick { display: grid; gap: 6px; margin-bottom: 16px; }
+.pick label { display: grid; grid-template-columns: 18px 1fr; gap: 2px 10px; padding: 11px 12px; border: 1px solid var(--line2); border-radius: 9px; background: var(--g2); font-size: 13px; }
+.pick small { grid-column: 2; color: var(--t3); font-size: 12px; }
 
 /* Phone. */
 .phone { position: relative; width: 360px; max-width: 100%; height: 720px; border-radius: 26px; overflow: hidden; border: 1px solid var(--line2); background: var(--g0); color: var(--t); font: 14px/1.45 "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums; display: flex; flex-direction: column; }
@@ -479,36 +489,45 @@ kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; 
 
 <section class="fig" id="host">
   <h2>Host</h2>
-  <p>Admins only. The host's memory as one bar: what each pool holds, what workspaces are waiting for, the reserve no workspace grows into, and what's free. A pool whose daemon stopped writing says since when.</p>
+  <p>Admins only. The host page is a section per node: its state, Close or Reopen, its memory as one bar, with what each pool holds and waits for, the reserve and what's free, its disk, and its workspaces, each made at run time with <b>Move…</b>. A node that doesn't answer keeps its workspaces listed, Unreachable. Move lists the open nodes of the same build but the workspace's own.</p>
   <div class="scroll"><div class="app t-dark">
-    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="cmd"><svg class="i"><use href="#search"/></svg>Open, sign in or restart a workspace…<kbd>Ctrl K</kbd></span><span class="me"><span class="role">admin</span>carol<span class="av">CA</span></span></div>
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me"><span class="role">admin</span>carol<span class="av">CA</span></span></div>
     <div class="lay np">
-      <aside class="side"><div class="ni"><span>Workspaces</span><span class="x">7</span></div><div class="ni a"><span>Host</span></div><div class="ni"><span>Help</span></div></aside>
+      <aside class="side"><div class="ni"><span>Workspaces</span><span class="x">5</span></div><div class="ni a"><span>Host</span></div></aside>
       <section class="main">
-        <div class="bar"><b>Host</b><span class="x">ws.example.com</span><span class="chips small">updated 10:42:05</span></div>
+        <div class="bar"><b>Host</b><span class="chips small">updated 10:42:05</span></div>
         <div class="hostw">
           <div class="panel">
-            <header><h2>Memory</h2><span>125.6 GiB total</span><span class="rt">46.2 GiB free</span></header>
-            <div class="hbar"><i class="sw1" style="width:24%"></i><i class="sw2" style="width:28%"></i><i class="sw3" style="width:2.5%"></i><i class="sw4" style="width:10%"></i></div>
-            <div class="legend"><span><i class="sw1"></i>workbench 30.1 GiB</span><span><i class="sw2"></i>builders 35.2 GiB</span><span><i class="sw3"></i>waiting 3.1 GiB</span><span><i class="sw4"></i>reserve 12.6 GiB</span><span><i class="sw5"></i>free 46.2 GiB</span></div>
-            <div class="tbl">
-              <div class="hd"><span>Pool</span><span class="num">Holds</span><span class="num">Waiting</span><span>Last denied</span><span>Report</span></div>
-              <div><span class="mono">workbench</span><span class="num">30.1 GiB</span><span class="num">3.1 GiB</span><span>4 min ago</span><span class="small">2 s ago</span></div>
-              <div><span class="mono">builders</span><span class="num">35.2 GiB</span><span class="num">—</span><span>—</span><span style="color:var(--go)">no data since 10:12</span></div>
+            <header><h2>Node <span class="mono">a</span></h2><span class="ns">up</span><span>62.8 GiB total</span><span class="rt">21.4 GiB free</span><span class="btn">Close a</span></header>
+            <div class="hbar"><i class="sw1" style="width:48%"></i><i class="sw4" style="width:10%"></i></div>
+            <div class="legend"><span><i class="sw1"></i>workspaces 30.1 GiB</span><span><i class="sw3"></i>waiting 0 GiB</span><span><i class="sw4"></i>reserve 6.3 GiB</span><span><i class="sw5"></i>free 21.4 GiB</span></div>
+            <p class="nodedisk">Disk: 412 GiB free of 900 GiB. Its workspaces may grow to 48 GiB together.</p>
+            <div class="tbl nws">
+              <div class="hd"><span></span><span>Workspace</span><span>Owner</span><span class="num">Now</span><span class="num">Boot</span><span class="num">Most</span><span class="num">Disk</span><span></span></div>
+              <div><span class="dot on"></span><span class="mono">alice</span><span>alice</span><span class="num">3.2 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">64 GiB</span><span class="small">declared in Nix</span></div>
+              <div><span class="dot on"></span><span class="mono">alice-dev</span><span>alice</span><span class="num">5.8 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">64 GiB</span><span class="btn">Move…</span></div>
             </div>
           </div>
           <div class="panel">
-            <header><h2>Workspaces</h2><span>memory now, at boot and at most</span></header>
-            <div class="tbl ws">
-              <div class="hd"><span></span><span>Workspace</span><span>Owner</span><span class="num">Now</span><span class="num">Boot</span><span class="num">Most</span><span class="num">Disk</span></div>
-              <div><span class="dot on"></span><span class="mono">bob</span><span>bob</span><span class="num">11.4 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">96 GiB</span></div>
-              <div><span class="dot on"></span><span class="mono">alice-nix</span><span>alice</span><span class="num">5.8 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">23 GiB</span></div>
-              <div><span class="dot on"></span><span class="mono">alice</span><span>alice</span><span class="num">3.2 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">41 GiB</span></div>
+            <header><h2>Node <span class="mono">b</span></h2><span class="ns bad">unreachable</span></header>
+            <div class="note bad"><b>It doesn't answer: its workspaces are Unreachable and their actions wait. Their apps answer while their VMs run.</b></div>
+            <div class="tbl nws">
+              <div class="hd"><span></span><span>Workspace</span><span>Owner</span><span class="num">Now</span><span class="num">Boot</span><span class="num">Most</span><span class="num">Disk</span><span></span></div>
+              <div><span class="dot bad"></span><span class="mono">bob</span><span>bob</span><span class="num">11.4 GiB</span><span class="num">2 GiB</span><span class="num">16 GiB</span><span class="num">96 GiB</span><span class="btn" aria-disabled="true">Move…</span></div>
             </div>
           </div>
         </div>
       </section>
     </div>
+  </div></div>
+  <div class="scroll"><div class="app short half t-dark">
+    <div class="top"><span class="brand"><svg><use href="#mark"/></svg>workbench</span><span class="me"><span class="role">admin</span>carol<span class="av">CA</span></span></div>
+    <div class="scrim"><div class="dlg" role="dialog" aria-labelledby="dm">
+      <h2 id="dm">Move <span class="mono">alice-dev</span></h2>
+      <p class="small">On a now. It is down while its disk is copied through the front, about 6 minutes for 40 GiB, and starts on the new node if it ran. Its address changes; its disk and apps don't.</p>
+      <div class="pick"><label><input type="radio" checked><span><b class="mono">c</b></span><small>34 GiB of memory free · 500 GiB of disk free</small></label></div>
+      <div class="acts"><span class="btn q">Cancel</span><span class="btn p">Move alice-dev</span></div>
+    </div></div>
   </div></div>
 </section>
 
