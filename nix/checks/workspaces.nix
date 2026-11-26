@@ -111,12 +111,12 @@ let
       "(&(cn=workbench)(memberUid=$1))" dn | grep -q '^dn:'
   '';
 
-  # Attaches to a workspace's shared console the way `workbench console`
-  # does, and presses Enter until the guest's login prompt shows.
+  # Attaches to a workspace's console its node shares, the way `workbench
+  # console` does, and presses Enter until the guest's login prompt shows.
   consoleLogin = pkgs.writeText "console-login.py" ''
     import socket, sys, time
     s = socket.socket(socket.AF_UNIX)
-    s.connect("/run/workbench-web/console.sock")
+    s.connect("/run/workbench-node/console.sock")
     s.sendall(sys.argv[1].encode() + b"\n")
     s.settimeout(2)
     out = b""
@@ -261,41 +261,49 @@ pkgs.testers.runNixOSTest {
       };
       services.nginx.virtualHosts.${domain}.locations."/dex/".proxyPass = "http://127.0.0.1:5556";
 
-      services.workbench = {
+      # A host on its own: the front, and its one node.
+      services.workbench.front = {
         enable = true;
-        inherit domain;
-        web = {
+        adminGroups = [ "workbench-admins" ];
+        # A test can't wait five minutes for a session to be checked.
+        sessionRefresh = "15s";
+        selfService = {
           enable = true;
-          adminGroups = [ "workbench-admins" ];
-          # A test can't wait five minutes for a session to be checked.
-          sessionRefresh = "15s";
-          selfService = {
-            enable = true;
-            groups = [ "workbench" ];
-            os = [ "ubuntu" ];
-            maxDiskGiB = 32;
-            # The host's memory: no VM here boots with it, since one could
-            # then take what the other needs to grow.
-            maxMemoryGiB = "auto";
-            environmentCommand = "${environmentCommand}";
-            ownerCommand = "${ownerCommand}";
-          };
-          oidc = {
-            provider = "oidc";
-            # No email scope, so the ID token names no email, as Keycloak's
-            # doesn't for a directory user without a mail.
-            scope = "openid profile groups offline_access";
-            issuerUrl = "https://${domain}/dex";
-            clientSecretFile = "${pkgs.writeText "client-secret" "test-client-secret"}";
-            cookieSecretFile = "${pkgs.writeText "cookie-secret" "0123456789abcdef0123456789abcdef"}";
-          };
+          groups = [ "workbench" ];
+          os = [ "ubuntu" ];
+          maxDiskGiB = 32;
+          # The host's memory: no VM here boots with it, since one could
+          # then take what the other needs to grow.
+          maxMemoryGiB = "auto";
+          environmentCommand = "${environmentCommand}";
+          ownerCommand = "${ownerCommand}";
+        };
+        oidc = {
+          provider = "oidc";
+          # No email scope, so the ID token names no email, as Keycloak's
+          # doesn't for a directory user without a mail.
+          scope = "openid profile groups offline_access";
+          issuerUrl = "https://${domain}/dex";
+          clientSecretFile = "${pkgs.writeText "client-secret" "test-client-secret"}";
+          cookieSecretFile = "${pkgs.writeText "cookie-secret" "0123456789abcdef0123456789abcdef"}";
         };
         virtualHost = {
           forceSSL = true;
           sslCertificate = "${certs}/server.crt";
           sslCertificateKey = "${certs}/server.key";
         };
+      };
+      services.workbench.node = {
+        enable = true;
+        name = "host";
         network.externalInterface = "eth1";
+      };
+      services.workbench.fleet = {
+        inherit domain;
+        nodes.host = {
+          subnet = "10.232.0";
+          wireguard.address = "10.231.0.10";
+        };
         environment.WORKSPACE_TEST = "shared";
         memory = {
           bootMiB = 2048;
@@ -305,6 +313,7 @@ pkgs.testers.runNixOSTest {
           name: ws:
           ws
           // {
+            node = "host";
             diskGiB = if ws.os or "ubuntu" == "nixos" then 16 else 8;
             cpus = 2;
             inherit apps;
@@ -402,6 +411,17 @@ pkgs.testers.runNixOSTest {
     def url(name):
         return f"https://{name}--t3code.{domain}"
 
+    # What the front says of a workspace: its record, and what waits for
+    # its next start, which the front tells from the record and the VM.
+    def record_of(name):
+        return json.loads(host.succeed(f"cat /var/lib/workbench/registry/{name}.json"))
+
+    def front_of(name):
+        seen = json.loads(host.succeed(
+            "curl -sf --unix-socket /run/workbench-web/ui.sock -H 'X-Workbench-User: carol' -H 'X-Workbench-Groups: workbench-admins' http://ui/api/workspaces"
+        ))
+        return next(w for w in seen if w["name"] == name)
+
     def os_of(name):
         return workspaces[name].get("os", "ubuntu")
 
@@ -416,6 +436,14 @@ pkgs.testers.runNixOSTest {
             # A NixOS guest copies the app's closure first.
             units = " ".join(f"workspace-app-{a}.service" for a in ${builtins.toJSON apps})
             guest(name, f"timeout 900 sh -c 'until systemctl is-active {units} workspace-agent.service; do sleep 5; done'")
+
+    with subtest("the front and its node reach each other through sockets, without WireGuard"):
+        host.fail("ip link show wg-workbench")
+        assert host.succeed("stat -c '%a %U %G' /run/workbench-node/api.sock").strip() == "660 root workbench"
+        assert host.succeed("stat -c '%a %U' /run/workbench-front/api.sock").strip() == "600 root"
+        for name in workspaces:
+            record = json.loads(host.succeed(f"cat /var/lib/workbench/registry/{name}.json"))
+            assert record["node"] == "host" and record["declared"], record
 
     with subtest("the agent runs the app as the owner with its environment"):
         for name, ws in workspaces.items():
@@ -527,8 +555,9 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the UI sees each VM through its sockets"):
         seen = json.loads(host.succeed(
-            "curl -sf --unix-socket /run/workbench-web/ui.sock -H 'X-Workbench-User: carol' http://ui/api/workspaces"
+            "curl -sf --unix-socket /run/workbench-web/ui.sock -H 'X-Workbench-User: carol' -H 'X-Workbench-Groups: workbench-admins' http://ui/api/workspaces"
         ))
+        assert sorted(ws["name"] for ws in seen) == sorted(workspaces), seen
         for ws in seen:
             assert ws["state"] == "running" and ws["apps"][0]["openLink"] and not ws.get("changes"), ws
 
@@ -801,6 +830,8 @@ pkgs.testers.runNixOSTest {
         assert out == "303 https://${domain}/?w=alice-dev", out
         config = json.loads(host.succeed("cat /var/lib/workbench/configs/alice-dev.json"))
         assert config["owner"] == "alice" and config["selfService"] and config["ip"] == "10.232.0.128", config
+        record = record_of("alice-dev")
+        assert (record["node"], record["ip"], record["owner"]) == ("host", "10.232.0.128", "alice"), record
         assert [a["id"] for a in config["apps"]] == ["t3code"], config
         host.succeed("getent passwd wb-alice-dev")
         workspaces["alice-dev"] = {"ip": config["ip"], "owner": "alice"}
@@ -831,8 +862,10 @@ pkgs.testers.runNixOSTest {
 
     with subtest("alice changes her workspace's apps, which wait for a restart"):
         assert set_apps("") == "303 https://${domain}/?w=alice-dev"
-        assert json.loads(host.succeed("cat /var/lib/workbench/configs/alice-dev.json"))["apps"] == []
-        ws = status_of("alice-dev")
+        # The record changes; the node's config, at the next start.
+        assert record_of("alice-dev")["apps"] == []
+        # The front tells what waits for the restart from the record.
+        ws = front_of("alice-dev")
         assert ws["changes"] == [{"kind": "appRemoved", "app": "t3code"}], ws
         assert app_active("alice-dev"), "it runs until the restart"
         page = client.succeed(f"curl -s {as_user('alice')} 'https://${domain}/?w=alice-dev'")
@@ -843,7 +876,7 @@ pkgs.testers.runNixOSTest {
         assert not app_active("alice-dev"), "gone with the restart"
         assert status_code(f"{as_user('alice')} {url('alice-dev')}/") == "404"
         assert set_apps("-d apps%5B0%5D=t3code") == "303 https://${domain}/?w=alice-dev"
-        assert status_of("alice-dev")["changes"] == [{"kind": "appAdded", "app": "t3code"}]
+        assert front_of("alice-dev")["changes"] == [{"kind": "appAdded", "app": "t3code"}]
         out = client.succeed(f"curl -s -o /dev/null -w '%{{redirect_url}}' {as_user('alice')} {ui_form} -d ws=alice-dev -d app=t3code https://${domain}/api/open")
         assert out == "https://${domain}/w/alice-dev/open/t3code", out
         host.succeed("workbench restart alice-dev")
@@ -853,7 +886,7 @@ pkgs.testers.runNixOSTest {
     with subtest("a config from before apps gets its app back"):
         file = "/var/lib/workbench/configs/alice-dev.json"
         host.succeed(f"jq '.app = .packages | del(.packages, .apps) | .appPort = 3773' {file} > /tmp/old.json && cp /tmp/old.json {file}")
-        host.succeed("systemctl restart workbench-self-service.service")
+        host.succeed("systemctl restart workbench-node-setup.service")
         now = json.loads(host.succeed(f"cat {file}"))
         assert [a["id"] for a in now["apps"]] == ["t3code"] and "appPort" not in now and "app" not in now, now
         assert not status_of("alice-dev").get("changes"), "the same app, the same packages"
@@ -885,7 +918,8 @@ pkgs.testers.runNixOSTest {
         assert "owner left" in page, page[:2000]
 
     with subtest("back in the group, her workspace starts again"):
-        host.fail("test -e /var/lib/workbench/.stopped/alice-dev")
+        # Its node keeps it stopped, across a reboot too, until she is back.
+        host.succeed("test -e /var/lib/workbench/.stopped/alice-dev")
         host.succeed(
             "printf 'dn: cn=workbench,ou=groups,${baseDN}\\nchangetype: modify\\nadd: memberUid\\nmemberUid: alice\\n' "
             "| ldapmodify -x -H ldap://127.0.0.1 -D cn=admin,${baseDN} -w admin"
@@ -893,6 +927,7 @@ pkgs.testers.runNixOSTest {
         host.succeed("systemctl start workbench-self-service-reconcile.service")
         host.wait_until_succeeds("systemctl show -P ActiveState workbench@alice-dev.service | grep -qx active", timeout=180)
         host.fail("test -e /var/lib/workbench/.left/alice-dev")
+        host.fail("test -e /var/lib/workbench/.stopped/alice-dev")
 
     with subtest("an admin destroys it, and its user and tap go"):
         tap = config["tap"]
@@ -902,6 +937,7 @@ pkgs.testers.runNixOSTest {
         ).strip()
         assert out == "303 https://${domain}/", out
         host.fail("test -e /var/lib/workbench/configs/alice-dev.json")
+        host.fail("test -e /var/lib/workbench/registry/alice-dev.json")
         host.fail("test -e /var/lib/workbench/alice-dev")
         host.fail("getent passwd wb-alice-dev")
         host.fail(f"ip link show {tap}")

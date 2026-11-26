@@ -25,42 +25,73 @@ let
             acceptTerms = true;
             defaults.email = "admin@example.com";
           };
+          # A host on its own: the front, and its one node.
           services.workbench = {
-            enable = true;
+            fleet = {
+              domain = "ws.example.com";
+              nodes.host = {
+                subnet = "10.232.0";
+                wireguard.address = "10.231.1.10";
+              };
+              # Not the default: the other controller below has its guests there.
+              wireguard.subnet = "10.231.1.0/24";
+              apps.hello = {
+                name = "Hello";
+                port = 8080;
+                serve = "exec ${pkgs.python3}/bin/python3 -m http.server \"$APP_PORT\"";
+              };
+              # Reached from a terminal, and only by the workspaces that ask.
+              apps.term = {
+                name = "Term";
+                port = null;
+                default = false;
+                serve = "exec sleep infinity";
+              };
+              workspaces = lib.mapAttrs (_: ws: ws // { node = "host"; }) {
+                alice-main = {
+                  owner = "alice";
+                  ip = "10.232.0.10";
+                };
+                alice-scratch = {
+                  owner = "alice";
+                  ip = "10.232.0.11";
+                  sudo = false;
+                  apps = [
+                    "hello"
+                    "term"
+                  ];
+                };
+                alice-bare = {
+                  owner = "alice";
+                  ip = "10.232.0.12";
+                  apps = [ ];
+                };
+              };
+            };
+            front = {
+              enable = true;
+              virtualHost = {
+                forceSSL = true;
+                useACMEHost = "ws.example.com";
+              };
+              oidc = {
+                issuerUrl = "https://sso.example.com/realms/example";
+                clientSecretFile = "/run/secrets/oidc";
+                cookieSecretFile = "/run/secrets/cookie";
+              };
+            };
+            node = {
+              enable = true;
+              name = "host";
+              network.externalInterface = "eth0";
+            };
+          };
+          security.acme.certs."ws.example.com" = {
             domain = "ws.example.com";
-            network.externalInterface = "eth0";
-            apps.hello = {
-              name = "Hello";
-              port = 8080;
-              serve = "exec ${pkgs.python3}/bin/python3 -m http.server \"$APP_PORT\"";
-            };
-            # Reached from a terminal, and only by the workspaces that ask.
-            apps.term = {
-              name = "Term";
-              port = null;
-              default = false;
-              serve = "exec sleep infinity";
-            };
-            workspaces = {
-              alice-main = {
-                owner = "alice";
-                ip = "10.232.0.10";
-              };
-              alice-scratch = {
-                owner = "alice";
-                ip = "10.232.0.11";
-                sudo = false;
-                apps = [
-                  "hello"
-                  "term"
-                ];
-              };
-              alice-bare = {
-                owner = "alice";
-                ip = "10.232.0.12";
-                apps = [ ];
-              };
-            };
+            extraDomainNames = [ "*.ws.example.com" ];
+            dnsProvider = "rfc2136";
+            environmentFile = "/run/secrets/acme";
+            group = "nginx";
           };
         }
       ]
@@ -84,7 +115,7 @@ let
   alone = eval [ ];
   clash = eval [
     neighbour
-    { services.workbench.network.subnet = lib.mkForce "10.231.0"; }
+    { services.workbench.fleet.nodes.host.subnet = lib.mkForce "10.231.0"; }
   ];
   failedAssertions = c: map (a: a.message) (lib.filter (a: !a.assertion) c.assertions);
   memoryExec = config.systemd.services.workbench-memory.serviceConfig.ExecStart;
@@ -134,9 +165,13 @@ let
     {
       ok =
         config.environment.etc ? "workbench/alice-main.json"
-        && config.services.nginx.virtualHosts ? "alice-scratch--hello.ws.example.com"
-        && lib.all (h: !lib.hasPrefix "alice-bare" h) (lib.attrNames config.services.nginx.virtualHosts);
-      msg = "every workspace gets a config, and each of its apps a virtual host";
+        && config.environment.etc ? "workbench-front/alice-main.json"
+        &&
+          lib.attrNames config.services.nginx.virtualHosts == [
+            "workbench-workspaces"
+            "ws.example.com"
+          ];
+      msg = "every workspace gets a config and a record, and one virtual host serves every app";
     }
     {
       ok =
@@ -148,9 +183,8 @@ let
           map (a: a.port) (appsOf "alice-scratch") == [
             8080
             null
-          ]
-        && !(config.services.nginx.virtualHosts ? "alice-scratch--term.ws.example.com");
-      msg = "an app people opt into, without an address, is only where asked and has no virtual host";
+          ];
+      msg = "an app people opt into, without an address, is only where asked";
     }
   ];
 in

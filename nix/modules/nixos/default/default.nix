@@ -1,9 +1,61 @@
 { inputs, ... }:
+let
+  # What a host on its own had, before the fleet, and where each went: an
+  # old option fails the evaluation and names its new one.
+  moved = {
+    enable = "services.workbench.front.enable and services.workbench.node.enable";
+    domain = "services.workbench.fleet.domain";
+    publicScheme = "services.workbench.fleet.publicScheme";
+    package = "services.workbench.fleet.package";
+    vmkitSource = "services.workbench.fleet.vmkitSource";
+    apps = "services.workbench.fleet.apps";
+    herdr = "services.workbench.fleet.herdr";
+    herdrCore = "services.workbench.fleet.herdrCore";
+    extraPackages = "services.workbench.fleet.extraPackages";
+    environment = "services.workbench.fleet.environment";
+    environmentFile = "services.workbench.fleet.environmentFile, a path on the front";
+    allowedEndpoints = "services.workbench.fleet.allowedEndpoints";
+    image = "services.workbench.fleet.image";
+    imageFormat = "services.workbench.fleet.imageFormat";
+    nixos = "services.workbench.fleet.nixos";
+    "memory.bootMiB" = "services.workbench.fleet.memory.bootMiB";
+    "memory.maxGiB" = "services.workbench.fleet.memory.maxGiB";
+    "memory.reservePercent" = "services.workbench.node.memory.reservePercent";
+    "network.subnet" = "services.workbench.fleet.nodes.<node>.subnet";
+    "network.externalInterface" = "services.workbench.node.network.externalInterface";
+    "network.nameservers" = "services.workbench.fleet.network.nameservers";
+    workspaces = "services.workbench.fleet.workspaces, each with its `node`";
+    virtualHost = "services.workbench.front.virtualHost";
+    web = "services.workbench.front, which always has the web UI";
+    stateDir = "services.workbench.front.stateDir and services.workbench.node.stateDir";
+  };
+  removed =
+    path: now:
+    { lib, ... }:
+    {
+      imports = [
+        (lib.mkRemovedOptionModule
+          (
+            [
+              "services"
+              "workbench"
+            ]
+            ++ lib.splitString "." path
+          )
+          ''
+            It is ${now} now: workbench runs as a fleet. See the README's "From one host to a front and a node".
+          ''
+        )
+      ];
+    };
+in
 {
   imports = [
     inputs.vmkit.nixosModules.default
-    ./workspaces.nix
-    ./web.nix
+    ./fleet.nix
+    ./front.nix
+    ./node.nix
+    ./wireguard.nix
     (
       { lib, pkgs, ... }:
       let
@@ -39,7 +91,7 @@
             '';
       in
       {
-        services.workbench = {
+        services.workbench.fleet = {
           package = lib.mkDefault t3code;
           herdr.package = lib.mkDefault agents.herdr;
           herdrCore.package = lib.mkDefault agents.herdr-core;
@@ -47,5 +99,6 @@
         };
       }
     )
-  ];
+  ]
+  ++ builtins.attrValues (builtins.mapAttrs removed moved);
 }
