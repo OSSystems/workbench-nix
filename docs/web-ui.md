@@ -311,7 +311,8 @@ amber while starting, red while failing; a stopped workspace has none.
 **The side panel** shows the selected workspace: name, status and since
 when, what waits for a restart, then Owner (admins), System, Memory (a
 meter with a tick at the boot size, and for an admin on a workspace made
-at run time **Change…**, to its memory page), Disk on host, its apps and
+at run time **Edit…** at its right, which opens the memory form in a
+dialog, its page without JavaScript), Disk on host, its apps and
 the actions:
 
 - **Apps**: each app's **Open `<app>`**, the first primary (`↵`), and a ⋯
@@ -431,7 +432,8 @@ memory.
 ### The memory of a workspace (`/w/<ws>/memory`, admins)
 
 The most a workspace made at run time grows to, which its owner picked on
-**New workspace**: an admin changes it here, from the boot size to
+**New workspace**: an admin changes it from the panel's **Edit…**, a
+dialog, or here, from the boot size to
 `web.selfService.maxMemoryGiB`, or to `auto` where that is `auto` too:
 as far as the host has memory, read at every start. Then **Save** or
 **Save and restart**; a

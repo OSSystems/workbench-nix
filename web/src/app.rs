@@ -139,6 +139,7 @@ const ICON_CONSOLE: &str = "m5 8 4 4-4 4M12 16h7";
 const ICON_TERMINAL: &str = "M4 5h16v14H4zM8 10l2 2-2 2M12 14h4";
 const ICON_RESTART: &str = "M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6";
 const ICON_STOP: &str = "M12 3v8M6.6 6.6a8 8 0 1 0 10.8 0";
+const ICON_EDIT: &str = "M12 20h8M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z";
 
 fn initials(name: &str) -> String {
     name.chars().take(2).collect::<String>().to_uppercase()
@@ -793,6 +794,9 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
     };
     let make = (make, for_app);
     let ws = move || row.with(|r| r.as_ref().map(|r| r.ws.clone()).unwrap_or_default());
+    // An admin sizes one made at run time, where the host offers sizes.
+    let resizable = row.with_untracked(|r| r.as_ref().is_some_and(|r| r.ws.self_service))
+        && snap.with_untracked(|s| s.viewer.admin && s.memory_gib.is_some());
     let head = move || {
         row.get().map(|r| {
             let ws = r.ws;
@@ -834,27 +838,37 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                     {(!ws.os.is_empty()).then(|| view! { <dt>"System"</dt><dd>{os_name(&ws.os)}</dd> })}
                     {(ws.max_memory_bytes > 0)
                         .then(|| {
-                            // An admin changes how far one made at run time grows.
-                            let change = snap.with_untracked(|s| s.viewer.admin && s.memory_gib.is_some())
-                                && ws.self_service;
+                            // An admin changes how far one made at run time grows,
+                            // in its dialog.
+                            let edit = resizable.then(|| {
+                                let id = format!("memory-{}", ws.name);
+                                view! {
+                                    <a
+                                        class="btn sm"
+                                        href=format!("/w/{}/memory", ws.name)
+                                        rel="external"
+                                        aria-label=format!("Edit the memory of {}…", ws.name)
+                                        on:click=move |ev| open_dialog(&ev, &id)
+                                    >
+                                        <Icon d=ICON_EDIT />
+                                        "Edit…"
+                                    </a>
+                                }
+                            });
                             view! {
                                 <dt>"Memory"</dt>
                                 <dd>
-                                    {if ws.memory_bytes > 0 { gib(ws.memory_bytes) } else { "—".into() }}
-                                    {format!(
-                                        " of {} GiB{}",
-                                        gib(ws.max_memory_bytes),
-                                        if ws.memory_auto { ", the host's" } else { "" },
-                                    )}
-                                    {change
-                                        .then(|| {
-                                            view! {
-                                                " · "
-                                                <a href=format!("/w/{}/memory", ws.name) rel="external">
-                                                    "Change…"
-                                                </a>
-                                            }
-                                        })}
+                                    <div class="kv-v">
+                                        <span>
+                                            {if ws.memory_bytes > 0 { gib(ws.memory_bytes) } else { "—".into() }}
+                                            {format!(
+                                                " of {} GiB{}",
+                                                gib(ws.max_memory_bytes),
+                                                if ws.memory_auto { ", the host's" } else { "" },
+                                            )}
+                                        </span>
+                                        {edit}
+                                    </div>
                                     <span class="meter">
                                         <i style=format!("width: {}%", pct(ws.memory_bytes, ws.max_memory_bytes))></i>
                                         <b
@@ -968,6 +982,16 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
             })
         })
     });
+    // The memory dialog follows whether the VM runs and how far it grows,
+    // not what it holds now, which changes as someone types.
+    let memory_of = Memo::new(move |_| {
+        row.with(|r| {
+            r.as_ref().map(|r| {
+                let ws = &r.ws;
+                (ws.state == State::Stopped, ws.max_memory_bytes, ws.memory_auto, ws.boot_memory_bytes)
+            })
+        })
+    });
     let dialogs = configured.get_untracked().then(|| {
         let offered = snap.with_untracked(|s| s.apps.clone());
         view! {
@@ -982,6 +1006,20 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
                                 form_of.track();
                                 let ws = row.with_untracked(|r| r.as_ref().map(|r| r.ws.clone()).unwrap_or_default());
                                 view! { <AppsForm ws offered=offered.clone() dialog=true /> }
+                            }}
+                        </dialog>
+                    }
+                })}
+            {resizable
+                .then(|| {
+                    view! {
+                        <dialog id=format!("memory-{name}") class="dlg" aria-labelledby=format!("memory-{name}-h")>
+                            {move || {
+                                memory_of.track();
+                                let ws = row.with_untracked(|r| r.as_ref().map(|r| r.ws.clone()).unwrap_or_default());
+                                let (range, auto) =
+                                    snap.with_untracked(|s| (s.memory_gib.unwrap_or_default(), s.memory_auto));
+                                view! { <MemoryForm ws range auto dialog=true /> }
                             }}
                         </dialog>
                     }
@@ -1331,12 +1369,13 @@ fn AppsForm(
 
 /// The field of the most memory a VM grows to, in GiB from `lo` to `hi`,
 /// or `auto` where the host offers it: as far as the host has memory, `hi`
-/// GiB now. `then` follows its hint.
-fn memory_input(lo: i64, hi: i64, auto: bool, value: String, then: &str) -> AnyView {
+/// GiB now. `then` follows its hint, and `list` names its suggestions,
+/// one per page.
+fn memory_input(lo: i64, hi: i64, auto: bool, value: String, then: &str, list: String) -> AnyView {
     if auto {
         view! {
-            <input name="memory_gib" type="text" inputmode="numeric" pattern="auto|[0-9]+" list="memory-sizes" required value=value />
-            <datalist id="memory-sizes">
+            <input name="memory_gib" type="text" inputmode="numeric" pattern="auto|[0-9]+" list=list.clone() required value=value />
+            <datalist id=list>
                 <option value="auto"></option>
             </datalist>
             <small>{format!("GiB, {lo} to {hi}, or auto: as far as the host has memory, {hi} GiB now; {then}")}</small>
@@ -1352,9 +1391,16 @@ fn memory_input(lo: i64, hi: i64, auto: bool, value: String, then: &str) -> AnyV
 }
 
 /// The most memory a workspace made at run time grows to, which an admin
-/// changes within `range`, in GiB, or to `auto` where the host offers it.
+/// changes within `range`, in GiB, or to `auto` where the host offers it:
+/// in its dialog on the panel, or on its own page.
 #[component]
-fn MemoryForm(ws: Workspace, range: (i64, i64), auto: bool, error: String) -> impl IntoView {
+fn MemoryForm(
+    ws: Workspace,
+    range: (i64, i64),
+    auto: bool,
+    #[prop(optional)] dialog: bool,
+    #[prop(optional)] error: String,
+) -> impl IntoView {
     let name = ws.name.clone();
     let (lo, hi) = range;
     let now =
@@ -1369,14 +1415,26 @@ fn MemoryForm(ws: Workspace, range: (i64, i64), auto: bool, error: String) -> im
         }
         .into_any()
     };
+    let cancel = if dialog {
+        view! { <button type="button" class="btn q" on:click=move |ev| close_dialog(&ev)>"Cancel"</button> }.into_any()
+    } else {
+        view! { <a class="btn q" href=format!("/?w={name}")>"Cancel"</a> }.into_any()
+    };
     view! {
-        <h2>"Memory of " <span class="mono">{name.clone()}</span></h2>
+        <h2 id=format!("memory-{name}-h")>"Memory of " <span class="mono">{name.clone()}</span></h2>
         {(!error.is_empty()).then(|| view! { <div class="err"><b>{error.clone()}</b></div> })}
         <form class="form" method="post" action="/api/memory">
             <input type="hidden" name="ws" value=name.clone() />
             <label>
                 <span>"Memory, at most"</span>
-                {memory_input(lo, hi, auto, now, &format!("it boots with {} GiB and grows as it needs", gib(ws.boot_memory_bytes)))}
+                {memory_input(
+                    lo,
+                    hi,
+                    auto,
+                    now,
+                    &format!("it boots with {} GiB and grows as it needs", gib(ws.boot_memory_bytes)),
+                    format!("memory-sizes-{name}"),
+                )}
             </label>
             <p class="small">
                 {if stopped {
@@ -1385,10 +1443,7 @@ fn MemoryForm(ws: Workspace, range: (i64, i64), auto: bool, error: String) -> im
                     "The VM grows up to it once it restarts. Nothing on its disk changes."
                 }}
             </p>
-            <div class="acts">
-                <a class="btn q" href=format!("/?w={name}")>"Cancel"</a>
-                {save}
-            </div>
+            <div class="acts">{cancel} {save}</div>
         </form>
     }
 }
@@ -2394,6 +2449,7 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
                                 l.memory_auto(),
                                 memory,
                                 &format!("it boots with {} GiB", gib(l.boot_mem_mib << 20)),
+                                "memory-sizes".into(),
                             )}
                         </label>
                         <label>
