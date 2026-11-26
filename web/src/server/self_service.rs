@@ -110,6 +110,7 @@ impl AppState {
             max_memory: memory,
             disk_gib: disk,
             apps: form.apps.clone(),
+            node: String::new(),
         };
         if let Err(e) = r.check(&ss.limits) {
             return refused(&e);

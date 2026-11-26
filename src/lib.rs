@@ -9,6 +9,7 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
+pub mod fleet;
 pub mod launch;
 pub mod memoryd;
 pub mod self_service;

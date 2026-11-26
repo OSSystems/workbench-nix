@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use vmkit::hostutil::{self, Account};
 use workbench_model::apps::{AppInfo, BootApp};
+use workbench_model::fleet::Record;
 use workbench_model::memory::Ceiling;
 use workbench_model::self_service::{AppsRequest, Limits, MemoryRequest, Outcome, Request, quota_of};
 use workbench_model::{is_user_name, is_workspace_name};
@@ -219,16 +220,31 @@ impl Paths {
 
     /// One request at a time, so a quota holds and an address or a user id
     /// is never handed out while it is being taken away.
-    fn lock(&self) -> anyhow::Result<nix::fcntl::Flock<fs::File>> {
-        let path = self.0.join(".seeds").join(".lock");
-        fs::create_dir_all(path.parent().context("lock")?)?;
-        let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
-        Ok(nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).map_err(|(_, e)| e)?)
+    pub(crate) fn lock(&self) -> anyhow::Result<nix::fcntl::Flock<fs::File>> {
+        lock_file(&self.0.join(".seeds").join(".lock"))
+    }
+
+    /// A request to move a workspace to another node, and how it went.
+    #[must_use]
+    pub fn move_request(&self, name: &str) -> PathBuf {
+        self.dir().join("requests").join(format!("{name}.move.json"))
+    }
+
+    #[must_use]
+    pub fn move_outcome(&self, name: &str) -> PathBuf {
+        self.dir().join("results").join(format!("{name}.move.json"))
     }
 }
 
+/// Takes an exclusive lock on `path`, made if missing, until dropped.
+pub(crate) fn lock_file(path: &Path) -> anyhow::Result<nix::fcntl::Flock<fs::File>> {
+    fs::create_dir_all(path.parent().context("lock")?)?;
+    let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+    Ok(nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).map_err(|(_, e)| e)?)
+}
+
 /// Reads a file the web UI wrote, without following a link it put there.
-fn read_theirs(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_theirs(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt;
     let f = fs::OpenOptions::new().read(true).custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits()).open(path)?;
@@ -259,7 +275,7 @@ pub fn read_quotas(path: &Path) -> anyhow::Result<BTreeMap<String, u32>> {
 /// Every config file in `dirs`, each on its own: one a directory before
 /// shadows still holds its address and VM user. Then the files that don't
 /// load, whose address and user nobody can tell.
-fn every_config(dirs: &[PathBuf]) -> (Vec<Config>, Vec<String>) {
+pub(crate) fn every_config(dirs: &[PathBuf]) -> (Vec<Config>, Vec<String>) {
     let (mut ok, mut bad) = (Vec::new(), Vec::new());
     for dir in dirs {
         let dir = std::slice::from_ref(dir);
@@ -387,6 +403,7 @@ pub fn refreshed(t: &Template, c: &Config) -> anyhow::Result<Config> {
         max_memory: c.max_mem.map(|mib| mib / 1024),
         disk_gib: c.disk_gib,
         apps,
+        node: String::new(),
     };
     let mut t = t.clone();
     let offered = t.images.contains_key(&c.os);
@@ -406,6 +423,78 @@ pub fn refreshed(t: &Template, c: &Config) -> anyhow::Result<Config> {
     }
     fresh.validate()?;
     Ok(fresh)
+}
+
+/// The request a record stands for: the one that made it, or would have.
+#[must_use]
+pub fn request_of(r: &Record) -> Request {
+    Request {
+        name: r.name.clone(),
+        owner: r.owner.clone(),
+        os: r.os.clone(),
+        ssh_authorized_keys: r.ssh_authorized_keys.clone(),
+        max_memory: r.max_memory,
+        disk_gib: r.disk_gib,
+        apps: r.apps.clone(),
+        node: String::new(),
+    }
+}
+
+/// The record of a workspace a request makes on `node` at `ip`.
+#[must_use]
+pub fn record_of(req: &Request, node: &str, ip: &str) -> Record {
+    Record {
+        name: req.name.clone(),
+        owner: req.owner.clone(),
+        node: node.to_owned(),
+        ip: ip.to_owned(),
+        os: req.os.clone(),
+        ssh_authorized_keys: req.ssh_authorized_keys.clone(),
+        max_memory: req.max_memory,
+        disk_gib: req.disk_gib,
+        apps: req.apps.clone(),
+        ..Record::default()
+    }
+}
+
+/// The record of a config made at run time on a host on its own, which
+/// becomes `node` of a fleet.
+#[must_use]
+pub fn record_of_config(c: &Config, node: &str) -> Record {
+    Record {
+        name: c.name.clone(),
+        owner: c.owner.clone(),
+        node: node.to_owned(),
+        ip: c.ip.clone(),
+        os: c.os.clone(),
+        ssh_authorized_keys: c.ssh_authorized_keys.clone(),
+        max_memory: c.max_mem.map(|mib| mib / 1024),
+        disk_gib: c.disk_gib,
+        apps: c.apps.iter().map(|a| a.id.clone()).collect(),
+        ..Record::default()
+    }
+}
+
+/// The config a node's template makes of a record, with the node's own
+/// VM user `uid`: what [`config_of`] makes of the record's request.
+pub fn render(t: &Template, r: &Record, uid: u32) -> anyhow::Result<Config> {
+    config_of(t, &request_of(r), &r.ip, uid)
+}
+
+/// The config a node starts a workspace made at run time with: the
+/// record, on what the node kept of it, its VM user, its address and the
+/// image its disk came from, made again from the template as it is now.
+pub fn render_kept(t: &Template, r: &Record, kept: &Config) -> anyhow::Result<Config> {
+    ensure!(kept.self_service && kept.name == r.name, "{} wasn't made at run time on this node", r.name);
+    ensure!(kept.ip == r.ip, "{} is at {} on this node, and {} in the registry", r.name, kept.ip, r.ip);
+    let mut c = kept.clone();
+    c.owner.clone_from(&r.owner);
+    c.ssh_authorized_keys.clone_from(&r.ssh_authorized_keys);
+    c.max_mem = r.max_memory.map(|gib| gib * 1024);
+    c.disk_gib = r.disk_gib;
+    c.apps = r.apps.iter().filter_map(|id| t.apps.iter().find(|a| a.id == *id).cloned()).collect();
+    c.legacy_app_port = 0;
+    refreshed(t, &c)
 }
 
 /// The VM user's userdb record: a locked system user whose primary group
@@ -507,10 +596,15 @@ impl Owner {
 
 /// Asks the owner command about `owner`.
 async fn owner_status(t: &Template, owner: &str) -> Owner {
-    match ask(&t.owner_command, owner).await {
+    owner_said(&t.owner_command, owner).await
+}
+
+/// Asks an owner command about `owner`.
+pub(crate) async fn owner_said(cmd: &str, owner: &str) -> Owner {
+    match ask(cmd, owner).await {
         Ok((code, _)) => Owner::of(code),
         Err(e) => {
-            eprintln!("{}: {e:#}", t.owner_command);
+            eprintln!("{cmd}: {e:#}");
             Owner::Unknown
         }
     }
@@ -518,7 +612,7 @@ async fn owner_status(t: &Template, owner: &str) -> Owner {
 
 /// Runs one of the host's commands with `owner` as its argument: its exit
 /// code, none when a signal ended it, and what it printed.
-async fn ask(cmd: &str, owner: &str) -> anyhow::Result<(Option<i32>, String)> {
+pub(crate) async fn ask(cmd: &str, owner: &str) -> anyhow::Result<(Option<i32>, String)> {
     let run = Command::new(cmd).arg(owner).stdin(Stdio::null()).stderr(Stdio::inherit()).kill_on_drop(true).output();
     let out = tokio::time::timeout(COMMAND_TIMEOUT, run).await.with_context(|| format!("{cmd} took too long"))??;
     let stdout = String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(1 << 20)]).into_owned();
@@ -537,7 +631,7 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-fn refuse(msg: impl Into<String>) -> anyhow::Error {
+pub(crate) fn refuse(msg: impl Into<String>) -> anyhow::Error {
     Refused(msg.into()).into()
 }
 
@@ -585,7 +679,7 @@ fn write_pending(paths: &Paths, c: &Config) -> anyhow::Result<()> {
 /// Under the lock: finishes what a create or a destroy that died half way
 /// left. A pending workspace with a config is whole, and one without is
 /// cleaned up.
-async fn finish_pending(paths: &Paths) -> anyhow::Result<()> {
+pub(crate) async fn finish_pending(paths: &Paths) -> anyhow::Result<()> {
     let dir = paths.dir().join("pending");
     let Ok(entries) = fs::read_dir(&dir) else { return Ok(()) };
     let mut failed = Vec::new();
@@ -606,7 +700,7 @@ async fn finish_pending(paths: &Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn kvm_gid() -> anyhow::Result<u32> {
+pub(crate) fn kvm_gid() -> anyhow::Result<u32> {
     Ok(nix::unistd::Group::from_name("kvm")?.context("no group kvm")?.gid.as_raw())
 }
 
@@ -627,7 +721,38 @@ fn write_host_files(c: &Config, kvm: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_tool(tool: &str, args: &[&str]) -> anyhow::Result<()> {
+/// Whether a unit runs or is about to; an error counts as running, so
+/// nothing is deleted under a VM.
+pub(crate) async fn unit_running(unit: &str) -> bool {
+    #[cfg(test)]
+    if let Some(answer) = tools::stubbed("systemctl", &["is-active", unit]) {
+        return answer.is_ok();
+    }
+    hostutil::unit_running(unit).await.unwrap_or(true)
+}
+
+/// A stand-in for the host's tools, for this thread's test: what it is
+/// asked, and what it answers.
+#[cfg(test)]
+pub(crate) mod tools {
+    use std::cell::RefCell;
+
+    type Stub = Box<dyn Fn(&str, &[&str]) -> anyhow::Result<()>>;
+
+    thread_local! {
+        static STUB: RefCell<Option<Stub>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn stubbed(tool: &str, args: &[&str]) -> Option<anyhow::Result<()>> {
+        STUB.with(|s| s.borrow().as_ref().map(|f| f(tool, args)))
+    }
+}
+
+pub(crate) async fn run_tool(tool: &str, args: &[&str]) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if let Some(answer) = tools::stubbed(tool, args) {
+        return answer;
+    }
     let out = Command::new(tool).args(args).kill_on_drop(true).output().await.with_context(|| tool.to_owned())?;
     ensure!(out.status.success(), "{tool} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
@@ -701,25 +826,78 @@ async fn write_seed(t: &Template, user_data: &str, c: &Config, at: &Path) -> any
 pub async fn create(dirs: &[PathBuf], t: &Template, name: &str) -> anyhow::Result<()> {
     ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
     let paths = t.paths();
-    remove(&paths.outcome(name))?;
-    let result = make(dirs, t, &paths, name).await;
-    write_outcome(&paths, name, &outcome_of(&result, "The host couldn't make it"))?;
-    let _ = fs::remove_file(paths.request(name));
+    let failed = "The host couldn't make it";
+    reporting(&paths.outcome(name), Some(&paths.request(name)), failed, false, make(dirs, t, &paths, name)).await
+}
+
+/// Runs what a request asks for, and writes how it went for the web UI:
+/// always, or `only_errors`; then the request goes.
+pub(crate) async fn reporting(
+    outcome: &Path,
+    request: Option<&Path>,
+    failed: &str,
+    only_errors: bool,
+    work: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    remove(outcome)?;
+    let result = work.await;
+    if result.is_err() || !only_errors {
+        write_outcome_at(outcome, &outcome_of(&result, failed))?;
+    }
+    if let Some(r) = request {
+        let _ = fs::remove_file(r);
+    }
     result
 }
 
-fn write_outcome(paths: &Paths, name: &str, outcome: &Outcome) -> anyhow::Result<()> {
-    write_outcome_at(&paths.outcome(name), outcome)
+/// The request the web UI wrote to make `name`, for an owner it may be.
+pub(crate) fn read_request(paths: &Paths, name: &str) -> anyhow::Result<Request> {
+    let raw = read_theirs(&paths.request(name)).context("the request")?;
+    let r: Request = serde_json::from_slice(&raw).context("the request")?;
+    ensure!(r.name == name, "the request names {:?}", r.name);
+    ensure!(is_user_name(&r.owner) && r.owner != "root", "invalid owner {:?}", r.owner);
+    Ok(r)
 }
 
-fn write_outcome_at(out: &Path, outcome: &Outcome) -> anyhow::Result<()> {
+/// Refuses a name taken by a workspace, or by what one left.
+pub(crate) fn taken(name: &str) -> anyhow::Error {
+    refuse(format!("{name} is taken: pick another name."))
+}
+
+/// Refuses one more workspace past an owner's quota.
+pub(crate) fn check_quota(owned: u32, quota: u32) -> anyhow::Result<()> {
+    if owned >= quota {
+        return Err(refuse(format!("You have all the workspaces your quota allows ({quota}). Ask an admin for more.")));
+    }
+    Ok(())
+}
+
+/// What an owner's new workspace needs from the host's commands: that the
+/// owner command keeps them, if there is one, and the secret environment
+/// the environment command prints for them.
+pub(crate) async fn credential(owner_command: &str, environment_command: &str, owner: &str) -> anyhow::Result<String> {
+    if !owner_command.is_empty() {
+        match owner_said(owner_command, owner).await {
+            Owner::Stays => {}
+            Owner::Left => return Err(refuse("You may not make workspaces here. Ask an admin.")),
+            Owner::Unknown => return Err(refuse("The host couldn't check who you are just now. Try again later.")),
+        }
+    }
+    let (code, env) = ask(environment_command, owner).await?;
+    if code != Some(0) || check_environment(&env).is_err() {
+        return Err(refuse("Your workspace has no credential for its app yet. Ask an admin."));
+    }
+    Ok(env)
+}
+
+pub(crate) fn write_outcome_at(out: &Path, outcome: &Outcome) -> anyhow::Result<()> {
     fs::create_dir_all(out.parent().context("outcome")?)?;
     hostutil::atomic_write(out, &serde_json::to_vec(outcome)?, 0o644)?;
     Ok(())
 }
 
 /// What a request's result says, for the web UI.
-fn outcome_of(result: &anyhow::Result<()>, failed: &str) -> Outcome {
+pub(crate) fn outcome_of(result: &anyhow::Result<()>, failed: &str) -> Outcome {
     match result {
         Ok(()) => Outcome { ok: true, error: String::new() },
         Err(e) => Outcome {
@@ -735,11 +913,8 @@ fn outcome_of(result: &anyhow::Result<()>, failed: &str) -> Outcome {
 pub async fn apps(t: &Template, name: &str) -> anyhow::Result<()> {
     ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
     let paths = t.paths();
-    remove(&paths.apps_outcome(name))?;
-    let result = change_apps(t, &paths, name).await;
-    write_outcome_at(&paths.apps_outcome(name), &outcome_of(&result, "The host couldn't change them"))?;
-    let _ = fs::remove_file(paths.apps_request(name));
-    result
+    let (outcome, request) = (paths.apps_outcome(name), paths.apps_request(name));
+    reporting(&outcome, Some(&request), "The host couldn't change them", false, change_apps(t, &paths, name)).await
 }
 
 async fn change_apps(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
@@ -764,11 +939,8 @@ async fn change_apps(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<
 pub async fn memory(t: &Template, name: &str) -> anyhow::Result<()> {
     ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
     let paths = t.paths();
-    remove(&paths.memory_outcome(name))?;
-    let result = change_memory(t, &paths, name).await;
-    write_outcome_at(&paths.memory_outcome(name), &outcome_of(&result, "The host couldn't change it"))?;
-    let _ = fs::remove_file(paths.memory_request(name));
-    result
+    let (outcome, request) = (paths.memory_outcome(name), paths.memory_request(name));
+    reporting(&outcome, Some(&request), "The host couldn't change it", false, change_memory(t, &paths, name)).await
 }
 
 async fn change_memory(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
@@ -784,7 +956,7 @@ async fn change_memory(t: &Template, paths: &Paths, name: &str) -> anyhow::Resul
 
 /// A workspace's config growing to `max` GiB at most, or `auto`, within
 /// the template's limits. It boots with no more than that.
-fn with_memory(t: &Template, c: &Config, max: Ceiling) -> anyhow::Result<Config> {
+pub(crate) fn with_memory(t: &Template, c: &Config, max: Ceiling) -> anyhow::Result<Config> {
     t.limits.check_memory(max).map_err(refuse)?;
     let mut next = c.clone();
     next.max_mem = max.map(|gib| gib * 1024);
@@ -794,7 +966,7 @@ fn with_memory(t: &Template, c: &Config, max: Ceiling) -> anyhow::Result<Config>
 }
 
 /// Writes a workspace's config where the host reads it after the Nix ones.
-fn write_config(paths: &Paths, c: &Config) -> anyhow::Result<()> {
+pub(crate) fn write_config(paths: &Paths, c: &Config) -> anyhow::Result<()> {
     fs::create_dir_all(paths.configs())?;
     let file = paths.configs().join(format!("{}.json", c.name));
     hostutil::atomic_write(&file, &serde_json::to_vec_pretty(c)?, 0o644)?;
@@ -802,10 +974,7 @@ fn write_config(paths: &Paths, c: &Config) -> anyhow::Result<()> {
 }
 
 async fn make(dirs: &[PathBuf], t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
-    let raw = read_theirs(&paths.request(name)).context("the request")?;
-    let r: Request = serde_json::from_slice(&raw).context("the request")?;
-    ensure!(r.name == name, "the request names {:?}", r.name);
-    ensure!(is_user_name(&r.owner) && r.owner != "root", "invalid owner {:?}", r.owner);
+    let r = read_request(paths, name)?;
     r.check(&t.limits).map_err(refuse)?;
 
     let lock = paths.lock()?;
@@ -818,38 +987,49 @@ async fn make(dirs: &[PathBuf], t: &Template, paths: &Paths, name: &str) -> anyh
     // reach the new one's guest.
     let leftover = [Path::new(&t.state_dir).join(name), Path::new(&t.secrets_root).join(name), paths.seed(name)];
     if all.iter().any(|c| c.name == name) || leftover.iter().any(|p| p.exists()) {
-        return Err(refuse(format!("{name} is taken: pick another name.")));
+        return Err(taken(name));
     }
     let quota = quota_of(&read_quotas(&paths.quotas())?, t.limits.quota, &r.owner);
     let made: Vec<Config> = all.iter().filter(|c| c.self_service).cloned().collect();
-    if owned(&made, &r.owner) >= quota {
-        return Err(refuse(format!("You have all the workspaces your quota allows ({quota}). Ask an admin for more.")));
-    }
-    if !t.owner_command.is_empty() {
-        match owner_status(t, &r.owner).await {
-            Owner::Stays => {}
-            Owner::Left => return Err(refuse("You may not make workspaces here. Ask an admin.")),
-            Owner::Unknown => return Err(refuse("The host couldn't check who you are just now. Try again later.")),
-        }
-    }
-    let (code, env) = ask(&t.environment_command, &r.owner).await?;
-    if code != Some(0) || check_environment(&env).is_err() {
-        return Err(refuse("Your workspace has no credential for its app yet. Ask an admin."));
-    }
+    check_quota(owned(&made, &r.owner), quota)?;
+    let env = credential(&t.owner_command, &t.environment_command, &r.owner).await?;
 
     let ip = free_ip(&t.subnet, &all.iter().map(|c| c.ip.clone()).collect())?;
     let uids: BTreeSet<u32> = all.iter().map(|c| c.uid).collect();
     let uid = free_uid(&uids, |u| nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(u)).ok().flatten().is_some())?;
     let c = config_of(t, &r, &ip, uid)?;
+    build(t, paths, &c, Build { disk: true, stopped: false, secret_environment: Some(&env) }).await?;
+    drop(lock);
+    run_tool("systemctl", &["--no-block", "start", &state::unit_name(name)]).await
+}
 
+/// How [`build`] makes a workspace.
+pub(crate) struct Build<'a> {
+    /// Its disk, from the image; otherwise only its state directory, for a
+    /// disk that comes later.
+    pub disk: bool,
+    /// Kept stopped by its stop marker, until something starts it.
+    pub stopped: bool,
+    /// Its secrets directory with this environment, on a host that keeps
+    /// it.
+    pub secret_environment: Option<&'a str>,
+}
+
+/// Under the lock: makes on the host what a config of a workspace made at
+/// run time names, then the config. If it fails half way, its pending
+/// record has what it made cleaned up.
+pub(crate) async fn build(t: &Template, paths: &Paths, c: &Config, how: Build<'_>) -> anyhow::Result<()> {
     // Markers an earlier workspace of the name left would keep this one
     // stopped.
     let root = Path::new(&t.state_dir);
-    remove(&state::stop_marker(root, name))?;
-    remove(&left_marker(root, name))?;
-    write_pending(paths, &c)?;
+    remove(&state::stop_marker(root, &c.name))?;
+    remove(&left_marker(root, &c.name))?;
+    write_pending(paths, c)?;
     let made = async {
-        write_host_files(&c, kvm_gid()?)?;
+        if how.stopped {
+            state::mark_stopped(root, &c.name)?;
+        }
+        write_host_files(c, kvm_gid()?)?;
         run_tool("networkctl", &["reload"]).await?;
         if !c.seed.is_empty() {
             let at = PathBuf::from(&c.seed);
@@ -857,15 +1037,22 @@ async fn make(dirs: &[PathBuf], t: &Template, paths: &Paths, name: &str) -> anyh
             let dir = at.parent().context("seed")?;
             fs::create_dir_all(dir)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(0o711))?;
-            write_seed(t, &t.images[&c.os].user_data, &c, &at).await?;
+            let image = t.images.get(&c.os).with_context(|| format!("no image for {:?}", c.os))?;
+            write_seed(t, &image.user_data, c, &at).await?;
         }
-        let secrets = PathBuf::from(&c.secrets_dir);
-        fs::create_dir_all(&secrets)?;
-        fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))?;
-        hostutil::atomic_write(secrets.join("environment"), env.as_bytes(), 0o600)?;
+        if let Some(env) = how.secret_environment {
+            let secrets = PathBuf::from(&c.secrets_dir);
+            fs::create_dir_all(&secrets)?;
+            fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))?;
+            hostutil::atomic_write(secrets.join("environment"), env.as_bytes(), 0o600)?;
+        }
         let vm_user = wait_for_user(&c.user).await?;
-        launch::prepare_state(&c, &vm_user)?;
-        write_config(paths, &c)?;
+        if how.disk {
+            launch::prepare_state(c, &vm_user)?;
+        } else {
+            launch::prepare_state_dir(c, &vm_user)?;
+        }
+        write_config(paths, c)?;
         anyhow::Ok(())
     }
     .await;
@@ -873,17 +1060,16 @@ async fn make(dirs: &[PathBuf], t: &Template, paths: &Paths, name: &str) -> anyh
         // Without a config, the pending record has it cleaned up; if that
         // fails too, the next request under the lock tries again.
         if let Err(again) = finish_pending(paths).await {
-            eprintln!("{name}: cleaning up after a failed create: {again:#}");
+            eprintln!("{}: cleaning up after a failed create: {again:#}", c.name);
         }
         return Err(e);
     }
-    remove(&paths.pending(name))?;
-    drop(lock);
-    run_tool("systemctl", &["--no-block", "start", &state::unit_name(name)]).await
+    remove(&paths.pending(&c.name))?;
+    Ok(())
 }
 
 /// The VM user, once the user database has its record.
-async fn wait_for_user(user: &str) -> anyhow::Result<Account> {
+pub(crate) async fn wait_for_user(user: &str) -> anyhow::Result<Account> {
     for _ in 0..50 {
         if let Ok(a) = hostutil::lookup_account(user) {
             return Ok(a);
@@ -899,15 +1085,10 @@ async fn wait_for_user(user: &str) -> anyhow::Result<Account> {
 pub async fn destroy(t: &Template, name: &str) -> anyhow::Result<()> {
     ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
     let paths = t.paths();
-    remove(&paths.outcome(name))?;
-    let result = take_away(&paths, name).await;
-    if result.is_err() {
-        write_outcome(&paths, name, &outcome_of(&result, "The host couldn't destroy it"))?;
-    }
-    result
+    reporting(&paths.outcome(name), None, "The host couldn't destroy it", true, take_away(&paths, name)).await
 }
 
-async fn take_away(paths: &Paths, name: &str) -> anyhow::Result<()> {
+pub(crate) async fn take_away(paths: &Paths, name: &str) -> anyhow::Result<()> {
     let _lock = paths.lock()?;
     finish_pending(paths).await?;
     let Some(c) = config::load(&[paths.configs()], name).ok().filter(|c| c.self_service) else {
@@ -915,7 +1096,7 @@ async fn take_away(paths: &Paths, name: &str) -> anyhow::Result<()> {
     };
     let unit = state::unit_name(name);
     run_tool("systemctl", &["stop", &unit]).await?;
-    ensure!(!hostutil::unit_running(&unit).await.unwrap_or(true), "{unit} is still running; nothing deleted");
+    ensure!(!unit_running(&unit).await, "{unit} is still running; nothing deleted");
     // The config first, so nothing starts the VM again; the pending record
     // has whatever is left cleaned up if this dies half way.
     write_pending(paths, &c)?;
@@ -924,7 +1105,7 @@ async fn take_away(paths: &Paths, name: &str) -> anyhow::Result<()> {
     finish_pending(paths).await
 }
 
-fn remove(p: &Path) -> io::Result<()> {
+pub(crate) fn remove(p: &Path) -> io::Result<()> {
     let r = if p.is_dir() && !p.is_symlink() { fs::remove_dir_all(p) } else { fs::remove_file(p) };
     match r {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -1039,7 +1220,7 @@ async fn settle(root: &Path, c: &Config, owner: Owner) -> anyhow::Result<()> {
                 fs::write(&marker, "")?;
                 eprintln!("{}: {} left; stopping it, disk kept", c.name, c.owner);
             }
-            if hostutil::unit_running(&unit).await.unwrap_or(true) {
+            if unit_running(&unit).await {
                 run_tool("systemctl", &["--no-block", "stop", &unit]).await?;
             }
         }
@@ -1127,6 +1308,7 @@ pub(crate) mod tests {
             max_memory: Ceiling::Size(8),
             disk_gib: 64,
             apps: vec!["t3code".into()],
+            node: String::new(),
         }
     }
 
@@ -1238,6 +1420,51 @@ pub(crate) mod tests {
         let mut gone = template();
         gone.apps.clear();
         assert!(refreshed(&gone, &c).unwrap().apps.is_empty(), "an app no longer offered goes");
+    }
+
+    fn script(dir: &Path, name: &str, out: &str, code: i32) -> String {
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\necho '{out}'\nexit {code}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    /// A host on its own and a front ask the host's commands the same:
+    /// whether the owner stays, then their workspace's credential.
+    #[tokio::test]
+    async fn a_credential_from_the_host_s_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = script(dir.path(), "env", "API_KEY=sk-1", 0);
+        let refusal = |e: anyhow::Error| e.downcast_ref::<Refused>().map(|r| r.0.clone()).unwrap_or_default();
+        assert_eq!(credential("", &env, "alice").await.unwrap().trim(), "API_KEY=sk-1");
+        for (owner, credential_command, why) in [
+            (script(dir.path(), "left", "", 1), env.clone(), "may not make"),
+            (script(dir.path(), "down", "", 2), env.clone(), "couldn't check"),
+            (String::new(), script(dir.path(), "none", "", 0), "no credential"),
+            (String::new(), script(dir.path(), "fails", "API_KEY=x", 3), "no credential"),
+        ] {
+            let e = credential(&owner, &credential_command, "alice").await.unwrap_err();
+            assert!(refusal(e).contains(why), "{why}");
+        }
+        assert!(check_quota(1, 1).is_err() && check_quota(0, 1).is_ok());
+    }
+
+    /// A node renders a record into the config a host on its own makes of
+    /// the same request, and back.
+    #[test]
+    fn a_record_renders_as_today() {
+        let t = template();
+        let mut hosts = t.clone();
+        hosts.limits.max_memory = Ceiling::Auto;
+        let auto = Request { max_memory: Ceiling::Auto, ..request("ubuntu") };
+        for (t, req) in [(&t, request("ubuntu")), (&t, request("nixos")), (&hosts, auto)] {
+            let record = record_of(&req, "a", "10.232.0.130");
+            let today = config_of(t, &req, "10.232.0.130", 60_600).unwrap();
+            assert_eq!(render(t, &record, 60_600).unwrap(), today, "{}", req.os);
+            assert_eq!(request_of(&record), req);
+            assert_eq!(record_of_config(&today, "a"), record);
+            assert_eq!(render_kept(t, &record, &today).unwrap(), today, "a start changes nothing");
+        }
     }
 
     #[test]

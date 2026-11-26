@@ -36,6 +36,25 @@ const MAX_ENV_FILE: u64 = 1 << 20;
 /// cloud-hypervisor, and only returns on failure.
 pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
+    boot(&c, None)
+}
+
+/// What a start is given rather than read on the host: on a node, what
+/// the front answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Given {
+    pub secrets: Secrets,
+    /// The guest's SSH host key, and the user CA it trusts; none from a
+    /// front without the CAs.
+    pub host_key: Option<HostKey>,
+    pub user_ca: Option<Vec<u8>>,
+}
+
+/// Prepares the disk and the shares of a workspace, starts virtiofsd and
+/// becomes cloud-hypervisor. The secrets and the SSH keys are the host's,
+/// or those `given`.
+pub fn boot(c: &Config, given: Option<&Given>) -> anyhow::Result<()> {
+    let c = c.clone();
     let vm_user = hostutil::lookup_account(&c.user).context("VM user")?;
     virtiofs::require_private_mounts()?;
     wait_for_tap(&c.tap)?;
@@ -62,11 +81,26 @@ pub fn run(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let [store, config_share, secrets] = c.shares();
     virtiofs::store_view(&c.closure, &store.dir).context("sharing the closure")?;
     write_config_share(&c, &config_share.dir).context("writing the config share")?;
-    write_secrets_share(&c, &secrets.dir).context("writing the secrets share")?;
-    // Without them people reach the guest the way they did before: the VM
-    // starts all the same.
-    if let Err(e) = write_ssh_keys(&c, &config_share.dir, &secrets.dir) {
-        eprintln!("the guest's SSH host key and user CA: {e:#}");
+    match given {
+        // Until the modules render a fleet: a host on its own reads its
+        // own secrets and signs its own host keys.
+        None => {
+            write_secrets_share(&c, &secrets.dir).context("writing the secrets share")?;
+            // Without them people reach the guest the way they did before:
+            // the VM starts all the same.
+            if let Err(e) = write_ssh_keys(&c, &config_share.dir, &secrets.dir) {
+                eprintln!("the guest's SSH host key and user CA: {e:#}");
+            }
+        }
+        Some(g) => {
+            write_secrets(&secrets.dir, &g.secrets).context("writing the secrets share")?;
+            if let Some(ca) = &g.user_ca {
+                write_user_ca(&config_share.dir, &c.owner, ca).context("sharing the user CA")?;
+            }
+            if let Some(key) = &g.host_key {
+                write_host_key(&secrets.dir, key).context("sharing the SSH host key")?;
+            }
+        }
     }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
     for share in c.shares() {
@@ -113,8 +147,13 @@ fn wait_for_tap(tap: &str) -> anyhow::Result<()> {
 /// Makes the state directory and the disk, as the VM user's. Others may
 /// stat the disk, for its size, but not list or read it.
 pub(crate) fn prepare_state(c: &Config, vm_user: &Account) -> anyhow::Result<()> {
-    ensure_dir(Path::new(&c.state_dir), 0o711, vm_user)?;
+    prepare_state_dir(c, vm_user)?;
     prepare_disk(c, vm_user).context("preparing disk")
+}
+
+/// Makes the state directory alone, for a disk that comes from elsewhere.
+pub(crate) fn prepare_state_dir(c: &Config, vm_user: &Account) -> anyhow::Result<()> {
+    ensure_dir(Path::new(&c.state_dir), 0o711, vm_user)
 }
 
 /// Makes a directory with `mode`, owned by `owner`.
@@ -298,28 +337,70 @@ pub(crate) fn environment_file(env: &BTreeMap<String, String>) -> String {
 /// appends the environment files to its environment file, which the
 /// guest's app service reads. Nothing of it is in the store.
 pub(crate) fn write_secrets_share(c: &Config, dir: &Path) -> anyhow::Result<()> {
-    make_dir(dir, 0o755)?;
-    let src = Path::new(&c.secrets_dir);
+    let secrets = collect_secrets(Path::new(&c.secrets_dir), &c.environment_files)?;
+    write_secrets(dir, &secrets)
+}
+
+/// What a secrets share holds: a copy of the secrets directory, but its
+/// own `environment` and `ssh-host`, and the secret environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Secrets {
+    /// Its directories, relative to it, each after its parent. Names are
+    /// the file system's, UTF-8 or not.
+    pub dirs: Vec<PathBuf>,
+    /// Its files, relative to it, and what each holds.
+    pub files: Vec<(PathBuf, Vec<u8>)>,
+    /// The secrets directory's environment file followed by every
+    /// environment file, each starting on a line of its own; empty for
+    /// none.
+    pub environment: Vec<u8>,
+}
+
+/// Reads a secrets directory, which may be missing, and the environment
+/// files, which may not.
+pub fn collect_secrets(src: &Path, environment_files: &[String]) -> anyhow::Result<Secrets> {
+    let mut out = Secrets::default();
     let mut total = 0;
     if src.exists() {
-        copy_secrets(src, dir, true, &mut total)?;
+        collect_dir(src, Path::new(""), &mut out, &mut total)?;
     }
-    // The environment is the secrets directory's environment file followed
-    // by every environment file, each starting on a line of its own.
-    let mut env = match hostutil::read_bounded(src.join("environment"), MAX_ENV_FILE) {
+    out.environment = match hostutil::read_bounded(src.join("environment"), MAX_ENV_FILE) {
         Ok(raw) => raw,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e).context("secrets environment"),
     };
-    for path in &c.environment_files {
+    for path in environment_files {
         let raw = hostutil::read_bounded(path, MAX_ENV_FILE).with_context(|| path.clone())?;
-        env.push(b'\n');
-        env.extend(raw);
+        out.environment.push(b'\n');
+        out.environment.extend(raw);
     }
-    if !env.is_empty() {
-        write_read_only(&dir.join("environment"), &env)?;
+    Ok(out)
+}
+
+/// Writes a secrets share: directories anyone may list, files anyone in
+/// the guest may read and no one write.
+pub fn write_secrets(dir: &Path, secrets: &Secrets) -> anyhow::Result<()> {
+    make_dir(dir, 0o755)?;
+    for d in &secrets.dirs {
+        ensure!(is_relative_path(d), "a secret directory {} outside the share", d.display());
+        let to = dir.join(d);
+        fs::create_dir(&to).with_context(|| to.display().to_string())?;
+        fs::set_permissions(&to, fs::Permissions::from_mode(0o755))?;
+    }
+    for (name, data) in &secrets.files {
+        ensure!(is_relative_path(name), "a secret file {} outside the share", name.display());
+        write_read_only(&dir.join(name), data).with_context(|| name.display().to_string())?;
+    }
+    if !secrets.environment.is_empty() {
+        write_read_only(&dir.join("environment"), &secrets.environment)?;
     }
     Ok(())
+}
+
+/// A relative path of named components, which stays below the directory
+/// it is joined to.
+fn is_relative_path(p: &Path) -> bool {
+    p.components().next().is_some() && p.components().all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// The guest's SSH host key and its certificate, in the secrets share.
@@ -338,61 +419,98 @@ const HOST_CERT_VALIDITY: &str = "-5m:+520w";
 /// `ssh/principals/<owner>`: a certificate signs in as the owner, never
 /// as another account. Nothing for a config from before the CAs.
 pub(crate) fn write_ssh_keys(c: &Config, config_dir: &Path, secrets_dir: &Path) -> anyhow::Result<()> {
-    let Some(keys) = c.host_key_dir() else { return Ok(()) };
+    if c.ssh.is_empty() {
+        return Ok(());
+    }
     let user_ca = hostutil::read_bounded(&c.ssh.user_ca, MAX_ENV_FILE).with_context(|| c.ssh.user_ca.clone())?;
-    make_dir(&config_dir.join("ssh"), 0o755)?;
-    write_read_only(&config_dir.join("ssh/user-ca.pub"), &user_ca)?;
-    make_dir(&config_dir.join("ssh/principals"), 0o755)?;
-    write_read_only(&config_dir.join("ssh/principals").join(&c.owner), format!("{}\n", c.owner).as_bytes())?;
+    write_user_ca(config_dir, &c.owner, &user_ca)?;
+    let key = sign_host_key(&c.ssh, &c.name, c.host_name())?;
+    write_host_key(secrets_dir, &key)
+}
+
+/// A guest's SSH host key, its public key and a certificate for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostKey {
+    pub private: Vec<u8>,
+    pub public: Vec<u8>,
+    pub certificate: Vec<u8>,
+}
+
+/// The host key of workspace `name`, made the first time and kept in the
+/// CAs' `hostKeys`, with a certificate for `host_name` the host CA signs
+/// now.
+pub fn sign_host_key(ssh: &config::SshCa, name: &str, host_name: &str) -> anyhow::Result<HostKey> {
+    ensure!(!ssh.is_empty(), "no SSH certificate authorities");
+    let keys = Path::new(&ssh.host_keys).join(name);
     make_dir(&keys, 0o700)?;
     let key = keys.join(SSH_HOST_KEY);
     let keygen = |args: &[&str]| -> anyhow::Result<()> {
-        let out = Command::new(&c.ssh.keygen).args(args).stdin(Stdio::null()).output().context("ssh-keygen")?;
+        let out = Command::new(&ssh.keygen).args(args).stdin(Stdio::null()).output().context("ssh-keygen")?;
         ensure!(out.status.success(), "ssh-keygen: {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
         Ok(())
     };
     let key_arg = key.to_string_lossy().into_owned();
     if !key.exists() {
-        keygen(&["-q", "-t", "ed25519", "-N", "", "-C", c.host_name(), "-f", &key_arg])?;
+        keygen(&["-q", "-t", "ed25519", "-N", "", "-C", host_name, "-f", &key_arg])?;
     }
     let (public, cert) = (keys.join(format!("{SSH_HOST_KEY}.pub")), keys.join(format!("{SSH_HOST_KEY}-cert.pub")));
     let _ = fs::remove_file(&cert);
-    let id = format!("{} host", c.name);
+    let id = format!("{name} host");
     let public_arg = public.to_string_lossy().into_owned();
-    keygen(&["-q", "-s", &c.ssh.host_ca, "-I", &id, "-h", "-n", c.host_name(), "-V", HOST_CERT_VALIDITY, &public_arg])?;
-    let share = secrets_dir.join(SSH_HOST_DIR);
-    make_dir(&share, 0o755)?;
-    let private = hostutil::read_bounded(&key, MAX_ENV_FILE)?;
-    // Root's in the guest: sshd refuses a host key others may read.
-    fs::write(share.join(SSH_HOST_KEY), &private)?;
-    fs::set_permissions(share.join(SSH_HOST_KEY), fs::Permissions::from_mode(0o400))?;
-    for (from, name) in [(&public, format!("{SSH_HOST_KEY}.pub")), (&cert, format!("{SSH_HOST_KEY}-cert.pub"))] {
-        write_read_only(&share.join(name), &hostutil::read_bounded(from, MAX_ENV_FILE)?)?;
-    }
+    keygen(&["-q", "-s", &ssh.host_ca, "-I", &id, "-h", "-n", host_name, "-V", HOST_CERT_VALIDITY, &public_arg])?;
+    Ok(HostKey {
+        private: hostutil::read_bounded(&key, MAX_ENV_FILE)?,
+        public: hostutil::read_bounded(&public, MAX_ENV_FILE)?,
+        certificate: hostutil::read_bounded(&cert, MAX_ENV_FILE)?,
+    })
+}
+
+/// The user CA's public key, which the guest's sshd trusts, and the one
+/// principal it takes for the owner, their name, in the config share.
+pub fn write_user_ca(config_dir: &Path, owner: &str, user_ca: &[u8]) -> anyhow::Result<()> {
+    make_dir(&config_dir.join("ssh"), 0o755)?;
+    write_read_only(&config_dir.join("ssh/user-ca.pub"), user_ca)?;
+    make_dir(&config_dir.join("ssh/principals"), 0o755)?;
+    write_read_only(&config_dir.join("ssh/principals").join(owner), format!("{owner}\n").as_bytes())?;
     Ok(())
 }
 
-fn copy_secrets(src: &Path, dst: &Path, top: bool, total: &mut u64) -> anyhow::Result<()> {
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
+/// The guest's host key, its public key and its certificate, in the
+/// secrets share's `ssh-host/`.
+pub fn write_host_key(secrets_dir: &Path, key: &HostKey) -> anyhow::Result<()> {
+    let share = secrets_dir.join(SSH_HOST_DIR);
+    make_dir(&share, 0o755)?;
+    // Root's in the guest: sshd refuses a host key others may read.
+    fs::write(share.join(SSH_HOST_KEY), &key.private)?;
+    fs::set_permissions(share.join(SSH_HOST_KEY), fs::Permissions::from_mode(0o400))?;
+    write_read_only(&share.join(format!("{SSH_HOST_KEY}.pub")), &key.public)?;
+    write_read_only(&share.join(format!("{SSH_HOST_KEY}-cert.pub")), &key.certificate)?;
+    Ok(())
+}
+
+/// Reads one directory of a secrets directory, `rel` below it.
+fn collect_dir(src: &Path, rel: &Path, out: &mut Secrets, total: &mut u64) -> anyhow::Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(src)?.collect::<io::Result<_>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
         let name = entry.file_name();
         // The host writes these itself.
-        if top && (name == "environment" || name == SSH_HOST_DIR) {
+        if rel.as_os_str().is_empty() && (name == "environment" || name == SSH_HOST_DIR) {
             continue;
         }
-        let (from, to) = (entry.path(), dst.join(&name));
+        let from = entry.path();
+        let path = rel.join(&name);
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            fs::create_dir(&to)?;
-            fs::set_permissions(&to, fs::Permissions::from_mode(0o755))?;
-            copy_secrets(&from, &to, false, total)?;
+            out.dirs.push(path.clone());
+            collect_dir(&from, &path, out, total)?;
         } else if kind.is_file() {
             let raw = hostutil::read_bounded(&from, MAX_SECRET).with_context(|| from.display().to_string())?;
             *total += raw.len() as u64;
             if *total > MAX_SECRETS {
                 bail!("secrets directory larger than 64 MiB");
             }
-            write_read_only(&to, &raw)?;
+            out.files.push((path, raw));
         }
     }
     Ok(())
@@ -629,6 +747,25 @@ mod tests {
         write_secrets_share(&c, &tmp.path().join("empty")).expect("a missing secrets directory leaves an empty share");
         c.environment_files = vec![tmp.path().join("nope.env").to_string_lossy().into()];
         assert!(write_secrets_share(&c, &tmp.path().join("broken")).is_err(), "a missing environment file was ignored");
+    }
+
+    /// A host on its own copies a secret whatever its name, UTF-8 or not.
+    #[test]
+    fn secrets_of_any_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = test_config();
+        let secrets = tmp.path().join("secrets");
+        let odd = std::ffi::OsStr::from_bytes(b"caf\xe9.key");
+        fs::create_dir_all(secrets.join(odd)).unwrap();
+        fs::write(secrets.join(odd).join(odd), "k").unwrap();
+        c.secrets_dir = secrets.to_string_lossy().into();
+        c.environment_files = vec![];
+        let share = tmp.path().join("share");
+        write_secrets_share(&c, &share).unwrap();
+        assert_eq!(fs::read(share.join(odd).join(odd)).unwrap(), b"k");
+        let outside = Secrets { files: vec![("../x".into(), vec![])], ..Secrets::default() };
+        assert!(write_secrets(&tmp.path().join("other"), &outside).is_err(), "a secret outside the share");
     }
 
     /// The guest gets a host key of its own, the same at every start, and a

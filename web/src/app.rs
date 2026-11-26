@@ -679,6 +679,7 @@ fn Primary(ws: Workspace) -> impl IntoView {
             view! { <ControlForm ws=ws.name.clone() verb=Verb::Start>"Start"</ControlForm> }.into_any()
         }
         (State::Stopping | State::Restarting, _) => view! { <span class="wait">"up to 2 min"</span> }.into_any(),
+        (State::Moving | State::Unreachable, _) => view! { <span class="wait">"waiting for its node"</span> }.into_any(),
     }
 }
 

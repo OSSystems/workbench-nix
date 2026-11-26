@@ -25,6 +25,7 @@ similar_names = "allow"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.22.1"
 clap = { version = "4.6.8", features = ["derive"] }
 jiff = { version = "1.0.1", features = ["serde"] }
 nix = { version = "0.32.0", features = ["fs", "term", "user"] }

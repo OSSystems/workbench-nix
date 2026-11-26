@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod apps;
 pub mod connect;
+pub mod fleet;
 pub mod memory;
 pub mod self_service;
 
@@ -55,6 +56,10 @@ pub enum State {
     /// Never derived from systemd: stopping or starting after a restart
     /// someone asked for.
     Restarting,
+    /// Never derived from systemd: on its way from one node to another.
+    Moving,
+    /// Never derived from systemd: its node doesn't answer.
+    Unreachable,
 }
 
 impl State {
@@ -68,6 +73,8 @@ impl State {
             State::Stopped => "Stopped",
             State::Failing => "Failing",
             State::Restarting => "Restarting",
+            State::Moving => "Moving",
+            State::Unreachable => "Unreachable",
         }
     }
 
@@ -76,17 +83,17 @@ impl State {
     pub fn dot(self) -> &'static str {
         match self {
             State::Running => "on",
-            State::Starting | State::Stopping | State::Restarting => "go",
-            State::Failing => "bad",
+            State::Starting | State::Stopping | State::Restarting | State::Moving => "go",
+            State::Failing | State::Unreachable => "bad",
             State::Stopped => "off",
         }
     }
 
-    /// Whether the workspace is on its way to another state, so no action
-    /// may start.
+    /// Whether the workspace is on its way to another state, or out of
+    /// reach, so no action may start.
     #[must_use]
     pub fn changing(self) -> bool {
-        matches!(self, State::Stopping | State::Restarting)
+        matches!(self, State::Stopping | State::Restarting | State::Moving | State::Unreachable)
     }
 }
 
@@ -154,6 +161,9 @@ pub struct Workspace {
     /// stopped, and its disk kept for an admin.
     #[serde(default, skip_serializing_if = "is_false")]
     pub owner_left: bool,
+    /// The node its disk is on, on a front with nodes: for admins.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node: String,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -280,8 +290,8 @@ impl Workspace {
             Some(_) => {}
         }
         match self.state {
-            State::Stopped | State::Stopping => Some(OpenBlocker::Stopped),
-            State::Starting | State::Restarting | State::Failing => Some(OpenBlocker::Starting),
+            State::Stopped | State::Stopping | State::Moving => Some(OpenBlocker::Stopped),
+            State::Starting | State::Restarting | State::Failing | State::Unreachable => Some(OpenBlocker::Starting),
             State::Running if !self.stage(app).runs() => Some(OpenBlocker::Coming),
             State::Running => None,
         }

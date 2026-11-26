@@ -62,6 +62,7 @@ pub struct Boot {
 
 /// One app a VM boots.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootApp {
     pub id: String,
     pub name: String,

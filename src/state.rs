@@ -240,6 +240,23 @@ pub fn stop_marker(state_root: &Path, name: &str) -> PathBuf {
     state_root.join(".stopped").join(name)
 }
 
+/// Leaves the stop marker that keeps a workspace stopped.
+pub fn mark_stopped(state_root: &Path, name: &str) -> anyhow::Result<()> {
+    let marker = stop_marker(state_root, name);
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // The directory is the web UI's: root never follows a link there.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(&marker)
+        .with_context(|| marker.display().to_string())?;
+    Ok(())
+}
+
 /// Starts, stops or restarts a workspace's unit. Stop leaves the marker
 /// that keeps it stopped; start and restart remove it. Unless `wait`, it
 /// returns once systemd has the job.
@@ -253,19 +270,7 @@ pub async fn control(state_root: &Path, verb: Verb, name: &str, wait: bool) -> a
             }
             _ => {}
         },
-        Verb::Stop => {
-            if let Some(dir) = marker.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            // The directory is the web UI's: root never follows a link there.
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-                .open(&marker)
-                .with_context(|| marker.display().to_string())?;
-        }
+        Verb::Stop => mark_stopped(state_root, name)?,
     }
     let unit = unit_name(name);
     let mut cmd = Command::new("systemctl");

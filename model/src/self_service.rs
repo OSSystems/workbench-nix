@@ -29,6 +29,16 @@ const SSH_KEY_TYPES: [&str; 7] = [
     "sk-ecdsa-sha2-nistp256@openssh.com",
 ];
 
+/// Names the host keeps for its own directories in its state directory,
+/// where a workspace's would be: `<stateDir>/<name>`.
+pub const RESERVED: [&str; 5] = ["closed", "configs", "registry", "self-service", "ssh"];
+
+/// Whether a workspace may not have `name`, which the host keeps.
+#[must_use]
+pub fn is_reserved(name: &str) -> bool {
+    RESERVED.contains(&name)
+}
+
 /// A uid as the start of workspace names: `.` and `_` become `-`, so
 /// `samuel.silva` owns `samuel-silva` and `samuel-silva-<suffix>`.
 #[must_use]
@@ -50,6 +60,9 @@ pub fn check_name(owner: &str, name: &str) -> Result<(), String> {
             "The name must be lowercase letters, digits and dashes, at most 28 characters, starting with a letter."
                 .into(),
         );
+    }
+    if is_reserved(name) {
+        return Err(format!("{name} is a name the host keeps for itself: pick another."));
     }
     Ok(())
 }
@@ -90,7 +103,7 @@ pub fn parse_ssh_keys(text: &str) -> Result<Vec<String>, String> {
 
 /// What the host lets people make, from the Nix configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
     /// The guest systems offered.
     pub os: Vec<String>,
@@ -182,6 +195,10 @@ pub struct Request {
     /// The apps it has, by id.
     #[serde(default)]
     pub apps: Vec<String>,
+    /// The node an admin picked for it, on a front with nodes; empty for
+    /// the one with the most free memory.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node: String,
 }
 
 impl Request {
@@ -271,6 +288,11 @@ mod tests {
         assert!(check_name("ana_paula", "ana-paula").is_ok(), "an underscore becomes a dash too");
         assert!(check_name("ana_paula", "ana_paula").is_err(), "still a DNS label");
         assert!(check_name("alice", "alice-a-name-much-too-long-here").is_err());
+        // The host's own directories are where a workspace's would be.
+        for kept in RESERVED {
+            assert!(check_name(kept, kept).unwrap_err().contains("keeps for itself"), "{kept}");
+        }
+        assert!(check_name("ssh", "ssh-keys").is_ok());
     }
 
     #[test]
@@ -304,6 +326,7 @@ mod tests {
             max_memory: Ceiling::Size(8),
             disk_gib: 64,
             apps: vec!["t3code".into()],
+            node: String::new(),
         };
         assert_eq!(ok.check(&limits), Ok(()));
         // The host's memory, only where the host's is the most.
@@ -328,5 +351,21 @@ mod tests {
         }
         let quotas = BTreeMap::from([("alice".to_owned(), 3)]);
         assert_eq!((quota_of(&quotas, 1, "alice"), quota_of(&quotas, 1, "bob")), (3, 1));
+    }
+
+    /// A field the Nix modules misspell is refused, not dropped.
+    #[test]
+    fn limits_and_apps_refuse_unknown_fields() {
+        let limits =
+            serde_json::json!({"os": ["ubuntu"], "bootMemMiB": 2048, "maxMemoryGiB": 16, "maxDiskGiB": 64, "quota": 1});
+        assert!(serde_json::from_value::<Limits>(limits.clone()).is_ok());
+        let mut typo = limits;
+        typo["maxMemroyGiB"] = 8.into();
+        assert!(serde_json::from_value::<Limits>(typo).is_err());
+        let app = serde_json::json!({"id": "hello", "name": "Hello", "port": 8080, "bundle": "/nix/store/x", "oneshot": true});
+        assert!(serde_json::from_value::<crate::apps::BootApp>(app.clone()).is_ok());
+        let mut typo = app;
+        typo["oneshott"] = true.into();
+        assert!(serde_json::from_value::<crate::apps::BootApp>(typo).is_err());
     }
 }

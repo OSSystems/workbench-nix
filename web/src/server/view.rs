@@ -29,6 +29,8 @@ fn note(ws: &Workspace, since: &str) -> String {
         State::Failing => "the VM won't stay up".into(),
         State::Stopped if !since.is_empty() => format!("since {since}"),
         State::Stopped => String::new(),
+        State::Moving => "moving to another node".into(),
+        State::Unreachable => "its node doesn't answer".into(),
     }
 }
 
