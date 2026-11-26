@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use leptos::prelude::ServerFnError;
 use vmkit::hostutil;
 use workbench::self_service::read_quotas;
+use workbench_model::memory::Ceiling;
 use workbench_model::self_service::{
     AppsRequest, MemoryRequest, NewView, Outcome, QuotaRow, Request, parse_ssh_keys, quota_of, slug,
 };
@@ -98,15 +99,15 @@ impl AppState {
             Ok(k) => k,
             Err(e) => return refused(&e),
         };
-        let (Ok(memory), Ok(disk)) = (form.memory_gib.trim().parse(), form.disk_gib.trim().parse()) else {
-            return refused("Memory and disk must be whole numbers of GiB.");
+        let (Ok(memory), Ok(disk)) = (form.memory_gib.trim().parse::<Ceiling>(), form.disk_gib.trim().parse()) else {
+            return refused("Memory and disk must be whole numbers of GiB, or memory auto.");
         };
         let r = Request {
             name: form.name.trim().to_owned(),
             owner: viewer.name.clone(),
             os: form.os.clone(),
             ssh_authorized_keys: keys,
-            max_memory_gib: memory,
+            max_memory: memory,
             disk_gib: disk,
             apps: form.apps.clone(),
         };
@@ -217,10 +218,10 @@ impl AppState {
             see_other(&format!("/w/{name}/memory?error={}", encode(msg)));
             Err(ServerFnError::new(msg))
         };
-        let Ok(gib) = memory_gib.trim().parse::<i64>() else {
-            return refused("Memory must be a whole number of GiB.", StatusCode::UNPROCESSABLE_ENTITY);
+        let Ok(max) = memory_gib.trim().parse::<Ceiling>() else {
+            return refused("Memory must be a whole number of GiB, or auto.", StatusCode::UNPROCESSABLE_ENTITY);
         };
-        if let Err(e) = ss.limits.check_memory(gib) {
+        if let Err(e) = ss.limits.check_memory(max) {
             return refused(&e, StatusCode::UNPROCESSABLE_ENTITY);
         }
         let change = Change {
@@ -230,7 +231,7 @@ impl AppState {
             outcome: ss.paths.memory_outcome(name),
             unit: format!("workbench-memory@{name}.service"),
         };
-        match self.change(ss, &ws, &change, &MemoryRequest { max_memory_gib: gib }, restart).await {
+        match self.change(ss, &ws, &change, &MemoryRequest { max_memory: max }, restart).await {
             Ok(()) => {
                 see_other(&format!("/?w={name}"));
                 Ok(())

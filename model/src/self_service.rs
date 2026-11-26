@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::apps::AppInfo;
 use crate::is_workspace_name;
+use crate::memory::Ceiling;
 
 /// The smallest disk a workspace made at run time gets.
 pub const MIN_DISK_GIB: i64 = 16;
@@ -96,9 +97,13 @@ pub struct Limits {
     /// What every VM boots with.
     #[serde(rename = "bootMemMiB")]
     pub boot_mem_mib: i64,
-    /// The most memory a VM may grow to.
+    /// The most memory a VM may grow to, or `auto`: the host's.
     #[serde(rename = "maxMemoryGiB")]
-    pub max_memory_gib: i64,
+    pub max_memory: Ceiling,
+    /// The host's memory, in whole GiB, for a most of `auto`: the host
+    /// reads it, the Nix configuration doesn't say.
+    #[serde(rename = "hostMemoryGiB", default)]
+    pub host_memory_gib: i64,
     #[serde(rename = "maxDiskGiB")]
     pub max_disk_gib: i64,
     /// How many workspaces a person may make, unless an admin set theirs.
@@ -115,11 +120,30 @@ impl Limits {
         (self.boot_mem_mib + 1023) / 1024
     }
 
+    /// The most memory a VM may be allowed to grow to, in GiB: the host's
+    /// for `auto`.
+    #[must_use]
+    pub fn max_memory_gib(&self) -> i64 {
+        self.max_memory.or_host(self.host_memory_gib)
+    }
+
+    /// Whether a VM may grow to `auto`, the host's memory: only where the
+    /// most is the host's too.
+    #[must_use]
+    pub fn memory_auto(&self) -> bool {
+        self.max_memory == Ceiling::Auto
+    }
+
     /// Checks the most memory a VM may grow to: from its boot memory to
-    /// the host's most.
-    pub fn check_memory(&self, gib: i64) -> Result<(), String> {
-        let (lo, hi) = (self.min_memory_gib(), self.max_memory_gib);
-        if (lo..=hi).contains(&gib) { Ok(()) } else { Err(format!("Memory must be from {lo} to {hi} GiB.")) }
+    /// the host's most, or `auto` where the host allows it.
+    pub fn check_memory(&self, max: Ceiling) -> Result<(), String> {
+        let (lo, hi) = (self.min_memory_gib(), self.max_memory_gib());
+        match max {
+            Ceiling::Auto if self.memory_auto() => Ok(()),
+            Ceiling::Auto => Err(format!("Memory must be from {lo} to {hi} GiB: this host has no auto.")),
+            Ceiling::Size(gib) if (lo..=hi).contains(&gib) => Ok(()),
+            Ceiling::Size(_) => Err(format!("Memory must be from {lo} to {hi} GiB.")),
+        }
     }
 
     /// Checks apps someone picked: offered ones, each once.
@@ -152,7 +176,7 @@ pub struct Request {
     pub os: String,
     pub ssh_authorized_keys: Vec<String>,
     #[serde(rename = "maxMemoryGiB")]
-    pub max_memory_gib: i64,
+    pub max_memory: Ceiling,
     #[serde(rename = "diskGiB")]
     pub disk_gib: i64,
     /// The apps it has, by id.
@@ -172,7 +196,7 @@ impl Request {
         if keys != self.ssh_authorized_keys {
             return Err("SSH keys must be one per entry.".into());
         }
-        limits.check_memory(self.max_memory_gib)?;
+        limits.check_memory(self.max_memory)?;
         if !(MIN_DISK_GIB..=limits.max_disk_gib).contains(&self.disk_gib) {
             return Err(format!("Disk must be from {MIN_DISK_GIB} to {} GiB.", limits.max_disk_gib));
         }
@@ -196,7 +220,7 @@ pub struct AppsRequest {
 #[serde(deny_unknown_fields)]
 pub struct MemoryRequest {
     #[serde(rename = "maxMemoryGiB")]
-    pub max_memory_gib: i64,
+    pub max_memory: Ceiling,
 }
 
 /// How a request ended, for the web UI to say.
@@ -266,7 +290,8 @@ mod tests {
         let limits = Limits {
             os: vec!["ubuntu".into()],
             boot_mem_mib: 2048,
-            max_memory_gib: 16,
+            max_memory: Ceiling::Size(16),
+            host_memory_gib: 0,
             max_disk_gib: 128,
             quota: 1,
             apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into(), ..AppInfo::default() }],
@@ -276,16 +301,22 @@ mod tests {
             owner: "alice".into(),
             os: "ubuntu".into(),
             ssh_authorized_keys: vec![KEY.into()],
-            max_memory_gib: 8,
+            max_memory: Ceiling::Size(8),
             disk_gib: 64,
             apps: vec!["t3code".into()],
         };
         assert_eq!(ok.check(&limits), Ok(()));
+        // The host's memory, only where the host's is the most.
+        let auto = Request { max_memory: Ceiling::Auto, ..ok.clone() };
+        assert!(auto.check(&limits).unwrap_err().contains("no auto"));
+        let hosts = Limits { max_memory: Ceiling::Auto, host_memory_gib: 64, ..limits.clone() };
+        assert_eq!((auto.check(&hosts), ok.check(&hosts), hosts.max_memory_gib()), (Ok(()), Ok(()), 64));
+        assert!(Request { max_memory: Ceiling::Size(65), ..ok.clone() }.check(&hosts).is_err());
         assert_eq!(Request { apps: vec![], ..ok.clone() }.check(&limits), Ok(()), "no app at all");
         for bad in [
             Request { os: "nixos".into(), ..ok.clone() },
-            Request { max_memory_gib: 1, ..ok.clone() },
-            Request { max_memory_gib: 17, ..ok.clone() },
+            Request { max_memory: Ceiling::Size(1), ..ok.clone() },
+            Request { max_memory: Ceiling::Size(17), ..ok.clone() },
             Request { disk_gib: 8, ..ok.clone() },
             Request { disk_gib: 129, ..ok.clone() },
             Request { name: "bob".into(), ..ok.clone() },

@@ -152,7 +152,8 @@ impl Daemon {
                 Ok(vm) => {
                     eprintln!(
                         "managing workspace memory workspace={name} bootMiB={} maxMiB={}",
-                        vm.c.boot_mem_mib, vm.c.max_mem_mib
+                        vm.c.boot_mem_mib,
+                        vm.c.max_mem_mib()
                     );
                     self.vms.insert(name, vm);
                 }
@@ -274,8 +275,10 @@ fn listen(c: Config, run: u64) -> anyhow::Result<Vm> {
     let listener = UnixListener::bind(&socket).with_context(|| socket.display().to_string())?;
     chown(&socket, Some(vm_user.uid), Some(vm_user.gid))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    let mem =
-        Arc::new(Mutex::new(VmState { mem: VmMemory::new(c.boot_mem_mib * MIB, c.max_mem_mib * MIB), denied: false }));
+    let mem = Arc::new(Mutex::new(VmState {
+        mem: VmMemory::new(c.boot_mem_mib * MIB, c.max_mem_mib() * MIB),
+        denied: false,
+    }));
     let state = mem.clone();
     let listener = tokio::spawn(async move {
         let e = control::serve(listener, move |conn: UnixStream| {

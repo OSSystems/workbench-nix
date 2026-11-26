@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use vmkit::hostutil::{self, Account};
 use workbench_model::apps::{AppInfo, BootApp};
+use workbench_model::memory::Ceiling;
 use workbench_model::self_service::{AppsRequest, Limits, MemoryRequest, Outcome, Request, quota_of};
 use workbench_model::{is_user_name, is_workspace_name};
 
@@ -112,10 +113,14 @@ pub struct Image {
 }
 
 impl Template {
-    /// Reads the template; its limits offer its apps.
+    /// Reads the template; its limits offer its apps, and know the host's
+    /// memory when their most is `auto`.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = hostutil::read_bounded(path, MAX_FILE).with_context(|| path.display().to_string())?;
         let mut t: Template = serde_json::from_slice(&raw).with_context(|| path.display().to_string())?;
+        if t.limits.memory_auto() {
+            t.limits.host_memory_gib = config::host_mem_mib()? / 1024;
+        }
         t.limits.apps = t
             .apps
             .iter()
@@ -336,7 +341,7 @@ fn unchecked_config_of(t: &Template, r: &Request, ip: &str, uid: u32) -> anyhow:
         disk_gib: r.disk_gib,
         cpus: t.cpus,
         boot_mem_mib: t.limits.boot_mem_mib,
-        max_mem_mib: r.max_memory_gib * 1024,
+        max_mem: r.max_memory.map(|gib| gib * 1024),
         tap,
         mac,
         ip: ip.to_owned(),
@@ -379,7 +384,7 @@ pub fn refreshed(t: &Template, c: &Config) -> anyhow::Result<Config> {
         owner: c.owner.clone(),
         os: c.os.clone(),
         ssh_authorized_keys: c.ssh_authorized_keys.clone(),
-        max_memory_gib: c.max_mem_mib / 1024,
+        max_memory: c.max_mem.map(|mib| mib / 1024),
         disk_gib: c.disk_gib,
         apps,
     };
@@ -391,7 +396,7 @@ pub fn refreshed(t: &Template, c: &Config) -> anyhow::Result<Config> {
             Image { image: c.image.clone(), image_format: c.image_format.clone(), user_data: String::new() },
         );
     }
-    t.limits.boot_mem_mib = t.limits.boot_mem_mib.min(c.max_mem_mib);
+    t.limits.boot_mem_mib = t.limits.boot_mem_mib.min(c.max_mem_mib());
     let mut fresh = unchecked_config_of(&t, &r, &c.ip, c.uid)?;
     // Not what the template says now: what the disk was made from.
     fresh.image.clone_from(&c.image);
@@ -774,16 +779,16 @@ async fn change_memory(t: &Template, paths: &Paths, name: &str) -> anyhow::Resul
     let Some(c) = config::load(&[paths.configs()], name).ok().filter(|c| c.self_service) else {
         bail!(Refused(format!("{name} wasn't made at run time: its memory is in the Nix configuration.")));
     };
-    write_config(paths, &with_memory(t, &c, r.max_memory_gib)?)
+    write_config(paths, &with_memory(t, &c, r.max_memory)?)
 }
 
-/// A workspace's config growing to `gib` at most, within the template's
-/// limits. It boots with no more than that.
-fn with_memory(t: &Template, c: &Config, gib: i64) -> anyhow::Result<Config> {
-    t.limits.check_memory(gib).map_err(refuse)?;
+/// A workspace's config growing to `max` GiB at most, or `auto`, within
+/// the template's limits. It boots with no more than that.
+fn with_memory(t: &Template, c: &Config, max: Ceiling) -> anyhow::Result<Config> {
+    t.limits.check_memory(max).map_err(refuse)?;
     let mut next = c.clone();
-    next.max_mem_mib = gib * 1024;
-    next.boot_mem_mib = next.boot_mem_mib.min(next.max_mem_mib);
+    next.max_mem = max.map(|gib| gib * 1024);
+    next.boot_mem_mib = next.boot_mem_mib.min(next.max_mem_mib());
     next.validate()?;
     Ok(next)
 }
@@ -1051,7 +1056,8 @@ pub(crate) mod tests {
             limits: Limits {
                 os: vec!["ubuntu".into(), "nixos".into()],
                 boot_mem_mib: 2048,
-                max_memory_gib: 16,
+                max_memory: Ceiling::Size(16),
+                host_memory_gib: 0,
                 max_disk_gib: 128,
                 quota: 1,
                 apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into(), terminal: false, default: true }],
@@ -1118,7 +1124,7 @@ pub(crate) mod tests {
             owner: "samuel.silva".into(),
             os: os.into(),
             ssh_authorized_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbJhk5H0h7O me@laptop".into()],
-            max_memory_gib: 8,
+            max_memory: Ceiling::Size(8),
             disk_gib: 64,
             apps: vec!["t3code".into()],
         }
@@ -1132,7 +1138,7 @@ pub(crate) mod tests {
         assert_eq!(c.url, "https://samuel-silva-data.ws.test");
         assert_eq!(c.user, "wb-samuel-silva-data");
         assert_eq!(c.seed, "/var/lib/workbench/.seeds/samuel-silva-data.img");
-        assert_eq!((c.max_mem_mib, c.boot_mem_mib, c.disk_gib), (8192, 2048, 64));
+        assert_eq!((c.max_mem, c.boot_mem_mib, c.disk_gib), (Ceiling::Size(8192), 2048, 64));
         assert!(c.self_service && c.uid == 60_600);
         assert_eq!(c.apps, t.apps);
         let bare = config_of(&t, &Request { apps: vec![], ..request("ubuntu") }, "10.232.0.11", 60_600).unwrap();
@@ -1147,14 +1153,41 @@ pub(crate) mod tests {
     fn memory_changes_within_the_limits() {
         let t = template();
         let c = config_of(&t, &request("ubuntu"), "10.232.0.11", 60_600).unwrap();
-        let more = with_memory(&t, &c, 16).unwrap();
-        assert_eq!((more.max_mem_mib, more.boot_mem_mib), (16_384, 2048));
-        assert_eq!(Config { max_mem_mib: c.max_mem_mib, ..more.clone() }, c, "nothing else changes");
-        assert_eq!(refreshed(&t, &more).unwrap().max_mem_mib, 16_384, "a deploy keeps it");
+        let more = with_memory(&t, &c, Ceiling::Size(16)).unwrap();
+        assert_eq!((more.max_mem, more.boot_mem_mib), (Ceiling::Size(16_384), 2048));
+        assert_eq!(Config { max_mem: c.max_mem, ..more.clone() }, c, "nothing else changes");
+        assert_eq!(refreshed(&t, &more).unwrap().max_mem, Ceiling::Size(16_384), "a deploy keeps it");
         for gib in [1, 17] {
-            let e = with_memory(&t, &c, gib).unwrap_err();
+            let e = with_memory(&t, &c, Ceiling::Size(gib)).unwrap_err();
             assert_eq!(e.downcast_ref::<Refused>().unwrap().0, "Memory must be from 2 to 16 GiB.", "{gib}");
         }
+        let e = with_memory(&t, &c, Ceiling::Auto).unwrap_err();
+        assert!(e.downcast_ref::<Refused>().unwrap().0.contains("no auto"), "not on a host whose most is a size");
+        // Where the most is the host's, a workspace may follow it, and
+        // keeps following it through deploys.
+        let mut hosts = t.clone();
+        hosts.limits.max_memory = Ceiling::Auto;
+        hosts.limits.host_memory_gib = 64;
+        let auto = with_memory(&hosts, &c, Ceiling::Auto).unwrap();
+        assert_eq!((auto.max_mem, auto.max_mem_mib()), (Ceiling::Auto, config::host_mem_mib().unwrap()));
+        assert_eq!(refreshed(&hosts, &auto).unwrap().max_mem, Ceiling::Auto, "a deploy keeps it");
+        let made =
+            config_of(&hosts, &Request { max_memory: Ceiling::Auto, ..request("ubuntu") }, "10.232.0.12", 60_601);
+        assert_eq!(made.unwrap().max_mem, Ceiling::Auto, "and one is made with it");
+        assert_eq!(with_memory(&hosts, &auto, Ceiling::Size(16)).unwrap().max_mem, Ceiling::Size(16_384));
+    }
+
+    /// A template's most memory of `auto` is the host's, in whole GiB.
+    #[test]
+    fn template_memory_of_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("template.json");
+        let mut v = serde_json::to_value(template()).unwrap();
+        v["limits"]["maxMemoryGiB"] = "auto".into();
+        fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let limits = Template::load(&path).unwrap().limits;
+        assert!(limits.memory_auto());
+        assert_eq!(limits.max_memory_gib(), config::host_mem_mib().unwrap() / 1024);
     }
 
     /// Every config is made again from a new template: the host's paths
@@ -1182,7 +1215,7 @@ pub(crate) mod tests {
             (fresh.packages.as_str(), fresh.apps[0].bundle.as_str()),
             ("/nix/store/y-packages", "/nix/store/y-t3code-app")
         );
-        assert_eq!((fresh.ip.as_str(), fresh.uid, fresh.max_mem_mib), (c.ip.as_str(), c.uid, c.max_mem_mib));
+        assert_eq!((fresh.ip.as_str(), fresh.uid, fresh.max_mem), (c.ip.as_str(), c.uid, c.max_mem));
         assert_eq!(fresh.image, c.image, "the image a disk was made from stays");
         let mut old = c.clone();
         old.apps.clear();
@@ -1195,13 +1228,13 @@ pub(crate) mod tests {
         // boots with, keeps what the workspace was given.
         let mut fewer = newer.clone();
         fewer.images.remove("ubuntu");
-        fewer.limits.boot_mem_mib = c.max_mem_mib + 1024;
+        fewer.limits.boot_mem_mib = c.max_mem_mib() + 1024;
         let kept = refreshed(&fewer, &c).unwrap();
         assert_eq!(
             (kept.os.as_str(), kept.seed.as_str(), kept.image.as_str()),
             (c.os.as_str(), c.seed.as_str(), c.image.as_str())
         );
-        assert_eq!((kept.boot_mem_mib, kept.packages.as_str()), (c.max_mem_mib, "/nix/store/y-packages"));
+        assert_eq!((kept.boot_mem_mib, kept.packages.as_str()), (c.max_mem_mib(), "/nix/store/y-packages"));
         let mut gone = template();
         gone.apps.clear();
         assert!(refreshed(&gone, &c).unwrap().apps.is_empty(), "an app no longer offered goes");

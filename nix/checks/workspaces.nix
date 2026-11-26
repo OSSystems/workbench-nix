@@ -274,6 +274,9 @@ pkgs.testers.runNixOSTest {
             groups = [ "workbench" ];
             os = [ "ubuntu" ];
             maxDiskGiB = 32;
+            # The host's memory: no VM here boots with it, since one could
+            # then take what the other needs to grow.
+            maxMemoryGiB = "auto";
             environmentCommand = "${environmentCommand}";
             ownerCommand = "${ownerCommand}";
           };
@@ -725,6 +728,15 @@ pkgs.testers.runNixOSTest {
             timeout=120,
         )
 
+    with subtest("auto is the host's memory, as a start reads it"):
+        kib = int(host.succeed("awk '/^MemTotal:/ { print $2 }' /proc/meminfo"))
+        mib = kib // 1024 // 128 * 128
+        host.succeed("mkdir -p /tmp/auto && jq '.maxMemMiB = \"auto\"' /etc/workbench/alice.json > /tmp/auto/alice.json")
+        host.succeed(
+            "workbench --config-dir /tmp/auto status --json"
+            f" | jq -e '.[] | select(.name == \"alice\") | .maxMemoryBytes == {mib << 20}'"
+        )
+
     with subtest("status lists both workspaces"):
         out = host.succeed("workbench status")
         print(out)
@@ -771,6 +783,9 @@ pkgs.testers.runNixOSTest {
         assert create("bob", "bob-dev").startswith("403"), "bob may not"
         page = client.succeed(f"curl -s {as_user('alice')} https://${domain}/")
         assert 'href="/new"' in page, "alice may"
+        # The template's auto, as the web UI offers it.
+        page = client.succeed(f"curl -s {as_user('alice')} https://${domain}/new")
+        assert f"2 to {mib // 1024}, or auto" in page, page
 
     with subtest("a failing credential command refuses the request"):
         host.succeed("touch /run/no-credential")
