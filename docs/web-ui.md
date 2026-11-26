@@ -322,7 +322,9 @@ the actions:
   **Edit…** there, and without apps a dashed box, "No apps yet", with
   **Add an app…**; one from the Nix configuration says its console is the
   way in. An app without an address has **Connect to `<app>`…** instead,
-  which leads to its Connect page.
+  which leads to its Connect page; for an admin on someone else's
+  workspace, "`<app>` · from `<owner>`'s terminal", disabled, as SSH to it
+  signs in as its owner.
 - **Start `<ws>`**, when stopped
 - **Console** (`C`)
 - **Restart…** (`R`), unless it is stopped; primary when something waits
@@ -453,12 +455,14 @@ for the next start. Later deploys keep it.
 
 ### Connect to an app (`/w/<ws>/connect/<app>`)
 
-For an app without an address, the owner and the admins see, under
-**Workspaces**, the way back, and the app's name:
+For an app without an address, the owner sees, under **Workspaces**, the
+way back, and the app's name. Anyone else, an admin included, gets `403`:
+the workspace's SSH server takes only its owner's certificates.
 
 1. **Set this computer up**: `curl -fsSL https://<domain>/connect/install.sh
    | sh -s -- <code>`, with a new code every time the page renders, and
-   **Copy**. Once per computer, on Linux.
+   **Copy**, which says "Copied" once the clipboard took it, and otherwise
+   selects the command. Once per computer, on Linux.
 2. **Reach `<app>`**: the steps of the app's `connect`, with `@host@` as
    `<ws>.<domain>` and commands between backticks: `herdr --remote
    <ws>.<domain>` for Herdr; herdr-app's Add machine, or `hc machine add
@@ -473,7 +477,11 @@ setting another up folds under **Another computer?**.
 The page is `no-store`: its code is the viewer's. Its referrer policy is
 the UI's, `same-origin`: the UI moves within one document, and
 `no-referrer` would send its forms with `Origin: null`. An app with an
-address has none, a `404`.
+address has none, a `404`, as has an app the workspace hasn't; neither
+makes a code. Nor does a request from a workspace's page that isn't a
+person following a link (`Sec-Fetch-Site` other than `same-origin` or
+`none`, and not a navigation to a document): it gets `403`, so a
+workspace can't spend the viewer's codes in the background.
 
 ### Start, stop and restart
 
@@ -711,7 +719,8 @@ just a page, current when loaded.
 | `GET` | `/w/<ws>/console/socket` | WebSocket to the shared console |
 | `GET` | `/host` | host memory, admins |
 | `GET` | `/denied` | the page nginx shows at an app's address it refused |
-| `GET` | `/w/<ws>/connect/<app>` | the Connect page of an app without an address |
+| `GET` | `/w/<ws>/connect/<app>` | the Connect page of an app without an address, its owner's |
+| `GET` | `/api/connect` | server function: `ws`, `app`; a new code and the viewer's devices |
 | `GET` | `/devices` | the viewer's devices |
 | `POST` | `/api/revoke-device` | server function: `id`, `back`; `303` to `back` |
 | `GET` | `/authz` | on `authz.sock` only, for nginx |

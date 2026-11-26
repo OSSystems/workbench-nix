@@ -33,7 +33,7 @@ use vmkit::hostutil;
 use workbench_model::Viewer;
 use workbench_model::connect::{
     CERT_HOURS, CODE_MINUTES, CODE_PREFIX, CREDENTIAL_PREFIX, Cert, CertRequest, DEVICE_DAYS, GROUPS_DAYS, MAX_DEVICES,
-    PairRequest, Paired, Refusal, clean_label, credential_id, is_code,
+    NO_TERMINAL_APP, PairRequest, Paired, Refusal, clean_label, credential_id, is_code,
 };
 use workbench_model::connect::{ConnectView, DeviceRow};
 use workbench_model::self_service::parse_ssh_keys;
@@ -299,14 +299,27 @@ impl Devices {
 impl AppState {
     /// The Connect page of a workspace's app without an address: a fresh
     /// code for the viewer and their devices, whose groups are noted as
-    /// single sign-on says them now.
+    /// single sign-on says them now. Only for the workspace's owner, as
+    /// its SSH server takes only the owner's certificates; and a code only
+    /// for an app there is to reach, as each one made drops the oldest
+    /// past [`MAX_CODES`].
     pub async fn connect_view(
         &self,
         viewer: &Viewer,
         groups: &[String],
         name: &str,
+        app: &str,
     ) -> Result<ConnectView, ServerFnError> {
         let ws = self.find(viewer, name).await?;
+        if !viewer.owns(&ws) {
+            return Err(super::refuse(
+                "this workspace isn't yours: SSH to it signs in as its owner",
+                StatusCode::FORBIDDEN,
+            ));
+        }
+        if ws.app(app).is_none_or(|a| a.url.is_some()) {
+            return Err(super::refuse(NO_TERMINAL_APP, StatusCode::NOT_FOUND));
+        }
         self.devices.seen(&viewer.name, groups);
         let code = self.devices.make_code(&viewer.name, groups).map_err(super::failed)?;
         super::no_store();
@@ -330,7 +343,7 @@ impl AppState {
                 label: d.label,
                 created: when(d.created),
                 last_used: if d.last_used == 0 { String::new() } else { super::view::ago_s(d.last_used, at) },
-                expires: when(d.expires),
+                expires: Timestamp::from_second(d.expires).map(|t| super::view::until(t, at)).unwrap_or_default(),
             })
             .collect()
     }

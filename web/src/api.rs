@@ -122,9 +122,9 @@ pub async fn quota(user: String, quota: String) -> Result<(), ServerFnError> {
 /// The Connect page of a workspace's app without an address: how to set a
 /// computer up, with a fresh pairing code, and the viewer's devices.
 #[server(prefix = "/api", endpoint = "connect", input = GetUrl)]
-pub async fn get_connect(ws: String) -> Result<(Snapshot, ConnectView), ServerFnError> {
+pub async fn get_connect(ws: String, app: String) -> Result<(Snapshot, ConnectView), ServerFnError> {
     let (state, viewer) = crate::server::request()?;
-    let view = state.connect_view(&viewer, &crate::server::request_groups(), &ws).await?;
+    let view = state.connect_view(&viewer, &crate::server::request_groups(), &ws, &app).await?;
     let snap = state.snapshot_for(&viewer).await.map_err(crate::server::failed)?;
     Ok((snap, view))
 }

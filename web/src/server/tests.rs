@@ -875,6 +875,51 @@ async fn connect_and_devices() {
     assert_eq!(s.devices.of("alice")[0].groups, ["admins"], "as single sign-on says them now");
 }
 
+/// A Connect page makes a code only for the workspace's owner, whose
+/// certificates its SSH server takes, for an app there is to reach, and
+/// asked by the UI or by a person following a link: never in the
+/// background of a workspace's page.
+#[tokio::test]
+async fn connect_codes_for_the_owner_only() {
+    let _turn = TURN.lock().await;
+    let s = state(Fake { herdr: true, ..Fake::default() });
+    let kept = s.devices.make_code("alice", &[]).unwrap();
+
+    let (code, _, _) = send(ui(&s), get("/w/alice/connect/herdr", "carol")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "SSH to alice's workspace signs in as alice, not as an admin");
+    let (_, _, panel) = send(ui(&s), get("/?w=alice", "carol")).await;
+    assert!(!panel.contains(r#"href="/w/alice/connect/herdr""#) && panel.contains("from alice"), "{panel}");
+
+    for path in ["/w/alice/connect/t3code", "/w/alice/connect/nope", "/api/connect?ws=alice&app=t3code"] {
+        let (code, _, body) = send(ui(&s), get(path, "alice")).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+
+    let asked = |path: &str, site: &str, mode: &str, dest: &str| {
+        let mut req = get(path, "alice");
+        for (k, v) in [("sec-fetch-site", site), ("sec-fetch-mode", mode), ("sec-fetch-dest", dest)] {
+            req.headers_mut().insert(k, v.parse().unwrap());
+        }
+        req
+    };
+    let api = "/api/connect?ws=alice&app=herdr";
+    for (req, why) in [
+        (asked(api, "same-site", "cors", "empty"), "a workspace's script"),
+        (asked("/w/alice/connect/herdr", "same-site", "no-cors", "image"), "a workspace's image"),
+        (asked("/w/alice/connect/herdr", "same-site", "navigate", "iframe"), "a workspace's frame"),
+    ] {
+        assert_eq!(send(ui(&s), req).await.0, StatusCode::FORBIDDEN, "{why}");
+    }
+    for (req, why) in [
+        (asked("/w/alice/connect/herdr", "same-site", "navigate", "document"), "a link from a workspace"),
+        (asked(api, "same-origin", "cors", "empty"), "the UI's own page"),
+    ] {
+        let (code, _, body) = send(ui(&s), req).await;
+        assert_eq!(code, StatusCode::OK, "{why}: {body}");
+    }
+    assert!(s.devices.pair(&kept, "laptop").is_ok(), "none of the refused made a code that pushed it out");
+}
+
 fn json_post(path: &str, bearer: Option<&str>, body: &serde_json::Value) -> Request<Body> {
     let mut req = Request::post(path).header(header::CONTENT_TYPE, "application/json");
     if let Some(b) = bearer {

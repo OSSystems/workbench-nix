@@ -69,6 +69,20 @@ pub fn when(t: Timestamp, now: Timestamp) -> String {
     }
 }
 
+/// When something is due, as briefly as is clear: the time today, the
+/// date after, with its year when that isn't this one.
+#[must_use]
+pub fn until(t: Timestamp, now: Timestamp) -> String {
+    let (z, today) = (local(t), local(now));
+    if z.date() == today.date() {
+        z.strftime("%H:%M").to_string()
+    } else if z.year() == today.year() {
+        z.strftime("%b %-d").to_string()
+    } else {
+        z.strftime("%b %-d, %Y").to_string()
+    }
+}
+
 /// How long ago something happened.
 #[must_use]
 pub fn ago(t: Timestamp, now: Timestamp) -> String {
@@ -172,6 +186,18 @@ mod tests {
         assert_eq!(ago(now - SignedDuration::from_secs(5), now), "5 s ago");
         assert_eq!(ago(now - SignedDuration::from_mins(4), now), "4 min ago");
         assert_eq!(ago(now - SignedDuration::from_hours(3), now), "3 h ago");
+    }
+
+    /// A time to come reads as its date, never as a weekday that could be
+    /// this week's.
+    #[test]
+    fn dues() {
+        let now: Timestamp = "2026-06-15T12:00:00Z".parse().unwrap();
+        let in_days = |d: i64| until(now + SignedDuration::from_hours(24 * d), now);
+        assert_eq!(in_days(30), local(now + SignedDuration::from_hours(24 * 30)).strftime("%b %-d").to_string());
+        assert!(!in_days(3).contains(':'), "a date, not a weekday and time: {}", in_days(3));
+        assert!(in_days(400).ends_with(", 2027"), "{}", in_days(400));
+        assert!(until(now, now).contains(':'), "today's is its time");
     }
 
     #[test]

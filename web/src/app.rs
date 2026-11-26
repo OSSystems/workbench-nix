@@ -10,7 +10,7 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::{SsrMode, path};
 use workbench_model::apps::{AppInfo, connect_step, copyable_step};
-use workbench_model::connect::{CODE_MINUTES, ConnectView, DEVICE_DAYS, DeviceRow, GROUPS_DAYS};
+use workbench_model::connect::{CODE_MINUTES, ConnectView, DEVICE_DAYS, DeviceRow, GROUPS_DAYS, NO_TERMINAL_APP};
 use workbench_model::self_service::{MIN_DISK_GIB, NewView};
 use workbench_model::{
     App, Change, Filter, HostView, List, OpenBlocker, Quotas, Row, Snapshot, Stage, State, Verb, Viewer, Workspace,
@@ -898,8 +898,8 @@ fn Peek(snap: RwSignal<Snapshot>, list: Memo<List>, name: String) -> impl IntoVi
             return None;
         }
         let name = ws.name.clone();
-        let offered = snap.with(|s| s.apps.clone());
-        let apps = view! { <AppsSection ws=ws.clone() offered device /> };
+        let (offered, owns) = snap.with(|s| (s.apps.clone(), s.viewer.owns(&ws)));
+        let apps = view! { <AppsSection ws=ws.clone() offered owns device /> };
         let start = (st == State::Stopped).then(|| {
             let label = format!("Start {name}");
             view! {
@@ -1072,9 +1072,10 @@ fn capitalized(s: &str) -> String {
 }
 
 /// A workspace's apps on its panel: each opens, and one made at run time
-/// changes its apps here.
+/// changes its apps here. `owns`: the viewer's own, whose apps without an
+/// address they reach from a terminal.
 #[component]
-fn AppsSection(ws: Workspace, offered: Vec<AppInfo>, device: Callback<(String, String)>) -> impl IntoView {
+fn AppsSection(ws: Workspace, offered: Vec<AppInfo>, owns: bool, device: Callback<(String, String)>) -> impl IntoView {
     let name = ws.name.clone();
     let editable = ws.self_service && !offered.is_empty();
     let dialog = format!("apps-{name}");
@@ -1113,7 +1114,7 @@ fn AppsSection(ws: Workspace, offered: Vec<AppInfo>, device: Callback<(String, S
         .apps
         .iter()
         .enumerate()
-        .map(|(i, app)| view! { <AppRow ws=ws.clone() app=app.clone() first=first == Some(i) device /> })
+        .map(|(i, app)| view! { <AppRow ws=ws.clone() app=app.clone() first=first == Some(i) owns device /> })
         .collect_view();
     view! { {head} <div class="apps">{rows}</div> }.into_any()
 }
@@ -1121,7 +1122,7 @@ fn AppsSection(ws: Workspace, offered: Vec<AppInfo>, device: Callback<(String, S
 /// One app on a panel: Open, and the other ways to it, or why it doesn't
 /// open now.
 #[component]
-fn AppRow(ws: Workspace, app: App, first: bool, device: Callback<(String, String)>) -> impl IntoView {
+fn AppRow(ws: Workspace, app: App, first: bool, owns: bool, device: Callback<(String, String)>) -> impl IntoView {
     let stage = ws.stage(&app.id);
     let until = (stage == Stage::Going).then_some(" · until a restart");
     let dot = if ws.state == State::Running { "dot on" } else { "dot go" };
@@ -1141,7 +1142,15 @@ fn AppRow(ws: Workspace, app: App, first: bool, device: Callback<(String, String
             .into_any()
         }
         // Reached from a terminal: its page says how, with a code that sets
-        // a computer up for it.
+        // a computer up for it. Only by its owner: SSH signs in as them.
+        Some(OpenBlocker::NoAddress) if !owns => view! {
+            <div class="appo">
+                <span class="btn" aria-disabled="true" title="SSH to a workspace signs in as its owner">
+                    <span><span class="dot off"></span>{format!("{} · from {}'s terminal", app.name, ws.owner)}</span>
+                </span>
+            </div>
+        }
+        .into_any(),
         Some(OpenBlocker::NoAddress) => view! {
             <div class="appo">
                 <a class="btn" href=format!("/w/{}/connect/{}", ws.name, app.id) rel="external" title="From your terminal">
@@ -2025,20 +2034,20 @@ fn ConnectPage() -> impl IntoView {
     let params = use_params_map();
     let get = move |k: &str| params.with_untracked(|p| p.get(k).unwrap_or_default());
     let (name, id) = (get("ws"), get("app"));
-    let data = Resource::new_blocking(move || name.clone(), api::get_connect);
+    let asked = (name.clone(), id.clone());
+    let data = Resource::new_blocking(move || asked.clone(), |(ws, app)| api::get_connect(ws, app));
     view! {
         <Suspense>
             {move || {
-                let id = id.clone();
+                let (name, id) = (name.clone(), id.clone());
                 Suspend::new(async move {
                     match data.await {
-                        Ok((snap, c)) => {
-                            let name = c.host.split('.').next().unwrap_or_default().to_owned();
-                            let ws = snap.find(&name).map(|r| r.ws.clone());
-                            let app = ws.as_ref().and_then(|w| w.app(&id)).cloned();
-                            view! { <ConnectBody viewer=snap.viewer ws=ws.unwrap_or_default() app c /> }.into_any()
-                        }
+                        Ok((snap, c)) => match snap.find(&name).and_then(|r| r.ws.app(&id)).cloned() {
+                            Some(app) => view! { <ConnectBody viewer=snap.viewer name app c /> }.into_any(),
+                            None => view! { <NoTerminalApp name /> }.into_any(),
+                        },
                         Err(e) if e.to_string().contains("isn't yours") => view! { <Forbidden viewer=None /> }.into_any(),
+                        Err(e) if e.to_string().contains(NO_TERMINAL_APP) => view! { <NoTerminalApp name /> }.into_any(),
                         Err(e) => view! { <Unreachable detail=e.to_string() /> }.into_any(),
                     }
                 })
@@ -2047,26 +2056,28 @@ fn ConnectPage() -> impl IntoView {
     }
 }
 
+/// The Connect page of an app the workspace `name` hasn't, or one that
+/// opens in a browser.
 #[component]
-fn ConnectBody(viewer: Viewer, ws: Workspace, app: Option<App>, c: ConnectView) -> impl IntoView {
-    let name = ws.name.clone();
-    let Some(app) = app.filter(|a| a.url.is_none()) else {
-        set_status(404);
-        return view! {
-            <Title text="No such app · workbench" />
-            <div class="app">
-                <Top viewer />
-                <main class="solo">
-                    <div class="card">
-                        <h1><span class="mono">{name.clone()}</span>" has no app to reach from a terminal there"</h1>
-                        <p>"Its apps are on its panel."</p>
-                        <div class="acts"><a class="btn p" href=format!("/?w={name}")>"Back to workspaces"</a></div>
-                    </div>
-                </main>
-            </div>
-        }
-        .into_any();
-    };
+fn NoTerminalApp(name: String) -> impl IntoView {
+    set_status(404);
+    view! {
+        <Title text="No such app · workbench" />
+        <div class="app">
+            <main class="solo">
+                <div class="card">
+                    <h1><span class="mono">{name.clone()}</span>{format!(" has {NO_TERMINAL_APP}")}</h1>
+                    <p>"Its apps are on its panel."</p>
+                    <div class="acts"><a class="btn p" href=format!("/?w={name}")>"Back to workspaces"</a></div>
+                </div>
+            </main>
+        </div>
+    }
+}
+
+/// The Connect page of `app`, of the workspace `name`.
+#[component]
+fn ConnectBody(viewer: Viewer, name: String, app: App, c: ConnectView) -> impl IntoView {
     let install = c.install();
     let steps =
         if app.connect.is_empty() { vec!["In a terminal: `ssh @host@`".to_owned()] } else { app.connect.clone() };
@@ -2152,27 +2163,52 @@ fn inline_step(parts: Vec<(bool, String)>) -> impl IntoView {
 }
 
 /// A command or name, whole, and a button that copies it, named `label`.
+/// It says "Copied" only once the clipboard took the text: what is copied
+/// here goes into a terminal. When it can't, the text is selected for the
+/// person to copy.
 #[component]
 fn CopyBox(text: String, label: String) -> impl IntoView {
-    let copied = RwSignal::new(false);
+    // Whether the last click copied, once the clipboard answers.
+    let copied = RwSignal::new(None::<bool>);
+    let code = NodeRef::<leptos::html::Code>::new();
     let copy = text.clone();
     view! {
         <div class="copy">
-            <code>{text}</code>
+            <code node_ref=code>{text}</code>
             <button
                 type="button"
                 class="btn"
                 aria-label=label
                 on:click=move |_| {
-                    let _ = window().navigator().clipboard().write_text(&copy);
-                    copied.set(true);
+                    let copy = copy.clone();
+                    leptos::task::spawn_local(async move {
+                        let ok = copy_text(&copy).await;
+                        if !ok
+                            && let (Some(code), Ok(Some(selection))) = (code.get_untracked(), window().get_selection())
+                        {
+                            let _ = selection.select_all_children(&code);
+                        }
+                        copied.set(Some(ok));
+                    });
                 }
             >
                 <Icon d=ICON_COPY />
-                {move || if copied.get() { "Copied" } else { "Copy" }}
+                {move || match copied.get() {
+                    None => "Copy",
+                    Some(true) => "Copied",
+                    Some(false) => "Selected: copy it",
+                }}
             </button>
         </div>
     }
+}
+
+/// Puts `text` on the clipboard; whether it took it. A page without the
+/// Clipboard API, as one not served over HTTPS, has none to take it.
+async fn copy_text(text: &str) -> bool {
+    let navigator = window().navigator();
+    let has_clipboard = js_sys::Reflect::get(&navigator, &"clipboard".into()).is_ok_and(|c| !c.is_undefined());
+    has_clipboard && wasm_bindgen_futures::JsFuture::from(navigator.clipboard().write_text(text)).await.is_ok()
 }
 
 /// A person's devices, each with Revoke, which brings the form back to

@@ -85,6 +85,12 @@ async fn guard(State(state): State<AppState>, mut req: Request, next: Next) -> R
             return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
         }
     }
+    // So must a GET that makes a pairing code, or a workspace's page could
+    // spend the viewer's codes in the background; a person following a
+    // link from one still gets the page.
+    if req.method() == Method::GET && makes_code(req.uri().path()) && !from_ui_or_navigation(req.headers()) {
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
     req.extensions_mut().insert(viewer);
     req.extensions_mut().insert(super::Groups(groups));
     let mut res = next.run(req).await;
@@ -103,6 +109,25 @@ async fn guard(State(state): State<AppState>, mut req: Request, next: Next) -> R
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     res
+}
+
+/// Whether a GET of `path` makes a pairing code: the Connect page, and
+/// the server function behind it.
+fn makes_code(path: &str) -> bool {
+    path == "/api/connect"
+        || path
+            .strip_prefix("/w/")
+            .is_some_and(|rest| matches!(rest.split('/').collect::<Vec<_>>()[..], [_, "connect", _]))
+}
+
+/// Whether a request comes from the UI's own pages, or is a person
+/// navigating to it. A browser without `Sec-Fetch-Site` says neither.
+fn from_ui_or_navigation(h: &axum::http::HeaderMap) -> bool {
+    let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
+    match get("sec-fetch-site") {
+        None | Some("same-origin" | "none") => true,
+        Some(_) => get("sec-fetch-mode") == Some("navigate") && get("sec-fetch-dest") == Some("document"),
+    }
 }
 
 async fn server_fn(State(state): State<AppState>, req: Request<Body>) -> impl IntoResponse {

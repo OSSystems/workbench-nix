@@ -118,6 +118,10 @@ pub struct DeviceRow {
     pub expires: String,
 }
 
+/// Why the Connect page of an app refuses: the workspace has no such app,
+/// or one that opens in a browser.
+pub const NO_TERMINAL_APP: &str = "no app to reach from a terminal there";
+
 /// What the Connect page shows: how to set a computer up, with a fresh
 /// code, and how to reach the app from it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
