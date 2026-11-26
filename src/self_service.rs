@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use vmkit::hostutil::{self, Account};
 use workbench_model::apps::{AppInfo, BootApp};
-use workbench_model::fleet::Record;
+use workbench_model::fleet::{NodeRefusal, Record};
 use workbench_model::memory::Ceiling;
 use workbench_model::self_service::{AppsRequest, Limits, MemoryRequest, Outcome, Request, quota_of};
 use workbench_model::{is_user_name, is_workspace_name};
@@ -895,6 +895,22 @@ pub(crate) async fn credential(owner_command: &str, environment_command: &str, o
     Ok(env)
 }
 
+/// How a request went, as its unit wrote it; none when it wrote nothing
+/// readable.
+#[must_use]
+pub fn read_outcome(path: &Path) -> Option<Outcome> {
+    let raw = hostutil::read_bounded(path, 1 << 16).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// An outcome written at `since` or after: one from an earlier request
+/// says nothing of this one.
+#[must_use]
+pub fn read_outcome_since(path: &Path, since: std::time::SystemTime) -> Option<Outcome> {
+    let at = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    (at >= since).then(|| read_outcome(path)).flatten()
+}
+
 pub(crate) fn write_outcome_at(out: &Path, outcome: &Outcome) -> anyhow::Result<()> {
     fs::create_dir_all(out.parent().context("outcome")?)?;
     hostutil::atomic_write(out, &serde_json::to_vec(outcome)?, 0o644)?;
@@ -904,11 +920,16 @@ pub(crate) fn write_outcome_at(out: &Path, outcome: &Outcome) -> anyhow::Result<
 /// What a request's result says, for the web UI.
 pub(crate) fn outcome_of(result: &anyhow::Result<()>, failed: &str) -> Outcome {
     match result {
-        Ok(()) => Outcome { ok: true, error: String::new() },
-        Err(e) => Outcome {
-            ok: false,
-            error: e.downcast_ref::<Refused>().map_or_else(|| format!("{failed}: {e:#}"), |r| r.0.clone()),
-        },
+        Ok(()) => Outcome { ok: true, ..Outcome::default() },
+        Err(e) => {
+            let node = e.chain().find_map(|c| c.downcast_ref::<NodeRefusal>()).cloned();
+            let error = match (e.downcast_ref::<Refused>(), e.downcast_ref::<NodeRefusal>()) {
+                (Some(r), _) => r.0.clone(),
+                (None, Some(n)) if !n.failed() => n.to_string(),
+                _ => format!("{failed}: {e:#}"),
+            };
+            Outcome { ok: false, error, node }
+        }
     }
 }
 
@@ -1541,6 +1562,24 @@ pub(crate) mod tests {
         assert_eq!(Owner::of(Some(1)), Owner::Left);
         assert_eq!(Owner::of(Some(2)), Owner::Unknown, "a directory that is down decides nothing");
         assert_eq!(Owner::of(None), Owner::Unknown);
+    }
+
+    /// An outcome carries the node that refused, whose name only admins
+    /// read; one the node failed says what failed.
+    #[test]
+    fn outcomes_say_which_node() {
+        let down = NodeRefusal::Unreachable { node: "a".into() };
+        let o = outcome_of(&Err(down.clone().into()), "The front couldn't make it");
+        assert_eq!(
+            (o.error.as_str(), o.node.as_ref()),
+            ("Its node, a, doesn't answer just now. Try again later.", Some(&down))
+        );
+        let failed = NodeRefusal::Failed { node: "a".into(), error: "boom".into() };
+        let o =
+            outcome_of(&Err(anyhow::Error::from(failed.clone()).context("making it")), "The front couldn't make it");
+        assert_eq!(o.error, "The front couldn't make it: making it: node a: boom");
+        assert_eq!(o.node, Some(failed));
+        assert_eq!(outcome_of(&Err(refuse("no")), "x"), Outcome { ok: false, error: "no".into(), node: None });
     }
 
     #[test]

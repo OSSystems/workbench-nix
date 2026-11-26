@@ -328,6 +328,52 @@ impl NodeView {
     }
 }
 
+/// Why a workspace's node didn't do what it was asked, as people are
+/// told: an admin reads which node, anyone else "its node".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum NodeRefusal {
+    /// It doesn't answer.
+    Unreachable { node: String },
+    /// It answers with another build, and isn't controlled.
+    OtherBuild { node: String, build: String },
+    /// It failed, and said why.
+    Failed { node: String, error: String },
+}
+
+impl NodeRefusal {
+    /// What `admin`, or anyone else, reads of it.
+    #[must_use]
+    pub fn told(&self, admin: bool) -> String {
+        let its = |node: &str| if admin { format!("Its node, {node},") } else { "Its node".to_owned() };
+        match self {
+            NodeRefusal::Unreachable { node } => format!("{} doesn't answer just now. Try again later.", its(node)),
+            NodeRefusal::OtherBuild { node, build } if admin => {
+                format!("{} is of another build ({build}): deploy it.", its(node))
+            }
+            NodeRefusal::OtherBuild { node, .. } => format!("{} is of another build: an admin deploys it.", its(node)),
+            NodeRefusal::Failed { node, error } if admin => format!("node {node}: {error}"),
+            NodeRefusal::Failed { error, .. } => format!("its node: {error}"),
+        }
+    }
+
+    /// Whether it is the node failing, rather than a refusal people are
+    /// shown as it is.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        matches!(self, NodeRefusal::Failed { .. })
+    }
+}
+
+/// As an admin reads it, for the logs and the command line.
+impl std::fmt::Display for NodeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.told(true))
+    }
+}
+
+impl std::error::Error for NodeRefusal {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -265,6 +265,30 @@ impl Drop for RawTerminal {
     }
 }
 
+/// `workbench move <ws> <node>` on a front: asks for the move as the web
+/// UI does, runs `workbench-move@<ws>` and says how it went.
+pub async fn request_move(
+    fleet: &crate::fleet::front::Fleet,
+    name: &str,
+    node: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let asked = std::time::SystemTime::now();
+    fleet.ask_move(name, node)?;
+    let unit = format!("workbench-move@{name}.service");
+    let ran = crate::self_service::run_tool("systemctl", &["start", &unit]).await;
+    // An outcome from an earlier move says nothing of this one.
+    match (crate::self_service::read_outcome_since(&fleet.paths().move_outcome(name), asked), ran) {
+        (Some(o), _) if o.ok => {
+            writeln!(out, "{name} is on {node}.")?;
+            Ok(())
+        }
+        (Some(o), _) => bail!("{}", o.error),
+        (None, Ok(())) => bail!("{unit} said nothing of the move"),
+        (None, Err(e)) => Err(e.context("and it said nothing of the move")),
+    }
+}
+
 /// Stops a workspace and deletes its disk, after the name is typed again
 /// unless `yes`. It is the only way workspace data is deleted.
 pub async fn destroy(
@@ -372,6 +396,36 @@ mod tests {
         );
         let err = destroy(&[], root.path(), "carol", true, &mut &b""[..], &mut out).await.unwrap_err();
         assert!(err.to_string().contains("no data"), "destroying an unknown workspace: {err}");
+    }
+
+    /// `workbench move` says how this move went, not an earlier one.
+    #[tokio::test]
+    async fn a_move_says_how_this_one_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (
+            crate::fleet::fake::FakeNode::new("a", dir.path().join("a"), 14),
+            crate::fleet::fake::FakeNode::new("b", dir.path().join("b"), 34),
+        );
+        let fleet = crate::fleet::fake::fleet(crate::fleet::tests::front_settings(dir.path()), &[&a, &b]);
+        let outcome = fleet.paths().move_outcome("alice");
+        std::fs::create_dir_all(outcome.parent().unwrap()).unwrap();
+        std::fs::write(&outcome, br#"{"ok":true,"error":""}"#).unwrap();
+        let last_week = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+        std::fs::File::options().write(true).open(&outcome).unwrap().set_modified(last_week).unwrap();
+        crate::self_service::tools::stub(|_, _| Ok(()));
+        let mut out = Vec::new();
+        let err = request_move(&fleet, "alice", "b", &mut out).await.unwrap_err();
+        assert!(err.to_string().contains("said nothing of the move"), "{err}");
+        let written = outcome.clone();
+        crate::self_service::tools::stub(move |_, _| {
+            std::fs::write(&written, br#"{"ok":false,"error":"Node b is closed: it takes no moves."}"#)?;
+            Ok(())
+        });
+        let err = request_move(&fleet, "alice", "b", &mut out).await.unwrap_err();
+        assert!(err.to_string().contains("is closed"), "{err}");
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        let err = request_move(&fleet, "registry", "b", &mut out).await.unwrap_err();
+        assert!(err.to_string().contains("state directory's own names"), "{err}");
     }
 
     #[test]

@@ -503,7 +503,7 @@ const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbJhk5H0h7O alice@laptop
 #[tokio::test]
 async fn people_in_the_group_make_their_own() {
     let _turn = TURN.lock().await;
-    let (dir, fake) = self_serve(vec![], Some(Outcome { ok: true, error: String::new() }));
+    let (dir, fake) = self_serve(vec![], Some(Outcome { ok: true, ..Outcome::default() }));
     let units = fake.units.clone();
     let s = state(fake);
     let paths = Paths(dir.path().to_owned());
@@ -555,7 +555,7 @@ async fn body_has_apps(s: &AppState) -> bool {
 #[tokio::test]
 async fn apps_of_a_workspace_made_at_run_time() {
     let _turn = TURN.lock().await;
-    let (dir, fake) = self_serve(vec![made("alice-dev", "alice")], Some(Outcome { ok: true, error: String::new() }));
+    let (dir, fake) = self_serve(vec![made("alice-dev", "alice")], Some(Outcome { ok: true, ..Outcome::default() }));
     let (units, calls, outcome) = (fake.units.clone(), fake.controlled.clone(), fake.outcome.clone());
     let s = state(fake);
     let paths = Paths(dir.path().to_owned());
@@ -604,7 +604,7 @@ async fn apps_of_a_workspace_made_at_run_time() {
 async fn admins_change_a_workspaces_memory() {
     let _turn = TURN.lock().await;
     let sized = Workspace { boot_memory_bytes: 2 << 30, max_memory_bytes: 8 << 30, ..made("alice-dev", "alice") };
-    let (dir, fake) = self_serve(vec![sized], Some(Outcome { ok: true, error: String::new() }));
+    let (dir, fake) = self_serve(vec![sized], Some(Outcome { ok: true, ..Outcome::default() }));
     let (units, calls) = (fake.units.clone(), fake.controlled.clone());
     let s = state(fake);
     let paths = Paths(dir.path().to_owned());
@@ -663,7 +663,7 @@ async fn auto_where_the_host_offers_it() {
         memory_auto: true,
         ..made("alice-dev", "alice")
     };
-    let (dir, fake) = self_serve(vec![following], Some(Outcome { ok: true, error: String::new() }));
+    let (dir, fake) = self_serve(vec![following], Some(Outcome { ok: true, ..Outcome::default() }));
     let s = state_with(fake, |l| {
         l.max_memory = Ceiling::Auto;
         l.host_memory_gib = 64;
@@ -699,7 +699,7 @@ async fn auto_where_the_host_offers_it() {
 #[tokio::test]
 async fn the_quota_and_the_hosts_refusals() {
     let _turn = TURN.lock().await;
-    let (dir, fake) = self_serve(vec![made("alice-dev", "alice")], Some(Outcome { ok: true, error: String::new() }));
+    let (dir, fake) = self_serve(vec![made("alice-dev", "alice")], Some(Outcome { ok: true, ..Outcome::default() }));
     let outcome = fake.outcome.clone();
     let s = state(fake);
     let form = "name=alice-two&os=ubuntu&memory_gib=8&disk_gib=64";
@@ -723,7 +723,7 @@ async fn the_quota_and_the_hosts_refusals() {
 
     // What the host refuses, such as a missing credential, is said too.
     let refusal = "Your workspace has no credential for its app yet. Ask an admin.";
-    *outcome.lock().unwrap() = Some(Outcome { ok: false, error: refusal.into() });
+    *outcome.lock().unwrap() = Some(Outcome { ok: false, error: refusal.into(), ..Outcome::default() });
     let (_, h, _) = send(
         ui(&s),
         with_groups(post("/api/create", "alice", ORIGIN, form.replace("two", "three").as_str()), "workbench"),

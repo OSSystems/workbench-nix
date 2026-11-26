@@ -127,6 +127,18 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// These limits, with `auto` the memory of the largest node of those
+    /// that said what they have.
+    #[must_use]
+    pub fn resolved(&self, nodes: &[crate::fleet::NodeView]) -> Limits {
+        let mut limits = self.clone();
+        if limits.memory_auto() {
+            limits.host_memory_gib =
+                nodes.iter().filter_map(|n| n.host.as_ref()).map(|h| h.mem_total / crate::GIB).max().unwrap_or(0);
+        }
+        limits
+    }
+
     /// The least a VM may be allowed to grow to: its boot memory.
     #[must_use]
     pub fn min_memory_gib(&self) -> i64 {
@@ -245,8 +257,12 @@ pub struct MemoryRequest {
 #[serde(rename_all = "camelCase")]
 pub struct Outcome {
     pub ok: bool,
+    /// What went wrong, as an admin reads it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// The node that didn't do it, whose name only admins read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<crate::fleet::NodeRefusal>,
 }
 
 /// What the New workspace page shows.
@@ -351,6 +367,25 @@ mod tests {
         }
         let quotas = BTreeMap::from([("alice".to_owned(), 3)]);
         assert_eq!((quota_of(&quotas, 1, "alice"), quota_of(&quotas, 1, "bob")), (3, 1));
+    }
+
+    /// `auto` is the largest node's memory, of those that answered; a
+    /// size stays a size.
+    #[test]
+    fn limits_resolved_from_the_nodes() {
+        use crate::fleet::{HostInfo, NodeState, NodeView};
+        let node = |gib: i64| NodeView {
+            name: format!("n{gib}"),
+            state: NodeState::Up,
+            host: Some(HostInfo { mem_total: gib * crate::GIB, ..HostInfo::default() }),
+            detail: String::new(),
+        };
+        let silent = NodeView { host: None, ..node(0) };
+        let auto = Limits { max_memory: Ceiling::Auto, ..Limits::default() };
+        assert_eq!(auto.resolved(&[node(32), node(128), silent.clone()]).host_memory_gib, 128);
+        assert_eq!(auto.resolved(&[silent]).host_memory_gib, 0);
+        let sized = Limits { max_memory: Ceiling::Size(16), ..Limits::default() };
+        assert_eq!(sized.resolved(&[node(128)]), sized);
     }
 
     /// A field the Nix modules misspell is refused, not dropped.

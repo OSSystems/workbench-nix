@@ -19,8 +19,14 @@
 pub mod client;
 pub mod contract;
 pub mod disk;
+#[cfg(test)]
+pub(crate) mod fake;
+pub mod front;
 mod http;
+pub mod moving;
 pub mod node;
+pub mod ops;
+pub mod placement;
 pub mod registry;
 pub mod run;
 
