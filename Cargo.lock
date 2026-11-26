@@ -2723,8 +2723,13 @@ name = "workbench"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "clap",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jiff",
  "nix 0.32.0",
  "serde",
@@ -2732,6 +2737,8 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
+ "tower",
  "url",
  "vmkit",
  "workbench-model",

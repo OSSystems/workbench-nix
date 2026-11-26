@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use workbench::cli::{self, ExitCode};
 use workbench::config::DEFAULT_CONFIG_DIRS;
+use workbench::fleet::{self, NODE_SETTINGS, NodeSettings};
 use workbench::memoryd::{self, BehindPool};
 use workbench::self_service::{self, Template};
 use workbench::{agent, launch};
@@ -71,8 +72,17 @@ enum Command {
         #[arg(long, default_value = "/var/lib/workbench")]
         state_root: PathBuf,
     },
-    /// Become the workspace's VM (internal: the unit's ExecStart)
+    /// Become the workspace's VM (internal: the unit's ExecStart); on a
+    /// node, with what the front answers
     Run { workspace: String },
+    /// A node of a fleet (internal: its units)
+    Node {
+        /// The node's settings
+        #[arg(long, default_value = NODE_SETTINGS)]
+        settings: PathBuf,
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
     /// Let the web UI use the VM's sockets (internal: the unit's ExecStartPost)
     ShareSockets { workspace: String },
     /// Power the VM off cleanly (internal: the unit's ExecStop)
@@ -135,6 +145,17 @@ enum SelfServiceCommand {
     Reconcile,
 }
 
+// The comments are the help text, written for people, not rustdoc.
+#[allow(clippy::doc_markdown)]
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Serve the node's API to the front
+    Serve,
+    /// Put back, at boot and with every new template, the users and taps of
+    /// workspaces made at run time, and start them
+    Setup,
+}
+
 #[derive(clap::Args)]
 struct StateRoot {
     /// Where workspace disks and stop markers live
@@ -159,7 +180,22 @@ fn run(args: Args) -> anyhow::Result<()> {
     let rt = || tokio::runtime::Builder::new_multi_thread().enable_all().build();
     match args.command {
         // Becomes cloud-hypervisor: no runtime threads left behind.
-        Command::Run { workspace } => launch::run(&dirs, &workspace),
+        Command::Run { workspace } => match NodeSettings::of_this_machine()? {
+            Some(node) => fleet::run::run(&node, &workspace),
+            // Until the modules render a fleet: a host on its own.
+            None => launch::run(&dirs, &workspace),
+        },
+        Command::Node { settings, command } => {
+            let node = NodeSettings::load(&settings)?;
+            rt()?.block_on(async {
+                match command {
+                    NodeCommand::Serve => fleet::node::serve(node).await,
+                    NodeCommand::Setup => {
+                        self_service::setup(&Template::load(std::path::Path::new(&node.template))?).await
+                    }
+                }
+            })
+        }
         Command::Console { workspace } => cli::console(&dirs, &workspace),
         Command::ShareSockets { workspace } => {
             // The sockets come once the disk is made, which the unit's

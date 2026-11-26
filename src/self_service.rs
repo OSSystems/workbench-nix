@@ -743,6 +743,11 @@ pub(crate) mod tools {
         static STUB: RefCell<Option<Stub>> = const { RefCell::new(None) };
     }
 
+    /// Answers every tool this thread runs with `stub` until it ends.
+    pub(crate) fn stub(stub: impl Fn(&str, &[&str]) -> anyhow::Result<()> + 'static) {
+        STUB.with(|s| *s.borrow_mut() = Some(Box::new(stub)));
+    }
+
     pub(crate) fn stubbed(tool: &str, args: &[&str]) -> Option<anyhow::Result<()>> {
         STUB.with(|s| s.borrow().as_ref().map(|f| f(tool, args)))
     }

@@ -159,11 +159,18 @@ fn or_dash(s: &str) -> String {
 pub const SHARED_CONSOLES: &str = "/run/workbench-web/console.sock";
 
 /// Attaches the terminal to the VM's serial console until Ctrl-] is typed:
-/// the web UI's shared one when it runs, the serial socket otherwise.
+/// the node's shared one on a node, the web UI's when it runs, the serial
+/// socket otherwise.
 pub fn console(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
-    let (conn, shared) = match shared_console(Path::new(SHARED_CONSOLES), name)? {
-        Some(conn) => (conn, " (shared with the web UI)"),
+    let shared = match shared_console(Path::new(crate::fleet::NODE_CONSOLES), name)? {
+        Some(conn) => Some((conn, " (shared with the front)")),
+        // Until the modules render a fleet: the web UI of a host on its
+        // own shares them.
+        None => shared_console(Path::new(SHARED_CONSOLES), name)?.map(|conn| (conn, " (shared with the web UI)")),
+    };
+    let (conn, shared) = match shared {
+        Some(s) => s,
         None => (UnixStream::connect(c.serial()).with_context(|| format!("serial console of {name}"))?, ""),
     };
     let raw = RawTerminal::new();

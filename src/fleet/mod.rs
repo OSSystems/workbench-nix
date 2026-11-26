@@ -16,8 +16,13 @@
 //! A machine without these settings runs as a host on its own did before
 //! (until the modules render a fleet).
 
+pub mod client;
 pub mod contract;
+pub mod disk;
+mod http;
+pub mod node;
 pub mod registry;
+pub mod run;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
