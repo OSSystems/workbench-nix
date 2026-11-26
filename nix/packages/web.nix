@@ -31,6 +31,9 @@ let
     meta.license = lib.licenses.mit;
   };
 
+  # The workbench crate's build, which the UI sends the nodes too.
+  inherit (pkgs.callPackage ../package.nix { inherit vmkit; }) build;
+
   xterm = pkgs.fetchurl {
     url = "https://registry.npmjs.org/@xterm/xterm/-/xterm-5.5.0.tgz";
     hash = "sha256-vZVPpyGHIXAYjMXX6D6I2zyDyaGKTo0kwng9JkkfWdI=";
@@ -79,7 +82,8 @@ pkgs.rustPlatform.buildRustPackage (
       "--bin"
       "workbench-web"
     ];
-    passthru = { inherit site; };
+    env.WORKBENCH_BUILD = build;
+    passthru = { inherit site build; };
     meta = common.meta // {
       description = "workbench's web UI, a Leptos app behind single sign-on";
       mainProgram = "workbench-web";
