@@ -201,17 +201,27 @@ pub struct App {
 }
 
 /// A step of [`App::connect`] for a workspace at `host`, in pieces: text,
-/// then a command, then text, and so on.
+/// then a command, then text, and so on. A backtick never closed starts
+/// no command: it, and what follows it, is text.
 #[must_use]
 pub fn connect_step(step: &str, host: &str) -> Vec<(bool, String)> {
     let name = host.split('.').next().unwrap_or(host);
-    step.replace("@host@", host)
-        .replace("@name@", name)
-        .split('`')
+    let step = step.replace("@host@", host).replace("@name@", name);
+    let mut pieces: Vec<&str> = step.split('`').collect();
+    let unclosed = if pieces.len().is_multiple_of(2) { pieces.pop().map(|s| format!("`{s}")) } else { None };
+    let mut parts: Vec<(bool, String)> = pieces
+        .into_iter()
         .enumerate()
         .filter(|(_, s)| !s.is_empty())
         .map(|(i, s)| (i % 2 == 1, s.to_owned()))
-        .collect()
+        .collect();
+    if let Some(rest) = unclosed {
+        match parts.last_mut() {
+            Some((false, text)) => text.push_str(&rest),
+            _ => parts.push((false, rest)),
+        }
+    }
+    parts
 }
 
 /// A step of [`connect_step`]'s pieces as a box to copy from: the text
@@ -325,6 +335,12 @@ mod tests {
         );
         assert_eq!(connect_step("`ssh @host@`", "a.ws.test"), [(true, "ssh a.ws.test".into())]);
         assert_eq!(connect_step("`hc run --on @name@ x`", "a-b.ws.test"), [(true, "hc run --on a-b x".into())]);
+        assert_eq!(connect_step("Run `hc ls", "a.ws.test"), [(false, "Run `hc ls".into())], "never closed");
+        assert_eq!(
+            connect_step("`ssh @host@` or `hc", "a.ws.test"),
+            [(true, "ssh a.ws.test".into()), (false, " or `hc".into())]
+        );
+        assert_eq!(connect_step("`hc", "a.ws.test"), [(false, "`hc".into())]);
 
         let copyable = |step: &str| copyable_step(&connect_step(step, "a.ws.test"));
         assert_eq!(
@@ -335,6 +351,7 @@ mod tests {
         assert_eq!(copyable("Or `hc machine add @host@`, then `hc run --on @name@ x`."), None);
         assert_eq!(copyable("Run `x` as root."), None);
         assert_eq!(copyable("Ask an admin."), None);
+        assert_eq!(copyable("Run `hc ls"), None, "nothing to copy that the step never closed");
     }
 
     #[test]

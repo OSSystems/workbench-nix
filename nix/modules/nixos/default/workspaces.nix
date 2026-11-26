@@ -275,7 +275,7 @@ let
           For an app without a port: how people reach it from a computer
           set up on its Connect page, one step each, with `@host@` for
           `<workspace>.<domain>`, `@name@` for the workspace, and commands
-          between backticks.
+          between backticks, each closed in its step.
         '';
       };
       default = mkOption {
@@ -1005,6 +1005,15 @@ in
             assertion = builtins.match "[a-z][a-z0-9]{0,15}" id != null;
             message = "services.workbench.apps.${id}: an app's id is a lowercase letter, then lowercase letters and digits, at most 16.";
           }) cfg.apps
+          ++ lib.concatLists (
+            lib.mapAttrsToList (
+              id: app:
+              map (step: {
+                assertion = lib.mod (lib.length (lib.splitString "`" step) - 1) 2 == 0;
+                message = "services.workbench.apps.${id}.connect: the step \"${step}\" opens a command with a backtick it never closes.";
+              }) app.connect
+            ) cfg.apps
+          )
           ++ lib.mapAttrsToList (name: ws: {
             assertion = ws.appPort == null;
             message = "services.workbench.workspaces.${name}.appPort is gone: a workspace runs apps now, T3 Code at `${name}--t3code.${cfg.domain}`, which listens on services.workbench.apps.t3code.port.";
