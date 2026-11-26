@@ -4,18 +4,28 @@
 [cloud-hypervisor](https://www.cloudhypervisor.org/) VM each, an Ubuntu
 24.04 or NixOS guest the person owns, running the apps they open from
 outside it: in the browser, each at `https://<workspace>--<app>.<domain>`,
-or from their own terminal, over SSH through the host. A person may have
+or from their own terminal, over SSH through the front. A person may have
 several workspaces.
 
-The host owns everything around the apps: the VM, its disk, network
+workbench runs as a **fleet**: a **front**, which people reach and which
+decides, and **nodes**, which run the workspaces' VMs and keep their
+disks. One machine may be both: a host on its own is a front and a node.
+A node is plugged in by declaring it; a workspace lives on one node until
+an admin moves it. [docs/multi-node.md](docs/multi-node.md) has the whole
+design.
+
+The fleet owns everything around the apps: the VM, its disk, network
 isolation, secrets, tools and memory. The apps are what the person opens
 from outside the workspace; see [Apps](#apps).
 
 Built on [vmkit-nix](https://github.com/OSSystems/vmkit-nix): workspaces share a
-host with other vmkit controllers only through its guest networks and
+node with other vmkit controllers only through its guest networks and
 memory pools.
 
 ## Usage
+
+Every machine imports the module and the same `fleet`; the front enables
+`front`, each node `node`, with its own name.
 
 ```nix
 {
@@ -27,31 +37,135 @@ memory pools.
     };
   };
 
-  # in your NixOS configuration
-  imports = [ inputs.workbench.nixosModules.default ];
+  # in each machine's NixOS configuration
+  imports = [ inputs.workbench.nixosModules.default ./fleet.nix ];
+}
+```
 
-  services.workbench = {
-    enable = true;
+```nix
+# fleet.nix: the same on the front and every node
+{ pkgs, ... }:
+{
+  services.workbench.fleet = {
     domain = "ws.example.com";            # one wildcard certificate covers it
-    virtualHost = { forceSSL = true; useACMEHost = "ws.example.com"; };
-    network.externalInterface = "enp6s0";
+    front.wireguard = {
+      address = "10.231.0.1";
+      publicKey = "…";
+      endpoint = "front.example.com:51820";
+    };
+    nodes = {
+      a = { subnet = "10.232.0"; wireguard = { address = "10.231.0.10"; publicKey = "…"; }; };
+      b = { subnet = "10.232.1"; wireguard = { address = "10.231.0.11"; publicKey = "…"; }; };
+    };
     environment.ANTHROPIC_BASE_URL = "https://llm-proxy.example.com";
     allowedEndpoints = [ { address = "10.0.5.20"; port = 443; } ];  # LLM proxy
     extraPackages = [ pkgs.claude-code ];
 
     workspaces = {
-      alice = { owner = "alice"; ip = "10.232.0.10"; };
-      alice-scratch = { owner = "alice"; ip = "10.232.0.11"; sudo = false; diskGiB = 128; };
+      alice = { node = "a"; owner = "alice"; ip = "10.232.0.10"; };
+      alice-scratch = { node = "a"; owner = "alice"; ip = "10.232.0.11"; sudo = false; diskGiB = 128; };
       bob = {
+        node = "b";
         owner = "bob";
-        ip = "10.232.0.12";
-        environmentFile = "/run/secrets/bob-llm.env";
+        ip = "10.232.1.10";
+        environmentFile = "/run/secrets/bob-llm.env";   # a path on the front
       };
-      carol = { owner = "carol"; ip = "10.232.0.13"; os = "nixos"; };  # see NixOS below
+      carol = { node = "b"; owner = "carol"; ip = "10.232.1.11"; os = "nixos"; };  # see NixOS below
     };
   };
 }
 ```
+
+```nix
+# the front
+services.workbench.front = {
+  enable = true;
+  virtualHost = { forceSSL = true; useACMEHost = "ws.example.com"; };
+  wireguard.privateKeyFile = "/run/secrets/wireguard";
+  admins = [ "alice" ];
+  oidc = { … };                          # see Web UI below
+};
+
+# node b
+services.workbench.node = {
+  enable = true;
+  name = "b";
+  network.externalInterface = "enp6s0";
+  wireguard.privateKeyFile = "/run/secrets/wireguard";
+};
+```
+
+A host on its own has both roles and one node, which it reaches through
+sockets: no WireGuard, no keys.
+
+```nix
+services.workbench = {
+  fleet = {
+    domain = "ws.example.com";
+    nodes.a = { subnet = "10.232.0"; wireguard.address = "10.231.0.10"; };
+    workspaces.alice = { node = "a"; owner = "alice"; ip = "10.232.0.10"; };
+  };
+  front = { enable = true; virtualHost = { … }; oidc = { … }; };
+  node = { enable = true; name = "a"; network.externalInterface = "enp6s0"; };
+};
+```
+
+### The front and its nodes
+
+- **WireGuard, hub and spoke**, on `wg-workbench`, UDP port 51820, in
+  `fleet.wireguard.subnet` (`10.231.0.0/24` by default). The front peers
+  with every node on another machine and forwards nothing between them;
+  a node peers with the front only and keeps the tunnel up, so the front
+  needs no node's endpoint. The private keys are files the machines are
+  given, such as sops secrets, readable by `systemd-network`; the public
+  keys are in the fleet (`wg genkey | tee key | wg pubkey`).
+- **The front decides.** Its registry, `/var/lib/workbench/registry`, says
+  who owns each workspace and which node it is on; it keeps the secrets
+  directories, the SSH CAs and host keys, the devices and the quotas.
+  `workbench-front` answers a node's start, from the node's WireGuard
+  address only and only for that node's workspaces, with what the start
+  needs: the secrets, a host key signed for `<workspace>.<domain>` and the
+  user CA.
+- **A node runs.** `workbench-node`, which answers the front's WireGuard
+  address only, makes, starts, stops and deletes its workspaces and
+  streams their disks. A node keeps the disks, the VM users, the taps and
+  the seeds, and holds a workspace's secrets only in its runtime
+  directory while it runs. A start the front refuses, or one while the
+  front can't be reached, is tried again every 10 seconds.
+- **One build.** The front and the nodes are deployed together: each
+  request between them carries the package's build, and one of another
+  build is refused.
+- **Placement.** A workspace made at run time goes to the node an admin
+  picks, or else to the open node with the most free memory, and stays
+  there. Admins close and reopen a node, and move a workspace made at run
+  time: `workbench move <workspace> <node>` on the front, or the host page.
+  A declared workspace moves when its `node` and `ip` change in Nix: the
+  front moves its disk at the next deploy.
+
+### From one host to a front and a node
+
+1. The host becomes node `a`: its `network.subnet` is the fleet's
+   `nodes.a.subnet`, its workspaces get `node = "a"`, and the options move
+   as [docs/multi-node.md](docs/multi-node.md#the-nix-modules) lists.
+   Its VMs, disks and seeds stay.
+2. A new machine becomes the front. It takes from the host, once, the SSH
+   CAs and host keys (`/var/lib/workbench/ssh`), the quotas
+   (`/var/lib/workbench/self-service/quotas`), the devices
+   (`/var/lib/workbench-web/devices.json`) and the secrets directories,
+   whose sops secrets are encrypted for it; and the configs made at run
+   time, as records on `a`: `workbench front import a <their copy>`.
+3. `<domain>` and `*.<domain>` point at the front.
+4. Both are deployed. A deploy restarts no VM: each workspace asks the
+   front at its next start, whenever that is, and is refused until the
+   front has its record.
+
+A host that stays on its own moves its options, `fleet`, and `front` and
+`node` on the same machine, and deploys. At that deploy,
+`workbench-front-setup` makes a record of each workspace it made at run
+time, from its config in `/var/lib/workbench/configs`, on its one node:
+their owners keep their list rows, apps and SSH, and every workspace asks
+the front at its next start. Its CAs, host keys, quotas, devices, secrets
+directories, seeds and stop markers stay where they are.
 
 ## How a workspace runs
 
@@ -64,12 +178,14 @@ memory pools.
   Stopping a workspace presses its ACPI power button and waits for the guest
   to shut down; `workbench stop` keeps it stopped across host reboots until
   `workbench start`.
-- **Declared in Nix, no reconciler.** Each workspace is rendered to
-  `/etc/workbench/<name>.json` plus an instance of the template unit.
-  Configs are also looked up in `/var/lib/workbench/configs`, which
-  `/etc` overrides, for a later self-service mode. Removing a workspace from
-  the configuration stops its VM and **keeps its disk** in
-  `/var/lib/workbench/<name>`; only `workbench destroy` deletes it.
+- **Declared in Nix, no reconciler.** Each workspace is rendered, on its
+  node, to `/etc/workbench/<name>.json` plus an instance of the template
+  unit, and on the front to its record, `/etc/workbench-front/<name>.json`.
+  The configs of workspaces made at run time are in
+  `/var/lib/workbench/configs`, which `/etc` overrides. Removing a
+  workspace from the configuration stops its VM and **keeps its disk** in
+  `/var/lib/workbench/<name>` on its node; only `workbench destroy`
+  deletes it.
 - **A guest the owner owns.** The OS image (`image` for Ubuntu,
   `nixos.image` for NixOS) is converted into a persistent raw disk on first
   start and grown to `diskGiB`; the guest boots with the cloud-hypervisor
@@ -82,48 +198,63 @@ memory pools.
   the unit's private mount namespace and served over virtiofs; it never sees
   the rest of the host store.
 - **Secrets stay out of the store.** `secretsDir` (default
-  `/var/lib/workbench-secrets/<name>`, fill it with sops-nix or similar)
-  is copied read-only to `/run/workspace/secrets` at every start. Its
+  `/var/lib/workbench-secrets/<name>` on the front, fill it with sops-nix
+  or similar) is given to the node at every start and copied read-only to
+  `/run/workspace/secrets`; nothing of it reaches the node's disk. Its
   `environment` file, followed by the global and per-workspace
-  `environmentFile`, is the apps' secret environment; the
-  `environment` options are the non-secret one.
-- **Network.** Each workspace has its own tap and a static `/32` route
-  (`network.subnet`, default `10.232.0`; the host is `.1`). Guests reach the
-  internet, but not the host, private ranges or each other, except for the
-  global and per-workspace `allowedEndpoints`; a guest can only send from
-  its own address. nginx on the host proxies `<workspace>--<app>.<domain>`
-  to the app's port in the guest, with websockets and day-long timeouts.
-- **SSH by certificate.** The host has two SSH certificate authorities in
+  `environmentFile`, paths on the front, is the apps' secret environment;
+  the `environment` options are the non-secret one.
+- **Network.** Each workspace has its own tap and a static `/32` route in
+  its node's subnet (`fleet.nodes.<node>.subnet`; the node is `.1`).
+  Declared workspaces take `.2` to `.127`, those made at run time `.128`
+  on. Guests reach the internet, but not their node, private ranges, the
+  WireGuard tunnel or each other, except for the global and per-workspace
+  `allowedEndpoints`; a guest can only send from its own address. nginx on
+  the front proxies `<workspace>--<app>.<domain>` to the app's port in the
+  guest, through WireGuard for a node on another machine, with websockets
+  and day-long timeouts.
+- **SSH by certificate.** The front has two SSH certificate authorities in
   `/var/lib/workbench/ssh`, made at its first boot. One signs each
-  workspace's host key, which the host keeps and shares with the guest at
-  every start, for `<workspace>.<domain>`; the guest's sshd trusts keys
-  the other signs, for the user they name. The web UI signs people's keys
-  with it; see [From a terminal](#from-a-terminal). Only the host reaches a
-  guest's port 22.
-- **Memory.** Workspaces boot with `memory.bootMiB` and grow through
-  virtio-mem up to `memory.maxGiB` under pressure, with free page reporting.
-  `auto`, there or in one workspace's `memory.maxGiB`, is the host's
-  memory, read at every start; growth still stops short of the host's
-  `memory.reservePercent`, so a ceiling in GiB is what keeps one workspace
-  from taking what the others would grow into. Where
-  `web.selfService.maxMemoryGiB` is `auto`, workspaces made at run time
+  workspace's host key, which the front keeps and gives the node at every
+  start, for `<workspace>.<domain>`; the guest's sshd trusts keys the
+  other signs, for the user they name. The web UI signs people's keys
+  with it; see [From a terminal](#from-a-terminal). Only the front and the
+  guest's node reach a guest's port 22.
+- **Memory.** Workspaces boot with `fleet.memory.bootMiB` and grow
+  through virtio-mem up to `fleet.memory.maxGiB` under pressure, with free
+  page reporting. `auto`, there or in one workspace's `memory.maxGiB`, is
+  its node's memory, read at every start; growth still stops short of the
+  node's `memory.reservePercent`, so a ceiling in GiB is what keeps one
+  workspace from taking what the others would grow into. Where
+  `front.selfService.maxMemoryGiB` is `auto`, workspaces made at run time
   may be `auto` too, and new ones are unless their owner picks a size.
   They are a `first` pool in vmkit's `services.vmkit.memory.pools`: on a
-  host with `yielding` pools, those only boot into and grow into memory
+  node with `yielding` pools, those only boot into and grow into memory
   workspaces leave, except for what each is guaranteed.
 
-Day to day, on the host:
+Day to day, on a workspace's node:
 
 ```sh
 sudo workbench status
-sudo workbench restart alice        # with the host's apps and packages now
+sudo workbench restart alice        # with the fleet's apps and packages now
 sudo workbench stop alice           # stays stopped, also across reboots
 sudo workbench start alice
 sudo workbench console alice        # serial console, Ctrl-] quits
-sudo workbench destroy alice        # asks for the name, then deletes the disk
+sudo workbench destroy alice        # a declared one: asks for the name, then deletes the disk
 ```
 
-Only x86_64 hosts are supported for now.
+A workspace made at run time is the front's: on its node, `workbench
+destroy` refuses it and says to run it on the front. On the front:
+
+```sh
+sudo workbench destroy alice-dev    # asks for the name, then deletes it: on its node, its
+                                    # disk, VM user, tap and seed; here, its record, secrets
+                                    # and host key; refused while it moves
+sudo workbench move alice-dev b     # a workspace made at run time, to node b
+sudo workbench forget alice-dev     # one whose node is lost for good
+```
+
+Only x86_64 machines are supported for now.
 
 ## Guest operating systems
 
@@ -217,7 +348,8 @@ The guest fetches its inputs and substitutes or builds its packages itself,
 over the internet; its memory grows for the build like for any other load.
 A rebuilt system is the next boot's too; `/etc/nixos` is never written
 again. systemd-boot keeps the previous generations: to start one after a
-bad rebuild, attach `workbench console <name>` on the host and restart the
+bad rebuild, attach `workbench console <name>` on its node, or open its
+console in the web UI, and restart the
 workspace; the menu waits `boot.loader.timeout`, one second by default.
 
 **What `nixosModules.guest` does**, at every boot:
@@ -299,15 +431,15 @@ keeps working.
 
 ## Web UI
 
-`services.workbench.web` serves a web UI at `https://<domain>` and puts
-single sign-on in front of every workspace: whatever the app does about
-accounts, only the workspace's owner and the admins reach it. People see
-and control their own workspaces: open their apps, set their computers up to
-reach them from a terminal, start, stop, restart and the serial console.
-Admins see all of them and the host's memory.
+The front serves a web UI at `https://<domain>` and puts single sign-on in
+front of every workspace: whatever the app does about accounts, only the
+workspace's owner and the admins reach it. People see and control their
+own workspaces: open their apps, set their computers up to reach them from
+a terminal, start, stop, restart and the serial console. Admins see all of
+them and every node's memory.
 
 ```nix
-services.workbench.web = {
+services.workbench.front = {
   enable = true;
   admins = [ "alice" ];
   oidc = {
@@ -328,11 +460,11 @@ well as `<domain>`, given through `virtualHost` (such as `useACMEHost`).
 
 ### Workspaces people make themselves
 
-With `web.selfService`, members of its groups make their own workspaces in
+With `front.selfService`, members of its groups make their own workspaces in
 the UI, within a quota admins change there, and destroy them:
 
 ```nix
-services.workbench.web = {
+services.workbench.front = {
   adminGroups = [ "workbench-admins" ];
   selfService = {
     enable = true;
@@ -348,27 +480,30 @@ services.workbench.web = {
 ```
 
 The UI stays unprivileged: it writes the request, and
-`workbench-create@<ws>.service` makes the workspace as root, with its VM
-user as a userdb record and its tap as systemd-networkd files.
+`workbench-create@<ws>.service` on the front places the workspace and has
+its node make it as root, with its VM user as a userdb record and its tap
+as systemd-networkd files.
 
 The UI is `workbench-web`, a Leptos app in Rust: the server renders the
 pages and the browser hydrates them with the same components compiled to
-WebAssembly. It runs as its own user, reaches the VMs through sockets its
-group may use and starts, stops and restarts workspaces through polkit.
-[docs/web-ui.md](docs/web-ui.md) has the whole design.
+WebAssembly. It runs on the front as its own user, on the registry and
+the nodes' APIs, which start, stop and restart the VMs and share their
+consoles; polkit lets it start only the front's units that make, change,
+move and destroy workspaces. [docs/web-ui.md](docs/web-ui.md) has the
+whole design.
 
 ## Apps
 
 An app is what runs in a workspace and is opened from outside it: in the
 browser, at `https://<workspace>--<app>.<domain>`, an origin of its own,
 or, for an app without an address, from a terminal on the person's own
-computer, over SSH through the host. The host offers them,
-`services.workbench.apps`; each workspace has the ones its `apps` names,
+computer, over SSH through the front. The fleet offers them,
+`services.workbench.fleet.apps`; each workspace has the ones its `apps` names,
 those whose `default` is true unless it says otherwise, and may have none.
 `https://<workspace>.<domain>` leads to the workspace's panel in the web UI.
 
 ```nix
-services.workbench.apps.notes = {
+services.workbench.fleet.apps.notes = {
   name = "Notes";
   port = 8080;
   packages = [ pkgs.mynotes ];
@@ -394,7 +529,7 @@ comes with its next restart, and the web UI says what waits for it.
 ### T3 Code
 
 [T3 Code](https://github.com/pingdotgg/t3code) is the app `t3code` when
-`package` is set, by default to the `t3code-server` of
+`fleet.package` is set, by default to the `t3code-server` of
 [t3code-nix](https://github.com/OSSystems/t3code-nix), T3 Code with
 OSSystems' patches, with the agents of
 [llm-agents.nix](https://github.com/numtide/llm-agents.nix), where
@@ -420,7 +555,7 @@ workspaces opt into, from llm-agents.nix too:
 | `herdrcore`, Herdr app | herdr-core's core, which `hc server start` starts as a user service | herdr-app: Add machine, `<workspace>.<domain>`; or `hc machine add <workspace>.<domain>` |
 
 ```nix
-services.workbench.workspaces.alice.apps = [ "t3code" "herdr" "herdrcore" ];
+services.workbench.fleet.workspaces.alice.apps = [ "t3code" "herdr" "herdrcore" ];
 ```
 
 Their panes and terminals have the workspace's environment and secrets:
@@ -428,7 +563,7 @@ Herdr's server has them as any app does, and Herdr app imports them into
 the owner's user manager before it starts the core, whose terminals are
 user services. Both find themselves over SSH on the workspace's `PATH`,
 and `herdr update` and `hc update` say that a newer one comes with the
-host. `herdr.package` and `herdrCore.package` choose the versions.
+host. `fleet.herdr.package` and `fleet.herdrCore.package` choose the versions.
 
 ### From a terminal
 
@@ -479,7 +614,7 @@ cargo test -p workbench-web --features ssr
 nix build .#web .#web.site   # the UI's server, and its WebAssembly and assets
 nix build .#workbench-connect .#workbench-connect.aarch64-linux   # the client, static
 (cd connect && cargo test)   # the client, a crate of its own
-nix flake check   # rustfmt, clippy and the tests, the module evaluations, and the VM test
+nix flake check   # rustfmt, clippy and the tests, the module evaluations, and the VM tests
 nix fmt -- $(git ls-files '*.nix')
 ```
 
@@ -497,12 +632,19 @@ requests, is described in [docs/contracts.md](docs/contracts.md).
 `workbench-connect`, in `connect/`, has a `Cargo.lock` of its own and no
 dependency on workbench's crates or vmkit. Its aarch64 build cross-compiles
 Rust's standard library for musl, which no binary cache has: the first
-build of the host takes a while longer.
+build of the front takes a while longer.
 
 `checks.guest` evaluates the system a new NixOS workspace writes and
-rebuilds. `checks.workspaces` boots two workspaces in a NixOS VM test, one
-Ubuntu and one NixOS, each with T3 Code and herdr's two runtimes; it needs
-nested virtualization on the machine that builds it (`kvm_amd`/`kvm_intel`
-with `nested=1`). The test runs the default
+rebuilds. `checks.fleet` and `checks.shared-host` evaluate what the
+modules render for a front, a node and both, and their assertions.
+`checks.workspaces` boots two workspaces in a NixOS VM test on a host on
+its own, one Ubuntu and one NixOS, each with T3 Code and herdr's two
+runtimes; `checks.multi-node` boots a front and two nodes over
+WireGuard, makes a workspace and moves it between them, and has a client
+use the web UI across them: an app and the SSH tunnel to a node's guest,
+an admin's node pick, Close and Move, and a node that doesn't answer.
+Both need nested
+virtualization on the machine that builds them (`kvm_amd`/`kvm_intel`
+with `nested=1`). `checks.workspaces` runs the default
 app, T3 Code, from t3code-nix, which OSSystems' Garnix builds and caches:
 a machine without that cache among its substituters builds it.
