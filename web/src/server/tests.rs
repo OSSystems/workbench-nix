@@ -608,10 +608,11 @@ async fn admins_change_a_workspaces_memory() {
     let (units, calls) = (fake.units.clone(), fake.controlled.clone());
     let s = state(fake);
     let paths = Paths(dir.path().to_owned());
-    let page = r#"href="/w/alice-dev/memory""#;
+    let (page, dialog) = (r#"href="/w/alice-dev/memory""#, r#"<dialog id="memory-alice-dev""#);
 
     let (_, _, panel) = send(ui(&s), with_groups(get("/?w=alice-dev", "alice"), "workbench")).await;
     assert!(panel.contains("8 GiB") && !panel.contains(page), "the owner sees it, not the way to change it");
+    assert!(!panel.contains(dialog), "{panel}");
     let (code, _, _) = send(ui(&s), with_groups(get("/w/alice-dev/memory", "alice"), "workbench")).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
     let form = "ws=alice-dev&memory_gib=16";
@@ -619,7 +620,8 @@ async fn admins_change_a_workspaces_memory() {
     assert_eq!(code, StatusCode::FORBIDDEN, "for admins");
 
     let (_, _, panel) = send(ui(&s), get("/?w=alice-dev", "carol")).await;
-    assert!(panel.contains(page), "{panel}");
+    assert!(panel.contains(page) && panel.contains("Edit…"), "{panel}");
+    assert!(panel.contains(dialog) && panel.contains(r#"value="8""#), "in place, as the apps are: {panel}");
     let (code, _, body) = send(ui(&s), get("/w/alice-dev/memory", "carol")).await;
     assert_eq!(code, StatusCode::OK);
     assert!(body.contains("Memory of") && body.contains(r#"value="8""#) && body.contains("Save and restart"), "{body}");
