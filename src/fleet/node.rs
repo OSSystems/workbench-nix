@@ -364,8 +364,8 @@ impl HostNode {
         let paths = t.paths();
         let found = config::load(&self.dirs(), name);
         if found.as_ref().is_ok_and(|c| c.self_service) {
-            // It takes the lock itself, as on a host on its own: a lock
-            // taken twice in one process waits for good.
+            // It takes the lock itself: a lock taken twice in one process
+            // waits for good.
             return self_service::take_away(&paths, name).await;
         }
         let _lock = paths.lock()?;
@@ -548,7 +548,7 @@ pub async fn serve(settings: NodeSettings) -> anyhow::Result<()> {
         }
     };
     let local = consoles.serve_local(Path::new(super::NODE_CONSOLES), "root on the node", move |name| {
-        Ok((config::load(&dirs, name)?.serial(), None))
+        Ok(config::load(&dirs, name)?.serial())
     });
     tokio::select! {
         r = tcp => r.context("the API"),

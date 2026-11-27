@@ -1,7 +1,7 @@
 //! Each VM's serial console, shared: one connection to its socket, what it
 //! printed last, and every viewer, who all type into the same console. A
-//! node shares its workspaces' consoles with the front, and the web UI of
-//! a host on its own with the browser; both with `workbench console`.
+//! node shares its workspaces' consoles with the front, which relays them
+//! to the browser, and with `workbench console` on the node.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,35 +24,24 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Who owns a workspace now, by its name; empty for no one.
-pub type OwnerOf = Arc<dyn Fn(&str) -> String + Send + Sync>;
-
-/// A workspace's serial socket, and its owner where consoles are owners'.
-type Serial = dyn Fn(&str) -> anyhow::Result<(PathBuf, Option<String>)> + Sync;
+/// A workspace's serial socket, by its name.
+type Serial = dyn Fn(&str) -> anyhow::Result<PathBuf> + Sync;
 
 /// The shared consoles, by workspace.
 #[derive(Default)]
 pub struct Consoles {
     m: Mutex<HashMap<String, Arc<Shared>>>,
-    /// Read again whenever a console reconnects: a VM of the name may be
-    /// another owner's workspace by then.
-    owner_of: Option<OwnerOf>,
 }
 
 /// One VM's console.
 pub struct Shared {
     socket: PathBuf,
-    name: String,
-    owner_of: Option<OwnerOf>,
     inner: Mutex<Inner>,
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
 }
 
 #[derive(Default)]
 struct Inner {
-    /// Whose workspace it was when last asked: another owner's, after a
-    /// workspace of the name was destroyed and made again, gets none of it.
-    owner: String,
     kept: Vec<u8>,
     viewers: HashMap<u64, ViewerChan>,
     next: u64,
@@ -83,31 +72,17 @@ pub struct Attached {
 }
 
 impl Consoles {
-    /// Consoles that are their workspaces' owners': a console another owner
-    /// had is forgotten, and its viewers let go.
-    #[must_use]
-    pub fn of_owners(owner_of: OwnerOf) -> Self {
-        Consoles { m: Mutex::default(), owner_of: Some(owner_of) }
-    }
-
     /// A workspace's console on `socket`, connecting it the first time.
     pub fn get(&self, name: &str, socket: &Path) -> Arc<Shared> {
         let mut m = lock(&self.m);
         if let Some(shared) = m.get(name).filter(|s| s.socket == socket) {
             return shared.clone();
         }
-        let shared = Arc::new(Shared::new(socket.to_owned(), name, self.owner_of.clone()));
+        let shared = Arc::new(Shared::new(socket.to_owned()));
         if let Some(old) = m.insert(name.to_owned(), shared.clone()) {
             old.close();
         }
         tokio::spawn(shared.clone().run());
-        shared
-    }
-
-    /// A workspace's console, `owner`'s now.
-    pub fn get_owned(&self, name: &str, socket: &Path, owner: &str) -> Arc<Shared> {
-        let shared = self.get(name, socket);
-        shared.owned_by(owner);
         shared
     }
 
@@ -122,12 +97,11 @@ impl Consoles {
     /// Shares the consoles on a Unix socket, for `workbench console`: it
     /// sends the workspace's name and a newline, gets `OK` or `ERR <why>`
     /// back, and then the connection is the console, its viewer `viewer`
-    /// to the others. `serial` finds a workspace's serial socket and its
-    /// owner, if consoles are owners'. Only root and this process's user
-    /// reach it.
+    /// to the others. `serial` finds a workspace's serial socket. Only root
+    /// reaches it.
     pub async fn serve_local<F>(self: Arc<Self>, path: &Path, viewer: &'static str, serial: F) -> anyhow::Result<()>
     where
-        F: Fn(&str) -> anyhow::Result<(PathBuf, Option<String>)> + Send + Sync + 'static,
+        F: Fn(&str) -> anyhow::Result<PathBuf> + Send + Sync + 'static,
     {
         let _ = std::fs::remove_file(path);
         if let Some(dir) = path.parent() {
@@ -161,8 +135,7 @@ impl Consoles {
             return;
         }
         let shared = match serial(&name) {
-            Ok((socket, None)) => self.get(&name, &socket),
-            Ok((socket, Some(owner))) => self.get_owned(&name, &socket, &owner),
+            Ok(socket) => self.get(&name, &socket),
             Err(e) => {
                 let _ = w.write_all(format!("ERR {e:#}\n").as_bytes()).await;
                 return;
@@ -198,25 +171,8 @@ impl Consoles {
 }
 
 impl Shared {
-    fn new(socket: PathBuf, name: &str, owner_of: Option<OwnerOf>) -> Self {
-        Shared {
-            socket,
-            name: name.to_owned(),
-            owner_of,
-            inner: Mutex::default(),
-            writer: tokio::sync::Mutex::default(),
-        }
-    }
-
-    /// Makes it `owner`'s: a console another owner had is forgotten, and
-    /// its viewers let go.
-    pub fn owned_by(&self, owner: &str) {
-        let mut inner = lock(&self.inner);
-        if inner.owner != owner {
-            owner.clone_into(&mut inner.owner);
-            inner.kept.clear();
-            inner.viewers.clear();
-        }
+    fn new(socket: PathBuf) -> Self {
+        Shared { socket, inner: Mutex::default(), writer: tokio::sync::Mutex::default() }
     }
 
     /// Lets its viewers go and stops reconnecting.
@@ -235,10 +191,6 @@ impl Shared {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             };
-            // A VM of the name may be another workspace's now.
-            if let Some(owner_of) = &self.owner_of {
-                self.owned_by(&owner_of(&self.name));
-            }
             let (mut r, w) = conn.into_split();
             *self.writer.lock().await = Some(w);
             lock(&self.inner).connected = true;
@@ -379,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn fans_out_and_keeps_the_tail() {
-        let shared = Shared::new("/nonexistent".into(), "alice", None);
+        let shared = Shared::new("/nonexistent".into());
         shared.output(b"early ");
         let mut a = shared.attach("alice");
         assert_eq!(a.kept, b"early ");
@@ -420,35 +372,10 @@ mod tests {
         assert!(got.is_empty(), "a viewer let go typed into the VM");
     }
 
-    /// A workspace of the name made again for someone else shows them
-    /// nothing of the one before, and lets its viewers go.
-    #[tokio::test]
-    async fn another_owner_starts_afresh() {
-        let shared = Shared::new("/nonexistent".into(), "alice", None);
-        shared.owned_by("alice");
-        shared.output(b"alice's secrets");
-        let mut a = shared.attach("alice");
-        shared.owned_by("alice");
-        assert_eq!(lock(&shared.inner).kept, b"alice's secrets", "the same owner keeps it");
-        shared.owned_by("bob");
-        assert!(lock(&shared.inner).kept.is_empty());
-        while a.status.try_recv().is_ok() {}
-        assert!(a.out.recv().await.is_none(), "alice's viewer is let go");
-        let (ours, mut vm) = UnixStream::pair().unwrap();
-        *shared.writer.lock().await = Some(ours.into_split().1);
-        shared.input(a.id, b"rm -rf ~\n").await;
-        let b = shared.attach("bob");
-        assert!(b.kept.is_empty());
-        shared.input(b.id, b"ls\n").await;
-        let mut got = [0; 3];
-        vm.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"ls\n", "only bob types into bob's VM");
-    }
-
     /// A viewer that stops reading is dropped rather than slowing the rest.
     #[tokio::test]
     async fn drops_a_stuck_viewer() {
-        let shared = Shared::new("/nonexistent".into(), "alice", None);
+        let shared = Shared::new("/nonexistent".into());
         let _stuck = shared.attach("stuck");
         let mut live = shared.attach("live");
         for _ in 0..300 {

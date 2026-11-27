@@ -1,14 +1,15 @@
-//! Workspaces made at run time: `workbench self-service create` makes one
-//! from a request the web UI wrote, `apps` changes its apps, `destroy`
-//! takes it away, `setup` puts back at boot what `/run` lost and brings
-//! every config up to the host's template, and `reconcile` stops the
-//! workspaces of owners who left. They run as root; the web UI only writes
-//! requests and starts their units.
+//! Workspaces made at run time. On a node, one is what the Nix module
+//! would declare: a config in `<stateDir>/configs`, the VM's user, as a
+//! userdb record, its tap, as systemd-networkd files, and for Ubuntu its
+//! cloud-init seed. The node's [`Template`] holds everything that isn't
+//! the workspace's own, and the front's record the rest: `build` makes
+//! them, `take_away` deletes them, and [`setup`], at boot and with every
+//! new template, puts back what `/run` lost and brings every config up to
+//! the template.
 //!
-//! A workspace made at run time is what the Nix module would declare: a
-//! config in `<stateDir>/configs`, the VM's user, as a userdb record, its
-//! tap, as systemd-networkd files, and for Ubuntu its cloud-init seed. The
-//! host's [`Template`] holds everything that isn't the workspace's own.
+//! On the front, the web UI writes requests, which the front's units read
+//! as root, and reads the outcomes they write, where [`Paths`] says; a new
+//! workspace is checked against the quotas and the host's commands.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -23,17 +24,14 @@ use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use vmkit::hostutil::{self, Account};
-use workbench_model::apps::{AppInfo, BootApp};
+use workbench_model::apps::BootApp;
 use workbench_model::fleet::{NodeRefusal, Record};
-use workbench_model::memory::Ceiling;
-use workbench_model::self_service::{AppsRequest, Limits, MemoryRequest, Outcome, Request, quota_of};
-use workbench_model::{is_user_name, is_workspace_name};
+use workbench_model::is_user_name;
+use workbench_model::self_service::{Limits, Outcome, Request};
 
 use crate::config::{self, Config};
 use crate::{launch, state};
 
-/// The host's template, which the Nix module writes.
-pub const TEMPLATE: &str = "/etc/workbench-self-service.json";
 /// Where the VMs' user records go; `/run` is empty at boot, so `setup` puts
 /// them back.
 pub const USERDB: &str = "/run/userdb";
@@ -84,18 +82,11 @@ pub struct Template {
     pub default_apps: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub environment_files: Vec<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub socket_group: String,
     /// By guest system: the image a new disk is made from.
     pub images: BTreeMap<String, Image>,
     /// For Ubuntu seeds.
     pub mkfs_vfat: String,
     pub mcopy: String,
-    /// Prints a workspace's secret environment for its owner.
-    pub environment_command: String,
-    /// Exits 0 while an owner may keep their workspaces; empty asks no one.
-    #[serde(default)]
-    pub owner_command: String,
     /// The host's SSH certificate authorities.
     #[serde(default)]
     pub ssh: config::SshCa,
@@ -114,25 +105,11 @@ pub struct Image {
 }
 
 impl Template {
-    /// Reads the template; its limits offer its apps, and know the host's
-    /// memory when their most is `auto`.
+    /// Reads the template. Of its limits, a node reads the boot memory
+    /// only: what people may make is the front's.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = hostutil::read_bounded(path, MAX_FILE).with_context(|| path.display().to_string())?;
-        let mut t: Template = serde_json::from_slice(&raw).with_context(|| path.display().to_string())?;
-        if t.limits.memory_auto() {
-            t.limits.host_memory_gib = config::host_mem_mib()? / 1024;
-        }
-        t.limits.apps = t
-            .apps
-            .iter()
-            .map(|a| AppInfo {
-                id: a.id.clone(),
-                name: a.name.clone(),
-                terminal: a.port.is_none(),
-                default: t.default_apps.contains(&a.id),
-            })
-            .collect();
-        Ok(t)
+        serde_json::from_slice(&raw).with_context(|| path.display().to_string())
     }
 
     /// The offered apps `ids` name, in that order.
@@ -295,12 +272,6 @@ pub fn made(paths: &Paths) -> Vec<Config> {
     every_config(&[paths.configs()]).0.into_iter().filter(|c| c.self_service).collect()
 }
 
-/// How many workspaces made at run time `owner` has.
-#[must_use]
-pub fn owned(made: &[Config], owner: &str) -> u32 {
-    u32::try_from(made.iter().filter(|c| c.owner == owner).count()).unwrap_or(u32::MAX)
-}
-
 /// The addresses of workspaces made at run time: the upper half of the
 /// subnet, which the Nix module keeps declared workspaces out of.
 pub const MADE_IPS: std::ops::RangeInclusive<u8> = 128..=254;
@@ -375,7 +346,7 @@ fn unchecked_config_of(t: &Template, r: &Request, ip: &str, uid: u32) -> anyhow:
         secrets_dir: format!("{}/{}", t.secrets_root, r.name),
         control_port: t.control_port,
         agent_port: t.agent_port,
-        socket_group: t.socket_group.clone(),
+        socket_group: String::new(),
         self_service: true,
         uid,
         ssh: t.ssh.clone(),
@@ -592,11 +563,6 @@ impl Owner {
             _ => Owner::Unknown,
         }
     }
-}
-
-/// Asks the owner command about `owner`.
-async fn owner_status(t: &Template, owner: &str) -> Owner {
-    owner_said(&t.owner_command, owner).await
 }
 
 /// Asks an owner command about `owner`.
@@ -826,15 +792,6 @@ async fn write_seed(t: &Template, user_data: &str, c: &Config, at: &Path) -> any
     made
 }
 
-/// `workbench self-service create <ws>`: makes the workspace the web UI
-/// asked for, and writes how it went for the UI to say.
-pub async fn create(dirs: &[PathBuf], t: &Template, name: &str) -> anyhow::Result<()> {
-    ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
-    let paths = t.paths();
-    let failed = "The host couldn't make it";
-    reporting(&paths.outcome(name), Some(&paths.request(name)), failed, false, make(dirs, t, &paths, name)).await
-}
-
 /// Runs what a request asks for, and writes how it went for the web UI:
 /// always, or `only_errors`; then the request goes.
 pub(crate) async fn reporting(
@@ -933,100 +890,12 @@ pub(crate) fn outcome_of(result: &anyhow::Result<()>, failed: &str) -> Outcome {
     }
 }
 
-/// `workbench self-service apps <ws>`: gives a workspace made at run time
-/// the apps the web UI asked for, in its config. The VM boots with them at
-/// its next start; whether that is now is the UI's to ask.
-pub async fn apps(t: &Template, name: &str) -> anyhow::Result<()> {
-    ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
-    let paths = t.paths();
-    let (outcome, request) = (paths.apps_outcome(name), paths.apps_request(name));
-    reporting(&outcome, Some(&request), "The host couldn't change them", false, change_apps(t, &paths, name)).await
-}
-
-async fn change_apps(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
-    let raw = read_theirs(&paths.apps_request(name)).context("the request")?;
-    let r: AppsRequest = serde_json::from_slice(&raw).context("the request")?;
-    t.limits.check_apps(&r.apps).map_err(refuse)?;
-    let _lock = paths.lock()?;
-    finish_pending(paths).await?;
-    let Some(c) = config::load(&[paths.configs()], name).ok().filter(|c| c.self_service) else {
-        bail!(Refused(format!("{name} wasn't made at run time: its apps are in the Nix configuration.")));
-    };
-    let mut next = c;
-    next.apps = t.apps_of(&r.apps)?;
-    next.validate()?;
-    write_config(paths, &next)
-}
-
-/// `workbench self-service memory <ws>`: gives a workspace made at run time
-/// the most memory an admin asked for in the web UI, in its config. The VM
-/// grows to it after its next start; whether that is now is the UI's to
-/// ask.
-pub async fn memory(t: &Template, name: &str) -> anyhow::Result<()> {
-    ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
-    let paths = t.paths();
-    let (outcome, request) = (paths.memory_outcome(name), paths.memory_request(name));
-    reporting(&outcome, Some(&request), "The host couldn't change it", false, change_memory(t, &paths, name)).await
-}
-
-async fn change_memory(t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
-    let raw = read_theirs(&paths.memory_request(name)).context("the request")?;
-    let r: MemoryRequest = serde_json::from_slice(&raw).context("the request")?;
-    let _lock = paths.lock()?;
-    finish_pending(paths).await?;
-    let Some(c) = config::load(&[paths.configs()], name).ok().filter(|c| c.self_service) else {
-        bail!(Refused(format!("{name} wasn't made at run time: its memory is in the Nix configuration.")));
-    };
-    write_config(paths, &with_memory(t, &c, r.max_memory)?)
-}
-
-/// A workspace's config growing to `max` GiB at most, or `auto`, within
-/// the template's limits. It boots with no more than that.
-pub(crate) fn with_memory(t: &Template, c: &Config, max: Ceiling) -> anyhow::Result<Config> {
-    t.limits.check_memory(max).map_err(refuse)?;
-    let mut next = c.clone();
-    next.max_mem = max.map(|gib| gib * 1024);
-    next.boot_mem_mib = next.boot_mem_mib.min(next.max_mem_mib());
-    next.validate()?;
-    Ok(next)
-}
-
 /// Writes a workspace's config where the host reads it after the Nix ones.
 pub(crate) fn write_config(paths: &Paths, c: &Config) -> anyhow::Result<()> {
     fs::create_dir_all(paths.configs())?;
     let file = paths.configs().join(format!("{}.json", c.name));
     hostutil::atomic_write(&file, &serde_json::to_vec_pretty(c)?, 0o644)?;
     Ok(())
-}
-
-async fn make(dirs: &[PathBuf], t: &Template, paths: &Paths, name: &str) -> anyhow::Result<()> {
-    let r = read_request(paths, name)?;
-    r.check(&t.limits).map_err(refuse)?;
-
-    let lock = paths.lock()?;
-    finish_pending(paths).await?;
-
-    // Fails closed: a config that doesn't load may hold any address.
-    let (all, unreadable) = every_config(dirs);
-    ensure!(unreadable.is_empty(), "configs the host can't read: {}", unreadable.join("; "));
-    // A secrets directory left by an earlier workspace of the name would
-    // reach the new one's guest.
-    let leftover = [Path::new(&t.state_dir).join(name), Path::new(&t.secrets_root).join(name), paths.seed(name)];
-    if all.iter().any(|c| c.name == name) || leftover.iter().any(|p| p.exists()) {
-        return Err(taken(name));
-    }
-    let quota = quota_of(&read_quotas(&paths.quotas())?, t.limits.quota, &r.owner);
-    let made: Vec<Config> = all.iter().filter(|c| c.self_service).cloned().collect();
-    check_quota(owned(&made, &r.owner), quota)?;
-    let env = credential(&t.owner_command, &t.environment_command, &r.owner).await?;
-
-    let ip = free_ip(&t.subnet, &all.iter().map(|c| c.ip.clone()).collect())?;
-    let uids: BTreeSet<u32> = all.iter().map(|c| c.uid).collect();
-    let uid = free_uid(&uids, |u| nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(u)).ok().flatten().is_some())?;
-    let c = config_of(t, &r, &ip, uid)?;
-    build(t, paths, &c, Build { disk: true, stopped: false, secret_environment: Some(&env) }).await?;
-    drop(lock);
-    run_tool("systemctl", &["--no-block", "start", &state::unit_name(name)]).await
 }
 
 /// How [`build`] makes a workspace.
@@ -1105,15 +974,6 @@ pub(crate) async fn wait_for_user(user: &str) -> anyhow::Result<Account> {
     hostutil::lookup_account(user).with_context(|| format!("the user database has no {user}"))
 }
 
-/// `workbench self-service destroy <ws>`: stops a workspace made at run
-/// time and deletes its disk, its config and the rest of it, saying how it
-/// went for the web UI.
-pub async fn destroy(t: &Template, name: &str) -> anyhow::Result<()> {
-    ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
-    let paths = t.paths();
-    reporting(&paths.outcome(name), None, "The host couldn't destroy it", true, take_away(&paths, name)).await
-}
-
 pub(crate) async fn take_away(paths: &Paths, name: &str) -> anyhow::Result<()> {
     let _lock = paths.lock()?;
     finish_pending(paths).await?;
@@ -1139,7 +999,7 @@ pub(crate) fn remove(p: &Path) -> io::Result<()> {
     }
 }
 
-/// `workbench self-service setup`, at boot and with every new template:
+/// `workbench node setup`, at boot and with every new template:
 /// each config of a workspace made at run time made again from the
 /// template, their user records and network files again, then the ones
 /// neither stopped nor left start. A VM that runs keeps what it booted
@@ -1192,70 +1052,10 @@ pub async fn setup(t: &Template) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `workbench self-service reconcile`: stops and marks the workspaces of
-/// owners the owner command no longer keeps, and unmarks those of owners
-/// who came back. Disks stay.
-pub async fn reconcile(t: &Template) -> anyhow::Result<()> {
-    if t.owner_command.is_empty() {
-        return Ok(());
-    }
-    let root = Path::new(&t.state_dir);
-    let paths = t.paths();
-    // Asked without the lock, which a slow directory would hold up.
-    let owners: BTreeSet<String> = made(&paths).into_iter().map(|c| c.owner).collect();
-    let mut said: BTreeMap<String, Owner> = BTreeMap::new();
-    for owner in owners {
-        let o = owner_status(t, &owner).await;
-        said.insert(owner, o);
-    }
-    // Then under it, so a workspace destroyed meanwhile isn't marked again.
-    let _lock = paths.lock()?;
-    let mut failed = Vec::new();
-    for c in made(&paths) {
-        let owner = said.get(&c.owner).copied().unwrap_or(Owner::Unknown);
-        if let Err(e) = settle(root, &c, owner).await {
-            failed.push(format!("{}: {e:#}", c.name));
-        }
-    }
-    ensure!(failed.is_empty(), "{}", failed.join("; "));
-    Ok(())
-}
-
-/// Brings one workspace in line with what the owner command said: one
-/// whose owner left is marked, and stopped whenever it runs, at every
-/// pass, whoever started it. The mark, not `workbench stop`'s, keeps it
-/// stopped across boots, so one its owner hadn't stopped starts again
-/// when they come back.
-async fn settle(root: &Path, c: &Config, owner: Owner) -> anyhow::Result<()> {
-    let marker = left_marker(root, &c.name);
-    let unit = state::unit_name(&c.name);
-    match owner {
-        Owner::Unknown => eprintln!("{}: couldn't tell whether {} stays; left as it is", c.name, c.owner),
-        Owner::Stays => {
-            if marker.exists() {
-                remove(&marker)?;
-                eprintln!("{}: {} is back", c.name, c.owner);
-                if !state::stop_marker(root, &c.name).exists() {
-                    run_tool("systemctl", &["--no-block", "start", &unit]).await?;
-                }
-            }
-        }
-        Owner::Left => {
-            if !marker.exists() {
-                fs::create_dir_all(marker.parent().context("marker")?)?;
-                fs::write(&marker, "")?;
-                eprintln!("{}: {} left; stopping it, disk kept", c.name, c.owner);
-            }
-            if unit_running(&unit).await {
-                run_tool("systemctl", &["--no-block", "stop", &unit]).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
+    use workbench_model::memory::Ceiling;
+
     use super::*;
 
     pub(crate) fn template() -> Template {
@@ -1267,7 +1067,12 @@ pub(crate) mod tests {
                 host_memory_gib: 0,
                 max_disk_gib: 128,
                 quota: 1,
-                apps: vec![AppInfo { id: "t3code".into(), name: "T3 Code".into(), terminal: false, default: true }],
+                apps: vec![workbench_model::apps::AppInfo {
+                    id: "t3code".into(),
+                    name: "T3 Code".into(),
+                    terminal: false,
+                    default: true,
+                }],
             },
             domain: "ws.test".into(),
             scheme: "https".into(),
@@ -1296,7 +1101,6 @@ pub(crate) mod tests {
             default_apps: vec!["t3code".into()],
             environment: BTreeMap::new(),
             environment_files: vec![],
-            socket_group: "workbench".into(),
             images: BTreeMap::from([
                 (
                     "ubuntu".into(),
@@ -1319,8 +1123,6 @@ pub(crate) mod tests {
             ]),
             mkfs_vfat: "/nix/store/x-dosfstools/bin/mkfs.vfat".into(),
             mcopy: "/nix/store/x-mtools/bin/mcopy".into(),
-            environment_command: "/run/current-system/sw/bin/env-of".into(),
-            owner_command: String::new(),
             ssh: crate::config::tests::test_config().ssh,
         }
     }
@@ -1355,47 +1157,21 @@ pub(crate) mod tests {
         assert!(nixos.seed.is_empty(), "NixOS takes no seed");
     }
 
-    /// An admin changes the most a workspace grows to within the limits,
-    /// which every later deploy keeps.
+    /// The most a workspace grows to, which an admin may have changed,
+    /// stays through every deploy, `auto` too.
     #[test]
-    fn memory_changes_within_the_limits() {
+    fn a_deploy_keeps_the_memory() {
         let t = template();
         let c = config_of(&t, &request("ubuntu"), "10.232.0.11", 60_600).unwrap();
-        let more = with_memory(&t, &c, Ceiling::Size(16)).unwrap();
-        assert_eq!((more.max_mem, more.boot_mem_mib), (Ceiling::Size(16_384), 2048));
-        assert_eq!(Config { max_mem: c.max_mem, ..more.clone() }, c, "nothing else changes");
-        assert_eq!(refreshed(&t, &more).unwrap().max_mem, Ceiling::Size(16_384), "a deploy keeps it");
-        for gib in [1, 17] {
-            let e = with_memory(&t, &c, Ceiling::Size(gib)).unwrap_err();
-            assert_eq!(e.downcast_ref::<Refused>().unwrap().0, "Memory must be from 2 to 16 GiB.", "{gib}");
-        }
-        let e = with_memory(&t, &c, Ceiling::Auto).unwrap_err();
-        assert!(e.downcast_ref::<Refused>().unwrap().0.contains("no auto"), "not on a host whose most is a size");
-        // Where the most is the host's, a workspace may follow it, and
-        // keeps following it through deploys.
-        let mut hosts = t.clone();
-        hosts.limits.max_memory = Ceiling::Auto;
-        hosts.limits.host_memory_gib = 64;
-        let auto = with_memory(&hosts, &c, Ceiling::Auto).unwrap();
-        assert_eq!((auto.max_mem, auto.max_mem_mib()), (Ceiling::Auto, config::host_mem_mib().unwrap()));
-        assert_eq!(refreshed(&hosts, &auto).unwrap().max_mem, Ceiling::Auto, "a deploy keeps it");
+        let more = Config { max_mem: Ceiling::Size(16_384), ..c.clone() };
+        assert_eq!(refreshed(&t, &more).unwrap().max_mem, Ceiling::Size(16_384));
+        let mut nodes = t.clone();
+        nodes.limits.max_memory = Ceiling::Auto;
+        let auto = Config { max_mem: Ceiling::Auto, ..c };
+        assert_eq!(refreshed(&nodes, &auto).unwrap().max_mem, Ceiling::Auto);
         let made =
-            config_of(&hosts, &Request { max_memory: Ceiling::Auto, ..request("ubuntu") }, "10.232.0.12", 60_601);
+            config_of(&nodes, &Request { max_memory: Ceiling::Auto, ..request("ubuntu") }, "10.232.0.12", 60_601);
         assert_eq!(made.unwrap().max_mem, Ceiling::Auto, "and one is made with it");
-        assert_eq!(with_memory(&hosts, &auto, Ceiling::Size(16)).unwrap().max_mem, Ceiling::Size(16_384));
-    }
-
-    /// A template's most memory of `auto` is the host's, in whole GiB.
-    #[test]
-    fn template_memory_of_auto() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("template.json");
-        let mut v = serde_json::to_value(template()).unwrap();
-        v["limits"]["maxMemoryGiB"] = "auto".into();
-        fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
-        let limits = Template::load(&path).unwrap().limits;
-        assert!(limits.memory_auto());
-        assert_eq!(limits.max_memory_gib(), config::host_mem_mib().unwrap() / 1024);
     }
 
     /// Every config is made again from a new template: the host's paths
@@ -1455,8 +1231,8 @@ pub(crate) mod tests {
         path.display().to_string()
     }
 
-    /// A host on its own and a front ask the host's commands the same:
-    /// whether the owner stays, then their workspace's credential.
+    /// The front asks the host's commands whether the owner stays, then for
+    /// their workspace's credential.
     #[tokio::test]
     async fn a_credential_from_the_host_s_commands() {
         let dir = tempfile::tempdir().unwrap();
@@ -1475,8 +1251,8 @@ pub(crate) mod tests {
         assert!(check_quota(1, 1).is_err() && check_quota(0, 1).is_ok());
     }
 
-    /// A node renders a record into the config a host on its own makes of
-    /// the same request, and back.
+    /// A node renders a record into the config its request makes, and
+    /// back.
     #[test]
     fn a_record_renders_as_today() {
         let t = template();
@@ -1590,13 +1366,5 @@ pub(crate) mod tests {
         assert!(check_environment("\n# only a comment\n").is_err());
         assert!(check_environment("not a variable").is_err());
         assert!(check_environment("1A=x").is_err());
-    }
-
-    #[test]
-    fn quotas_count_what_owners_made() {
-        let t = template();
-        let mut made = vec![config_of(&t, &request("ubuntu"), "10.232.0.11", 60_600).unwrap()];
-        made.push(Config { owner: "bob".into(), ..made[0].clone() });
-        assert_eq!((owned(&made, "samuel.silva"), owned(&made, "bob"), owned(&made, "carol")), (1, 1, 0));
     }
 }

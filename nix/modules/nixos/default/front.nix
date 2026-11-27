@@ -16,7 +16,6 @@ let
   fleet = config.services.workbench.fleet;
   front = config.services.workbench.front;
   node = config.services.workbench.node;
-  vmkit = config.services.vmkit;
   wb = import ./lib.nix { inherit config lib pkgs; };
   inherit (wb) exe;
   webPackage = pkgs.callPackage ../../../packages/web.nix { vmkit = fleet.vmkitSource; };
@@ -185,23 +184,6 @@ let
     cp ${client.x86_64-linux}/bin/workbench-connect $out/bin/workbench-connect-x86_64-linux
     cp ${client.aarch64-linux}/bin/workbench-connect $out/bin/workbench-connect-aarch64-linux
   '';
-
-  # Until the web UI runs on the fleet: on a machine with both roles, it
-  # also sees its own node's VMs, memory and template as a host on its own
-  # did.
-  localArgs = lib.optionals wb.bothRoles (
-    [
-      "--config-dir=/etc/workbench"
-      "--config-dir=${node.stateDir}/configs"
-      "--mem-reserve-percent=${toString node.memory.reservePercent}"
-      "--mem-reserve-min-gib=${toString vmkit.memory.reserveMinGiB}"
-      "--pool=workbench=${vmkit.memory.pools.workbench.statusFile}"
-    ]
-    ++ lib.mapAttrsToList (name: p: "--pool=${name}=${p.statusFile}") (
-      lib.filterAttrs (name: _: name != "workbench") vmkit.memory.pools
-    )
-    ++ lib.optional ss.enable "--self-service=${wb.template}"
-  );
 
   selfServiceUnit = description: args: {
     inherit description;
@@ -418,14 +400,14 @@ in
         description = "workbench web UI";
       };
       groups.workbench-web = { };
-      # May use the VMs' sockets and the local node's API.
+      # May use the local node's API, on a machine with both roles.
       groups.workbench = { };
       users.${config.services.nginx.user}.extraGroups = [ "workbench-web" ];
     };
 
     assertions = [
       {
-        # Its stop markers, requests and locks are where its node looks.
+        # Its node reads the marks of owners who left where it writes them.
         assertion = node.enable -> node.stateDir == stateDir;
         message = "services.workbench.front.stateDir: on a machine with both roles, the same as services.workbench.node.stateDir.";
       }
@@ -463,15 +445,13 @@ in
     };
 
     systemd.tmpfiles.rules =
-      # A machine with both roles has its node's, which the web UI lists.
-      lib.optional (!(node.enable && node.stateDir == stateDir)) "d ${stateDir} 0751 root workbench -"
+      # A machine with both roles has its node's.
+      lib.optional (!(node.enable && node.stateDir == stateDir)) "d ${stateDir} 0711 root root -"
       ++ [
         # Root's, which the web UI reads.
         "d ${stateDir}/registry 0755 root root -"
         "d ${stateDir}/closed 0755 workbench-web workbench-web -"
         "d ${stateDir}/.left 0755 root root -"
-        # Until the web UI runs on the fleet: its stop markers.
-        "d ${stateDir}/.stopped 0755 workbench-web workbench-web -"
         # Root's, so the UI can't swap what root reads and writes in it: the
         # UI writes requests and quotas, root the outcomes.
         "d ${stateDir}/self-service 0755 root root -"
@@ -565,13 +545,8 @@ in
 
       workbench-web = {
         description = "workbench web UI";
-        # It reads the template, with the apps it offers, when it starts.
-        restartTriggers = [
-          settings
-        ]
-        ++ lib.optional (
-          wb.bothRoles && ss.enable
-        ) config.environment.etc."workbench-self-service.json".text;
+        # It reads the settings, with the apps it offers, when it starts.
+        restartTriggers = [ settings ];
         wantedBy = [ "multi-user.target" ];
         after = [
           "network.target"
@@ -587,7 +562,6 @@ in
               webExe
               "--site=${webPackage.site}"
               "--origin=${origin}"
-              "--state-root=${stateDir}"
               "--oauth2-proxy=${oauth2Proxy}"
               "--cookie-name=${cookieName}"
               "--devices=/var/lib/workbench-web/devices.json"
@@ -598,7 +572,6 @@ in
             ++ map (a: "--admin=${a}") front.admins
             ++ map (g: "--admin-group=${g}") front.adminGroups
             ++ lib.optionals ss.enable (map (g: "--creator-group=${g}") ss.groups)
-            ++ localArgs
           );
           User = "workbench-web";
           Group = "workbench-web";
@@ -611,7 +584,6 @@ in
           Restart = "always";
           RestartSec = 2;
           ReadWritePaths = [
-            "${stateDir}/.stopped"
             "${stateDir}/closed"
             "${stateDir}/self-service/requests"
           ]
@@ -722,17 +694,13 @@ in
       };
     };
 
-    # Start, stop and restart workspaces, make, change, move and destroy
-    # those made at run time, and nothing else.
+    # Make, change, move and destroy workspaces made at run time, and
+    # nothing else: the nodes start, stop and restart them.
     security.polkit.enable = true;
     security.polkit.extraConfig = ''
       polkit.addRule(function(action, subject) {
         if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "workbench-web") {
           var unit = action.lookup("unit"), verb = action.lookup("verb");
-          if (/^workbench@[a-z][a-z0-9-]*\.service$/.test(unit) &&
-              (verb == "start" || verb == "stop" || verb == "restart")) {
-            return polkit.Result.YES;
-          }
           if (/^workbench-move@[a-z][a-z0-9-]*\.service$/.test(unit) && verb == "start") {
             return polkit.Result.YES;
           }

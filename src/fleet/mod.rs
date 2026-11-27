@@ -13,8 +13,8 @@
 //! - [`registry`], [`disk`], [`placement`], [`moving`]: the registry's
 //!   files, the disk stream, where a new workspace goes, and moves.
 //!
-//! A machine without these settings runs as a host on its own did before
-//! (until the modules render a fleet).
+//! A host on its own is a fleet too: a front and its one node, on one
+//! machine, with both settings.
 
 pub mod client;
 pub mod contract;
@@ -209,15 +209,6 @@ impl NodeSettings {
     #[must_use]
     pub fn state_root(&self) -> PathBuf {
         PathBuf::from(&self.state_dir)
-    }
-
-    /// Its settings, if this machine is a node of a fleet.
-    pub fn of_this_machine() -> anyhow::Result<Option<Self>> {
-        let path = Path::new(NODE_SETTINGS);
-        if !path.exists() {
-            return Ok(None);
-        }
-        Self::load(path).map(Some)
     }
 }
 

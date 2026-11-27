@@ -104,17 +104,16 @@ pub async fn create(
     state.create_action(&viewer, form).await
 }
 
-/// For admins on a front: closes a node, or with `closed` false reopens
-/// it. A form comes back to the host page.
+/// For admins: closes a node, or with `closed` false reopens it. A form
+/// comes back to the host page.
 #[server(prefix = "/api", endpoint = "node")]
 pub async fn set_node(node: String, #[server(default)] closed: bool) -> Result<(), ServerFnError> {
     let (state, viewer) = crate::server::request()?;
     state.node_action(&viewer, &node, closed).await
 }
 
-/// For admins on a front: moves a workspace made at run time to another
-/// node. A form comes back to the host page, or to the move's page with
-/// why not.
+/// For admins: moves a workspace made at run time to another node. A
+/// form comes back to the host page, or to the move's page with why not.
 #[server(prefix = "/api", endpoint = "move")]
 pub async fn move_to(ws: String, #[server(default)] node: String) -> Result<(), ServerFnError> {
     let (state, viewer) = crate::server::request()?;

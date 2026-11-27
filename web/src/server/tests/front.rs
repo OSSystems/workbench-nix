@@ -21,7 +21,7 @@ use super::*;
 
 /// A node: what it has, or nothing while it doesn't answer; of this
 /// build or another; at once, or after a while.
-struct FakeNode {
+pub(super) struct FakeNode {
     has: Mutex<Option<Vec<NodeWorkspace>>>,
     other_build: std::sync::atomic::AtomicBool,
     /// How long it takes to say what it has.
@@ -34,7 +34,7 @@ struct FakeNode {
 }
 
 impl FakeNode {
-    fn new(has: Vec<NodeWorkspace>) -> Arc<Self> {
+    pub(super) fn new(has: Vec<NodeWorkspace>) -> Arc<Self> {
         Arc::new(FakeNode {
             has: Mutex::new(Some(has)),
             other_build: std::sync::atomic::AtomicBool::new(false),
@@ -219,14 +219,14 @@ impl Backend for OnFront {
         self.inner.ssh_address(c)
     }
 
-    fn fleet(&self) -> Option<&Fleet> {
+    fn fleet(&self) -> &Fleet {
         self.inner.fleet()
     }
 }
 
 /// A front with nodes `a`, `b` and `c`, its files in `dir`; each node's
 /// API, for the consoles, is a socket there.
-fn settings(dir: &Path) -> FrontSettings {
+pub(super) fn settings(dir: &Path) -> FrontSettings {
     let node = |n: u8| NodeEntry {
         address: format!("10.231.0.{}", 10 + n).parse().unwrap(),
         subnet: format!("10.232.{n}"),
@@ -294,7 +294,7 @@ struct Front {
 
 impl Front {
     fn fleet(&self) -> &Fleet {
-        self.state.backend.fleet().unwrap()
+        self.state.backend.fleet()
     }
 
     fn state_dir(&self) -> std::path::PathBuf {
@@ -333,7 +333,6 @@ fn front() -> Front {
     fleet.registry.put(&record("dave", "dave", "c", "10.232.2.128")).unwrap();
     let ss = settings.self_service.as_ref().unwrap();
     let opts = Options {
-        state_root: settings.state_root(),
         origin: ORIGIN.into(),
         admins: vec!["carol".into()],
         creator_groups: vec!["workbench".into()],

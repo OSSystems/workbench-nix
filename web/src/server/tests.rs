@@ -1,4 +1,4 @@
-//! The UI's handlers against a fake host: who sees and controls what, the
+//! The UI's handlers against a fake front: who sees and controls what, the
 //! access check, the origin rule, and the pages the server renders.
 
 use std::sync::{Arc, Mutex};
@@ -8,6 +8,7 @@ use axum::http::{Request, StatusCode, header};
 use futures_util::{SinkExt, StreamExt};
 use tower::ServiceExt;
 use workbench::config::Config;
+use workbench::fleet::client::Node;
 use workbench::self_service::Paths;
 use workbench::state::OpenLinkError;
 use workbench_model::apps::{AppInfo, BootApp};
@@ -35,6 +36,18 @@ struct Fake {
     signed: Arc<Mutex<Vec<(String, String)>>>,
     /// Where the workspaces' SSH servers listen.
     ssh: String,
+    fleet: OneNode,
+}
+
+/// A fleet of one node, `a`, which answers with nothing on it: the fake's
+/// workspaces are its own.
+struct OneNode(Fleet);
+
+impl Default for OneNode {
+    fn default() -> Self {
+        let a: Arc<dyn Node> = front::FakeNode::new(vec![]);
+        OneNode(Fleet::with_nodes(front::settings(&test_dir()), [("a".to_owned(), a)].into()))
+    }
 }
 
 fn made(name: &str, owner: &str) -> Workspace {
@@ -156,6 +169,10 @@ impl Backend for Fake {
         let ran = ran_unit(self.paths.as_ref(), unit, outcome.as_ref());
         Box::pin(async move { ran })
     }
+
+    fn fleet(&self) -> &Fleet {
+        &self.fleet.0
+    }
 }
 
 /// Who a fake cookie names: `<user>` or `<user>:<group>,<group>`.
@@ -197,7 +214,8 @@ fn state(fake: Fake) -> AppState {
     state_with(fake, |_| {})
 }
 
-/// The state with the host's limits as `limits` leaves them.
+/// The state with the front's limits as `limits` leaves them; `auto` is
+/// its node's memory, 64 GiB.
 fn state_with(fake: Fake, limits: impl FnOnce(&mut Limits)) -> AppState {
     let mut l = Limits {
         os: vec!["ubuntu".into()],
@@ -230,10 +248,17 @@ fn state_with(fake: Fake, limits: impl FnOnce(&mut Limits)) -> AppState {
 
 /// A devices file of the test's own, in a directory the process leaves.
 fn devices_file() -> std::path::PathBuf {
+    test_dir().join("devices.json")
+}
+
+/// A directory of the test's own, which the process leaves.
+fn test_dir() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = DIR.get_or_init(|| tempfile::tempdir().unwrap());
-    dir.path().join(format!("devices-{}.json", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+    let mine = dir.path().join(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string());
+    std::fs::create_dir_all(&mine).unwrap();
+    mine
 }
 
 /// Leptos's reactive runtime is global to the process: tests each on a

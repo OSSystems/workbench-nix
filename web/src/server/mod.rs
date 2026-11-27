@@ -1,12 +1,10 @@
 //! The web UI's server: it renders the pages and answers their server
-//! functions, streams live updates, serves the shared consoles and nginx's
-//! access check for every workspace. It runs as its own user: systemd
-//! state and the VMs' sockets are readable to it, and polkit lets it start,
-//! stop and restart workspace units and nothing else.
-//!
-//! On a front, [`FleetBackend`] runs it on [`Fleet`]: the registry and the
-//! nodes; on a host on its own, [`HostBackend`] (until the modules render a
-//! fleet).
+//! functions, streams live updates, relays the consoles and answers nginx's
+//! access check for every workspace. It runs on the front as its own user,
+//! on [`Fleet`]: the registry, and the nodes, which it asks for every
+//! workspace's state and what is done to one. polkit lets it start the
+//! front's units that make, change, move and destroy workspaces, and
+//! nothing else.
 
 pub mod authz;
 pub mod connect;
@@ -26,10 +24,10 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use leptos::config::LeptosOptions;
 use leptos::prelude::*;
-use workbench::config::{self, Config};
+use workbench::config::Config;
 pub use workbench::fleet::front::Fleet;
 use workbench::self_service::Paths;
-use workbench::state::{self, OpenLinkError};
+use workbench::state::OpenLinkError;
 use workbench_model::apps::{BootApp, DeviceLink};
 use workbench_model::fleet::{NodeRefusal, NodeView};
 use workbench_model::self_service::Limits;
@@ -43,7 +41,7 @@ pub use workbench::self_service::Paths as SelfServicePaths;
 /// A future a [`Backend`] returns.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// What the UI does on the host; tests replace it.
+/// What the UI does on the front; tests replace it.
 pub trait Backend: Send + Sync + 'static {
     /// Every workspace's status.
     fn list(&self) -> BoxFuture<'_, anyhow::Result<Vec<Workspace>>>;
@@ -68,11 +66,9 @@ pub trait Backend: Send + Sync + 'static {
     fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
     /// Where a workspace's SSH server listens: its address, port 22.
     fn ssh_address(&self, c: &Config) -> String;
-    /// The fleet, on a front: the nodes, closing them, moves and the
-    /// consoles go through it. None on a host on its own.
-    fn fleet(&self) -> Option<&Fleet> {
-        None
-    }
+    /// The fleet: the nodes, closing them, moves and the consoles go
+    /// through it.
+    fn fleet(&self) -> &Fleet;
 }
 
 /// The groups single sign-on gave the person asking, as the UI's
@@ -98,8 +94,6 @@ pub struct SelfService {
 /// How `workbench-web` is set up.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    pub dirs: Vec<PathBuf>,
-    pub state_root: PathBuf,
     /// The UI's own origin, `https://<domain>`; every `POST` must come from
     /// it.
     pub origin: String,
@@ -108,16 +102,12 @@ pub struct Options {
     pub admin_groups: Vec<String>,
     /// Groups whose members make workspaces of their own.
     pub creator_groups: Vec<String>,
-    /// Set when the host lets people make workspaces.
+    /// Set when the front lets people make workspaces.
     pub self_service: Option<SelfService>,
     /// Where the access check asks who a cookie belongs to.
     pub oauth2_proxy: String,
     /// The single sign-on cookie, which no workspace's app ever gets.
     pub cookie_name: String,
-    pub reserve_percent: f64,
-    pub reserve_min_gib: f64,
-    /// The host's memory pools and their status files, for the host page.
-    pub pools: Vec<(String, PathBuf)>,
     /// Where the paired devices are kept.
     pub devices: PathBuf,
     /// `ssh-keygen`, the user CA's private key, which it signs people's
@@ -135,73 +125,13 @@ impl Options {
     }
 }
 
-/// The host as the UI sees it, through the workbench crate.
-pub struct HostBackend {
-    pub opts: Options,
-}
-
-impl Backend for HostBackend {
-    fn list(&self) -> BoxFuture<'_, anyhow::Result<Vec<Workspace>>> {
-        Box::pin(state::collect(&self.opts.dirs, &self.opts.state_root))
-    }
-
-    fn control<'a>(&'a self, verb: Verb, name: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(state::control(&self.opts.state_root, verb, name, false))
-    }
-
-    fn config(&self, name: &str) -> anyhow::Result<Config> {
-        config::load(&self.opts.dirs, name)
-    }
-
-    fn reachable(&self, c: &Config) -> Vec<BootApp> {
-        state::reachable_apps(c)
-    }
-
-    fn open_link(&self, c: Config, app: String) -> BoxFuture<'_, Result<String, OpenLinkError>> {
-        Box::pin(async move { state::open_link(&c, &app).await })
-    }
-
-    fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>> {
-        Box::pin(authz::ask_oauth2_proxy(&self.opts.oauth2_proxy, cookie))
-    }
-
-    fn host_ca(&self) -> anyhow::Result<String> {
-        let raw = vmkit::hostutil::read_bounded(&self.opts.host_ca, 64 << 10)
-            .with_context(|| self.opts.host_ca.display().to_string())?;
-        Ok(String::from_utf8_lossy(&raw).trim().to_owned())
-    }
-
-    fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(connect::sign_with(&self.opts.ssh_keygen, &self.opts.user_ca, user, id, key))
-    }
-
-    fn ssh_address(&self, c: &Config) -> String {
-        format!("{}:22", c.ip)
-    }
-
-    fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async move {
-            let run = tokio::process::Command::new("systemctl")
-                .args(["--no-ask-password", "start", unit])
-                .kill_on_drop(true)
-                .output();
-            let out = tokio::time::timeout(UNIT_TIMEOUT, run)
-                .await
-                .map_err(|_| anyhow::anyhow!("{unit} took too long"))??;
-            anyhow::ensure!(out.status.success(), "{unit}: {}", String::from_utf8_lossy(&out.stderr).trim());
-            Ok(())
-        })
-    }
-}
-
-/// A front as the UI sees it: every workspace from the registry and its
+/// The front as the UI sees it: every workspace from the registry and its
 /// node, and what is done to one done through its node. Who owns a
 /// workspace and where it is are the registry's, never a node's: the
 /// access check and the tunnel read it, and answer while a node doesn't.
+/// Who a cookie is, the units and the user CA are the front's own.
 pub struct FleetBackend {
-    /// Who a cookie is, the units, the SSH CAs and the guests' SSH servers,
-    /// as on a host on its own.
-    pub host: HostBackend,
+    pub opts: Options,
     pub fleet: Fleet,
     /// The apps each workspace's VM ran at the last list, by id: one that
     /// goes with its next restart still opens until then.
@@ -211,7 +141,7 @@ pub struct FleetBackend {
 impl FleetBackend {
     #[must_use]
     pub fn new(opts: Options, fleet: Fleet) -> Self {
-        FleetBackend { host: HostBackend { opts }, fleet, running: Mutex::default() }
+        FleetBackend { opts, fleet, running: Mutex::default() }
     }
 }
 
@@ -250,28 +180,41 @@ impl Backend for FleetBackend {
     }
 
     fn whoami<'a>(&'a self, cookie: &'a str) -> BoxFuture<'a, anyhow::Result<Identity>> {
-        self.host.whoami(cookie)
+        Box::pin(authz::ask_oauth2_proxy(&self.opts.oauth2_proxy, cookie))
     }
 
     fn run_unit<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
-        self.host.run_unit(unit)
+        Box::pin(async move {
+            let run = tokio::process::Command::new("systemctl")
+                .args(["--no-ask-password", "start", unit])
+                .kill_on_drop(true)
+                .output();
+            let out = tokio::time::timeout(UNIT_TIMEOUT, run)
+                .await
+                .map_err(|_| anyhow::anyhow!("{unit} took too long"))??;
+            anyhow::ensure!(out.status.success(), "{unit}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            Ok(())
+        })
     }
 
     fn host_ca(&self) -> anyhow::Result<String> {
-        self.host.host_ca()
+        let raw = vmkit::hostutil::read_bounded(&self.opts.host_ca, 64 << 10)
+            .with_context(|| self.opts.host_ca.display().to_string())?;
+        Ok(String::from_utf8_lossy(&raw).trim().to_owned())
     }
 
     fn sign_user_key<'a>(&'a self, user: &'a str, id: &'a str, key: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
-        self.host.sign_user_key(user, id, key)
+        Box::pin(connect::sign_with(&self.opts.ssh_keygen, &self.opts.user_ca, user, id, key))
     }
 
-    /// The registry's address, which the front reaches through `WireGuard`.
+    /// The registry's address, which the front reaches through `WireGuard`
+    /// or, for its own node's, the tap.
     fn ssh_address(&self, c: &Config) -> String {
-        self.host.ssh_address(c)
+        format!("{}:22", c.ip)
     }
 
-    fn fleet(&self) -> Option<&Fleet> {
-        Some(&self.fleet)
+    fn fleet(&self) -> &Fleet {
+        &self.fleet
     }
 }
 
@@ -305,7 +248,6 @@ pub struct Inner {
     /// The computers people paired, and the codes waiting.
     pub devices: connect::Devices,
     pub leptos: LeptosOptions,
-    pub consoles: console::Consoles,
     cache: tokio::sync::Mutex<Cache>,
     /// Held while the state is collected: one collection at a time, which
     /// no one but who waits for it waits for.
@@ -327,10 +269,10 @@ struct Cache {
     all: Result<Vec<Workspace>, String>,
     /// When someone asked for a restart, by workspace.
     restarts: HashMap<String, Instant>,
-    /// On a front: every node, as it said of itself with the list.
-    nodes: Option<Vec<NodeView>>,
-    /// On a front: what each workspace's node last said of it, which it
-    /// keeps while its node doesn't answer.
+    /// Every node, as it said of itself with the list.
+    nodes: Vec<NodeView>,
+    /// What each workspace's node last said of it, which it keeps while its
+    /// node doesn't answer.
     known: HashMap<String, Workspace>,
 }
 
@@ -342,7 +284,7 @@ impl Default for Cache {
             collected: false,
             all: Ok(vec![]),
             restarts: HashMap::new(),
-            nodes: None,
+            nodes: vec![],
             known: HashMap::new(),
         }
     }
@@ -455,14 +397,12 @@ fn see_other(to: &str) {
 
 impl AppState {
     pub fn new(opts: Options, backend: Box<dyn Backend>, leptos: LeptosOptions) -> anyhow::Result<Self> {
-        let consoles = console::Consoles::new(opts.dirs.clone());
         let devices = connect::Devices::load(&opts.devices)?;
         Ok(AppState(Arc::new(Inner {
             opts,
             backend,
             devices,
             leptos,
-            consoles,
             cache: tokio::sync::Mutex::default(),
             collecting: Arc::default(),
             authz: Mutex::default(),
@@ -480,12 +420,12 @@ impl AppState {
         is_user_name(name).then(|| Viewer { name: name.to_owned(), admin, creates })
     }
 
-    /// Every workspace, collected at most once a second whoever asks; on a
-    /// front, with every node. The collection runs apart: while it does,
-    /// everyone gets the last state, so a node slow to answer slows no
-    /// page. Only the first ever, the answer to an action and a state
-    /// older than [`SHOWN_FOR`], which no one looked at since, wait for a
-    /// new one, all but the first no longer than [`COLLECT_WAIT`].
+    /// Every workspace, collected at most once a second whoever asks, with
+    /// every node. The collection runs apart: while it does, everyone gets
+    /// the last state, so a node slow to answer slows no page. Only the
+    /// first ever, the answer to an action and a state older than
+    /// [`SHOWN_FOR`], which no one looked at since, wait for a new one, all
+    /// but the first no longer than [`COLLECT_WAIT`].
     pub async fn all(&self) -> anyhow::Result<Vec<Workspace>> {
         loop {
             let (wait, collected) = {
@@ -547,13 +487,7 @@ impl AppState {
     /// Collects the state, outside the cache's lock, then keeps it.
     async fn collect(&self) {
         let era = self.cache.lock().await.era;
-        let (all, nodes) = match self.backend.fleet() {
-            Some(fleet) => {
-                let (all, nodes) = tokio::join!(self.backend.list(), fleet.nodes_view());
-                (all, Some(nodes))
-            }
-            None => (self.backend.list().await, None),
-        };
+        let (all, nodes) = tokio::join!(self.backend.list(), self.backend.fleet().nodes_view());
         let mut cache = self.cache.lock().await;
         cache.all = all.map_err(|e| format!("{e:#}"));
         cache.nodes = nodes;
@@ -561,8 +495,8 @@ impl AppState {
         // One begun before an action says nothing of it.
         cache.at = (cache.era == era).then(Instant::now);
         {
-            let Cache { all, restarts, known, nodes, .. } = &mut *cache;
-            if let (Ok(all), Some(_)) = (&mut *all, nodes) {
+            let Cache { all, restarts, known, .. } = &mut *cache;
+            if let Ok(all) = &mut *all {
                 for ws in all.iter_mut() {
                     // Its node has it now, or said nothing of it.
                     if ws.unit != "-" {
@@ -593,29 +527,20 @@ impl AppState {
         }
     }
 
-    /// On a front, every node as it said of itself with the list.
-    pub async fn nodes(&self) -> Option<Vec<NodeView>> {
-        self.backend.fleet()?;
+    /// Every node, as it said of itself with the list.
+    pub async fn nodes(&self) -> Vec<NodeView> {
         let _ = self.all().await;
         self.cache.lock().await.nodes.clone()
     }
 
-    /// What people may make, with `auto` the host's memory: on a front, the
-    /// largest node's.
+    /// What people may make, with `auto` the largest node's memory.
     pub async fn limits(&self) -> Option<Limits> {
         Some(self.limits_of(self.opts.self_service.as_ref()?).await)
     }
 
-    /// What `ss` lets people make, with `auto` the host's memory: on a
-    /// front, the largest node's.
+    /// What `ss` lets people make, with `auto` the largest node's memory.
     async fn limits_of(&self, ss: &SelfService) -> Limits {
-        if ss.limits.memory_auto()
-            && let Some(nodes) = self.nodes().await
-        {
-            ss.limits.resolved(&nodes)
-        } else {
-            ss.limits.clone()
-        }
+        if ss.limits.memory_auto() { ss.limits.resolved(&self.nodes().await) } else { ss.limits.clone() }
     }
 
     /// Shows a workspace as restarting until it is up again, after asking
@@ -642,24 +567,18 @@ impl AppState {
             snap.memory_gib = Some((limits.min_memory_gib(), limits.max_memory_gib()));
             snap.memory_auto = limits.memory_auto();
             if viewer.admin {
-                let nodes = self.nodes().await.unwrap_or_default();
                 snap.node_memory_gib =
-                    nodes.into_iter().filter_map(|n| Some((n.name, n.host?.mem_total / GIB))).collect();
+                    self.nodes().await.into_iter().filter_map(|n| Some((n.name, n.host?.mem_total / GIB))).collect();
             }
         }
         Ok(snap)
     }
 
-    /// The host page: on a front, a section per node.
+    /// The host page: a section per node.
     pub async fn host_view(&self) -> anyhow::Result<HostView> {
         let all = self.all().await?;
-        let mut host = match (self.backend.fleet(), self.nodes().await) {
-            (Some(fleet), Some(nodes)) => {
-                let root = fleet.state_root();
-                view::fleet(&nodes, &all, |node| workbench::fleet::is_closed(&root, node))
-            }
-            _ => view::host(&self.opts, &all)?,
-        };
+        let root = self.backend.fleet().state_root();
+        let mut host = view::host(&self.nodes().await, &all, |node| workbench::fleet::is_closed(&root, node));
         host.quotas = self.quotas(&all)?;
         Ok(host)
     }

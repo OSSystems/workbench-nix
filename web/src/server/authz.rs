@@ -82,9 +82,9 @@ pub(crate) fn reachable_by(state: &AppState, viewer: &Viewer, name: &str) -> Opt
     state.backend.config(name).ok().filter(|c| viewer.may_use(&c.owner, c.self_service))
 }
 
-/// Whether a workspace moves, on a front: the registry says so.
+/// Whether a workspace moves: the registry says so.
 pub(crate) fn moving(state: &AppState, name: &str) -> bool {
-    state.backend.fleet().and_then(|f| f.record(name).ok()).is_some_and(|r| r.is_moving())
+    state.backend.fleet().record(name).is_ok_and(|r| r.is_moving())
 }
 
 /// Who the single sign-on cookie is signed in as, and their groups, asked

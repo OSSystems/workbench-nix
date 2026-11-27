@@ -553,7 +553,7 @@ pkgs.testers.runNixOSTest {
         )
         assert "x-workbench-cookie: other=1\r\n" in out.lower(), out
 
-    with subtest("the UI sees each VM through its sockets"):
+    with subtest("the UI sees each VM through its node"):
         seen = json.loads(host.succeed(
             "curl -sf --unix-socket /run/workbench-web/ui.sock -H 'X-Workbench-User: carol' -H 'X-Workbench-Groups: workbench-admins' http://ui/api/workspaces"
         ))
@@ -561,12 +561,19 @@ pkgs.testers.runNixOSTest {
         for ws in seen:
             assert ws["state"] == "running" and ws["apps"][0]["openLink"] and not ws.get("changes"), ws
 
-    with subtest("the serial console is shared through the UI"):
-        # The UI holds each VM's serial socket, which share-sockets opened
-        # to its group, and hands it to `workbench console` on the host.
+    with subtest("the serial console is shared by the node, and the VM's sockets are no one else's"):
+        # The node holds each VM's serial socket, and hands it to
+        # `workbench console` and to the front, which relays it to the UI.
         host.succeed("timeout 60 python3 ${consoleLogin} alice")
-        perms = host.succeed("stat -c '%a %G' /run/workbench/alice/vm/serial.sock /run/workbench/alice/vm/api.sock").split("\n")
-        assert all(p == "660 workbench" for p in perms if p), perms
+        assert host.succeed("stat -c '%a %U' /run/workbench/alice/vm").strip() == "700 wb-alice"
+        # Refused for want of permission, not for any other reason.
+        host.succeed(
+            "runuser -u workbench-web -- python3 -c '"
+            "import socket, sys\n"
+            "try: socket.socket(socket.AF_UNIX).connect(\"/run/workbench/alice/vm/serial.sock\")\n"
+            "except PermissionError: sys.exit(0)\n"
+            "sys.exit(1)'"
+        )
 
     with subtest("the UI opens an app in a browser it signs in"):
         open_ = "-d ws=alice -d app=t3code https://${domain}/api/open"
@@ -782,7 +789,7 @@ pkgs.testers.runNixOSTest {
         assert "copying" not in out, out
 
     with subtest("a stop through the UI lasts until a start"):
-        # The web UI controls units through polkit, as its own user.
+        # The web UI asks the node, which stops it and leaves its marker.
         assert status_code(f"{as_user('alice')} {ui_form} -d 'ws=bob&action=stop' https://${domain}/api/control") == "403"
         assert status_code(f"{as_user('bob')} {ui_form} -d 'ws=bob&action=stop' https://${domain}/api/control") == "303"
         host.wait_until_succeeds("systemctl show -P ActiveState workbench@bob.service | grep -qx inactive", timeout=180)

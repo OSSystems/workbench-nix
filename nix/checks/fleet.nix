@@ -271,9 +271,9 @@ let
         template.subnet == "10.232.1"
         && !(template ? ssh)
         && template.environmentFiles == [ ]
-        && template.environmentCommand == ""
-        && template.ownerCommand == ""
-        && template.socketGroup == ""
+        && !(template ? environmentCommand)
+        && !(template ? ownerCommand)
+        && !(template ? socketGroup)
         &&
           lib.attrNames template.images == [
             "nixos"
@@ -377,11 +377,33 @@ let
         && !(bothNode ? listen)
         && bothNode.socket == "/run/workbench-node/api.sock"
         && bothNode.socketGroup == "workbench"
-        && bothNode.front == "/run/workbench-front/api.sock"
-        && bothTemplate.socketGroup == "workbench"
-        && bothTemplate.limits.quota == 1
-        && bothTemplate.limits.maxDiskGiB == 128;
+        && bothNode.front == "/run/workbench-front/api.sock";
       msg = "both roles: sockets to each other, WireGuard to the other nodes only";
+    }
+    {
+      ok =
+        let
+          bothWeb = both.systemd.services.workbench-web;
+          vm = both.systemd.services."workbench@";
+          polkit = both.security.polkit.extraConfig;
+        in
+        lib.all (flag: !lib.hasInfix flag bothWeb.serviceConfig.ExecStart) [
+          "--self-service"
+          "--config-dir"
+          "--state-root"
+          "--pool"
+          "--mem-reserve"
+        ]
+        && !lib.any (lib.hasInfix ".stopped") (
+          bothWeb.serviceConfig.ReadWritePaths ++ both.systemd.tmpfiles.rules
+        )
+        && !lib.hasInfix "/^workbench@" polkit
+        && lib.hasInfix "/^workbench-move@" polkit
+        && !(vm.serviceConfig ? ExecStartPost)
+        && !(bothTemplate ? socketGroup)
+        && bothTemplate.limits.quota == 0
+        && lib.elem "d /var/lib/workbench 0711 root root -" both.systemd.tmpfiles.rules;
+      msg = "both roles: the web UI runs on the fleet alone, and reaches its node through the node's API only";
     }
     {
       ok =

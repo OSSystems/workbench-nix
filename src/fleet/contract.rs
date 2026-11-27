@@ -20,7 +20,7 @@ pub struct StartAnswer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<Record>,
     /// Its secrets directory and secret environment, as
-    /// `write_secrets_share` copies them on a host on its own.
+    /// `launch::collect_secrets` reads them on the front.
     pub secrets: WireSecrets,
     /// Its SSH host key, with a certificate for `<ws>.<domain>` signed
     /// now; none from a front without the CAs.

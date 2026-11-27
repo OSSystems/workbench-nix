@@ -224,14 +224,6 @@ fn union<'a>(next: &'a Boot, running: Option<&'a Boot>) -> impl Iterator<Item = 
     next.apps.iter().chain(only_running)
 }
 
-/// The apps a browser may reach now: the config's, and those the running
-/// VM has that its next start leaves out.
-#[must_use]
-pub fn reachable_apps(c: &Config) -> Vec<BootApp> {
-    let running = booted(c);
-    union(&c.boot(), running.as_ref()).cloned().collect()
-}
-
 /// Keeps a stopped workspace stopped across host reboots: its unit has
 /// `ConditionPathExists=!<marker>`. Names starting with a dot are never
 /// workspaces, so `.stopped` cannot clash with one.
@@ -449,10 +441,6 @@ mod tests {
         assert_eq!(apps::changes(Some(&old), &c.boot()).len(), 2, "its app comes, and new packages");
         std::fs::write(c.booted(), serde_json::to_vec(&c.boot()).unwrap()).unwrap();
         assert_eq!(booted(&c), Some(c.boot()));
-        let running = c.boot();
-        c.apps.clear();
-        std::fs::write(c.booted(), serde_json::to_vec(&running).unwrap()).unwrap();
-        assert_eq!(reachable_apps(&c), running.apps, "an app that goes at the next start is reached until then");
     }
 
     #[test]

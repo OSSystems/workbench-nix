@@ -31,8 +31,6 @@ let
   inherit (entry) subnet;
   # Its declared workspaces.
   workspaces = lib.filterAttrs (_: ws: ws.node == node.name) fleet.workspaces;
-  # The web UI's group may use the VMs' sockets, where it runs.
-  socketGroup = if wb.bothRoles then "workbench" else "";
   configDirs = [
     "/etc/workbench"
     "${node.stateDir}/configs"
@@ -44,32 +42,27 @@ let
     pkgs.writeText "workbench-${name}.json" (
       builtins.toJSON (
         wb.workspaceConfig {
-          inherit subnet socketGroup;
+          inherit subnet;
           inherit (node) stateDir;
         } name ws
       )
     );
 
   # A node offers nothing itself: of the limits, it reads the boot memory
-  # only. On a machine with both roles they are the front's, which today's
-  # web UI reads from the template.
-  limits =
-    if wb.bothRoles && config.services.workbench.front.selfService.enable then
-      wb.frontLimits
-    else
-      {
-        os = [
-          "ubuntu"
-          "nixos"
-        ];
-        bootMemMiB = fleet.memory.bootMiB;
-        maxMemoryGiB = fleet.memory.maxGiB;
-        maxDiskGiB = 0;
-        quota = 0;
-      };
+  # only. What people may make is the front's.
+  limits = {
+    os = [
+      "ubuntu"
+      "nixos"
+    ];
+    bootMemMiB = fleet.memory.bootMiB;
+    maxMemoryGiB = fleet.memory.maxGiB;
+    maxDiskGiB = 0;
+    quota = 0;
+  };
   template = builtins.toJSON (
     wb.templateFor {
-      inherit subnet socketGroup limits;
+      inherit subnet limits;
       inherit (node) stateDir;
     }
   );
@@ -217,8 +210,7 @@ in
 
     systemd = {
       tmpfiles.rules = [
-        # The web UI's group lists it, for the disks of removed workspaces.
-        "d ${node.stateDir} ${if wb.bothRoles then "0751 root workbench" else "0711 root root"} -"
+        "d ${node.stateDir} 0711 root root -"
         "d ${node.stateDir}/configs 0755 root root -"
         # The VMs' users reach their own seed, by its name.
         "d ${node.stateDir}/.seeds 0711 root root -"
@@ -246,7 +238,6 @@ in
           };
           serviceConfig = {
             ExecStart = "${exe} run %i";
-            ExecStartPost = "${exe} ${withConfigs} share-sockets %i";
             # A first start makes the disk from the image, which may take
             # minutes; one cut short starts it over.
             TimeoutStartSec = "15min";

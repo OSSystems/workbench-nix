@@ -177,7 +177,7 @@ pub struct Workspace {
     /// stopped, and its disk kept for an admin.
     #[serde(default, skip_serializing_if = "is_false")]
     pub owner_left: bool,
-    /// The node its disk is on, on a front with nodes: for admins.
+    /// The node its disk is on: for admins.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub node: String,
 }
@@ -516,34 +516,26 @@ pub fn pct(part: i64, whole: i64) -> String {
     format!("{:.1}", (part as f64 * 100.0 / whole as f64).clamp(0.0, 100.0))
 }
 
-/// The host page: its memory, each pool's share and the running
-/// workspaces'.
+/// The host page: a section per node, with its memory, its disk and its
+/// workspaces, and the quotas.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostView {
-    pub total: i64,
-    pub available: i64,
-    pub reserve: i64,
-    pub free: i64,
-    pub pools: Vec<PoolView>,
-    pub workspaces: Vec<Workspace>,
     /// When it was read, as a time of day.
     pub at: String,
-    /// People's quotas, when the host lets people make workspaces.
+    /// People's quotas, when the front lets people make workspaces.
     #[serde(default)]
     pub quotas: Option<Quotas>,
-    /// On a front, each node's section instead of the host's memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nodes: Option<Vec<fleet::NodeSection>>,
+    pub nodes: Vec<fleet::NodeSection>,
 }
 
-/// The host page's quotas: the host's, and each person's.
+/// The host page's quotas: the front's, and each person's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quotas {
     pub default: u32,
     pub people: Vec<self_service::QuotaRow>,
 }
 
-/// One memory pool on the host page.
+/// One memory pool of a node, on the host page.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolView {
     pub name: String,
@@ -634,8 +626,8 @@ mod tests {
         assert_eq!(Filter::parse("mine", false), Filter::All, "only admins filter for their own");
     }
 
-    /// On a front, a moving workspace is changing, one whose node doesn't
-    /// answer has a group of its own, and only admins see nodes.
+    /// A moving workspace is changing, one whose node doesn't answer has a
+    /// group of its own, and only admins see nodes.
     #[test]
     fn moving_and_unreachable() {
         let mut rows = [ws("a", "alice", State::Moving), ws("b", "alice", State::Unreachable)];

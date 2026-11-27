@@ -2,12 +2,9 @@
 //! zone: the browser shows these as they are.
 
 use jiff::{SignedDuration, Timestamp, ZonedDateTime, tz::TimeZone};
-use vmkit::hostutil;
-use vmkit::memory::{self, Status};
+use vmkit::memory;
 use workbench_model::fleet::{NodeSection, NodeView, PoolStatus};
 use workbench_model::{HostView, PoolView, Row, Stage, State, Workspace};
-
-use super::Options;
 
 /// A workspace as the list shows it.
 pub fn row(ws: Workspace) -> Row {
@@ -108,31 +105,9 @@ pub fn ago_s(at: i64, now: Timestamp) -> String {
     Timestamp::from_second(at).map(|t| ago(t, now)).unwrap_or_default()
 }
 
-/// The host page: its memory, each pool's share and the running
-/// workspaces'.
-pub fn host(opts: &Options, all: &[Workspace]) -> anyhow::Result<HostView> {
-    let now = Timestamp::now();
-    let info = hostutil::meminfo_kib()?;
-    let field = |k: &str| info.get(k).copied().unwrap_or(0) << 10;
-    let (total, available) = (field("MemTotal"), field("MemAvailable"));
-    let reserve = memory::reserve(total, opts.reserve_percent, opts.reserve_min_gib);
-    let pools = opts.pools.iter().map(|(name, file)| pool(name, file, now)).collect();
-    Ok(HostView {
-        total,
-        available,
-        reserve,
-        free: (available - reserve).max(0),
-        pools,
-        workspaces: all.iter().filter(|ws| ws.memory_bytes > 0).cloned().collect(),
-        at: local(now).strftime("%H:%M:%S").to_string(),
-        quotas: None,
-        nodes: None,
-    })
-}
-
-/// A front's host page: a section per node, with what it said of itself,
+/// The host page: a section per node, with what it said of itself,
 /// whether it is `closed`, and the workspaces on it.
-pub fn fleet(nodes: &[NodeView], all: &[Workspace], closed: impl Fn(&str) -> bool) -> HostView {
+pub fn host(nodes: &[NodeView], all: &[Workspace], closed: impl Fn(&str) -> bool) -> HostView {
     let now = Timestamp::now();
     let sections = nodes
         .iter()
@@ -143,25 +118,11 @@ pub fn fleet(nodes: &[NodeView], all: &[Workspace], closed: impl Fn(&str) -> boo
             workspaces: all.iter().filter(|w| w.node == n.name).cloned().collect(),
         })
         .collect();
-    HostView { at: local(now).strftime("%H:%M:%S").to_string(), nodes: Some(sections), ..HostView::default() }
+    HostView { at: local(now).strftime("%H:%M:%S").to_string(), nodes: sections, quotas: None }
 }
 
-/// One pool, from its status file; a stale one still shows when it last
-/// reported.
-fn pool(name: &str, file: &std::path::Path, now: Timestamp) -> PoolView {
-    let status = hostutil::read_bounded(file, memory::STATUS_MAX_BYTES)
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok())
-        .map(|s| PoolStatus {
-            updated_at: s.updated_at,
-            committed_bytes: s.committed_bytes,
-            pending_bytes: s.pending_bytes,
-            denied_at: s.denied_at,
-        });
-    pool_of(name, status.as_ref(), now)
-}
-
-/// One pool, from its status, here or on a node.
+/// One pool of a node, from its status; a stale one still shows when it
+/// last reported.
 fn pool_of(name: &str, status: Option<&PoolStatus>, now: Timestamp) -> PoolView {
     let mut p = PoolView { name: name.to_owned(), ..PoolView::default() };
     match status {
@@ -233,23 +194,19 @@ mod tests {
 
     #[test]
     fn stale_pools() {
-        let dir = tempfile::tempdir().unwrap();
         let now = Timestamp::now();
-        let file = dir.path().join("p.json");
-        let p = pool("p", &file, now);
+        let p = pool_of("p", None, now);
         assert!(p.stale && p.report == "no data");
-        let old = Status {
+        let old = PoolStatus {
             updated_at: now - SignedDuration::from_mins(5),
             committed_bytes: 1,
             pending_bytes: 0,
             denied_at: None,
         };
-        memory::write_status(&file, &old).unwrap();
-        let p = pool("p", &file, now);
+        let p = pool_of("p", Some(&old), now);
         assert!(p.stale && p.report.starts_with("no data since"), "{p:?}");
-        let fresh = Status { updated_at: now, committed_bytes: 1, pending_bytes: 2, denied_at: Some(now) };
-        memory::write_status(&file, &fresh).unwrap();
-        let p = pool("p", &file, now);
+        let fresh = PoolStatus { updated_at: now, committed_bytes: 1, pending_bytes: 2, denied_at: Some(now) };
+        let p = pool_of("p", Some(&fresh), now);
         assert!(!p.stale && p.pending == 2 && p.denied == "0 s ago", "{p:?}");
     }
 }

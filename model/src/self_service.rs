@@ -101,7 +101,7 @@ pub fn parse_ssh_keys(text: &str) -> Result<Vec<String>, String> {
     Ok(keys)
 }
 
-/// What the host lets people make, from the Nix configuration.
+/// What the front lets people make, from the Nix configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
@@ -224,8 +224,8 @@ pub struct Request {
     /// The apps it has, by id.
     #[serde(default)]
     pub apps: Vec<String>,
-    /// The node an admin picked for it, on a front with nodes; empty for
-    /// the one with the most free memory.
+    /// The node an admin picked for it; empty for the one with the most
+    /// free memory.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub node: String,
 }
@@ -291,7 +291,7 @@ pub struct NewView {
     /// Workspaces made at run time the viewer owns, and their quota.
     pub owned: u32,
     pub quota: u32,
-    /// On a front, for an admin: every node, to pick one from.
+    /// For an admin: every node, to pick one from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<crate::fleet::NodeView>,
     /// The node placement takes for the form as it starts, which is

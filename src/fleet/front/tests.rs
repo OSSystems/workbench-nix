@@ -73,7 +73,7 @@ async fn the_front_answers_a_node_for_its_own_workspaces_only() {
         Some("10.232.0.130"),
         "one made at run time has its record"
     );
-    // The secrets as a host on its own shares them.
+    // The secrets as the front reads them.
     let mut c = crate::config::tests::test_config();
     c.secrets_dir = s.dir.path().join("secrets/alice").display().to_string();
     c.environment_files = s.f.settings.self_service.as_ref().unwrap().environment_files.clone();

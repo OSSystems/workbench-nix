@@ -483,7 +483,7 @@ async fn tunnel(
         Ok(all) => all.into_iter().find(|ws| ws.name == c.name),
         Err(e) => return refused(StatusCode::BAD_GATEWAY, &format!("couldn't read the workspaces: {e:#}")),
     };
-    // On a front, a node that doesn't answer can't say its VM runs.
+    // A node that doesn't answer can't say its VM runs.
     match ws {
         Some(ws) if ws.vm == "Running" => {}
         Some(ws) if ws.state == workbench_model::State::Unreachable => {

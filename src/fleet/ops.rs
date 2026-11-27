@@ -2,7 +2,7 @@
 //! `workbench self-service create`, `destroy`, `apps`, `memory` and
 //! `reconcile` on a front, `workbench front setup` at boot and after a
 //! deploy, `workbench forget` and `workbench front import`. The web UI
-//! writes the requests and starts the units, as on a host on its own.
+//! writes the requests and starts the units.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -42,7 +42,7 @@ impl Fleet {
     }
 
     /// Its host key, which goes with it.
-    fn host_key_dir(&self, name: &str) -> Option<PathBuf> {
+    pub(crate) fn host_key_dir(&self, name: &str) -> Option<PathBuf> {
         (!self.settings.ssh.is_empty()).then(|| Path::new(&self.settings.ssh.host_keys).join(name))
     }
 
@@ -161,7 +161,10 @@ impl Fleet {
         reporting(&paths.outcome(name), None, "The front couldn't destroy it", true, self.take_away(name)).await
     }
 
-    async fn take_away(&self, name: &str) -> anyhow::Result<()> {
+    /// Stops a workspace made at run time and deletes it on its node and
+    /// the front: the web UI's Destroy, and `workbench destroy` on the
+    /// front.
+    pub(crate) async fn take_away(&self, name: &str) -> anyhow::Result<()> {
         let _lock = self.registry.lock()?;
         self.finish_pending().await;
         let r = self.made_at_run_time(name, "only the Nix configuration removes it")?;

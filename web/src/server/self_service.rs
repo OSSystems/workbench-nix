@@ -1,7 +1,6 @@
 //! What people do with workspaces of their own: the New workspace page,
-//! creating, changing their apps, destroying, and the admins' quotas and
-//! memory; on a front, the admins' nodes and moves too. The UI has no
-//! privilege: it writes the request, then starts the unit that makes,
+//! creating, changing their apps, destroying, and the admins' quotas,
+//! memory, nodes and moves. The UI has no privilege: it writes the request, then starts the unit that makes,
 //! destroys or moves the workspace as root, and reads how it went.
 
 use std::collections::BTreeMap;
@@ -35,7 +34,7 @@ pub struct CreateForm {
     pub memory_gib: String,
     pub disk_gib: String,
     pub apps: Vec<String>,
-    /// On a front, the node an admin picked.
+    /// The node an admin picked.
     pub node: String,
 }
 
@@ -119,7 +118,7 @@ impl AppState {
         let quotas = read_quotas(&ss.paths.quotas()).map_err(super::failed)?;
         let limits = self.limits_of(ss).await;
         // An admin picks the node, from the one placement takes.
-        let nodes = if viewer.admin { self.nodes().await.unwrap_or_default() } else { vec![] };
+        let nodes = if viewer.admin { self.nodes().await } else { vec![] };
         let node = placement::place(&nodes, first_needs(&limits), "").unwrap_or_default();
         Ok(NewView {
             slug: slug(&viewer.name),
@@ -152,16 +151,15 @@ impl AppState {
         let (Ok(memory), Ok(disk)) = (form.memory_gib.trim().parse::<Ceiling>(), form.disk_gib.trim().parse()) else {
             return refused("Memory and disk must be whole numbers of GiB, or memory auto.");
         };
-        // Only an admin picks a node, and only on a front.
-        let node = match self.nodes().await {
-            Some(nodes) if viewer.admin && !form.node.trim().is_empty() => {
-                let picked = form.node.trim();
-                if let Some(why) = why_not_on(&nodes, picked, "new workspaces") {
-                    return refused(&why);
-                }
-                picked.to_owned()
+        // Only an admin picks a node.
+        let node = if viewer.admin && !form.node.trim().is_empty() {
+            let picked = form.node.trim();
+            if let Some(why) = why_not_on(&self.nodes().await, picked, "new workspaces") {
+                return refused(&why);
             }
-            _ => String::new(),
+            picked.to_owned()
+        } else {
+            String::new()
         };
         let r = Request {
             name: form.name.trim().to_owned(),
@@ -374,12 +372,10 @@ impl AppState {
         Ok(())
     }
 
-    /// The `node` server function, for admins on a front: closes a node,
-    /// which then takes neither new workspaces nor moves, or reopens it.
+    /// The `node` server function, for admins: closes a node, which then
+    /// takes neither new workspaces nor moves, or reopens it.
     pub async fn node_action(&self, viewer: &Viewer, node: &str, closed: bool) -> Result<(), ServerFnError> {
-        let Some(fleet) = self.backend.fleet() else {
-            return Err(refuse("this host has no nodes", StatusCode::NOT_FOUND));
-        };
+        let fleet = self.backend.fleet();
         if !viewer.admin {
             return Err(refuse("nodes are for admins", StatusCode::FORBIDDEN));
         }
@@ -389,14 +385,12 @@ impl AppState {
         Ok(())
     }
 
-    /// The `move` server function, for admins on a front: asks for a
-    /// workspace made at run time's move to another node and starts the
+    /// The `move` server function, for admins: asks for a workspace made
+    /// at run time's move to another node and starts the
     /// unit that moves it as root; then the host page, or the move's page
     /// with why not. A declared workspace moves by changing Nix.
     pub async fn move_action(&self, viewer: &Viewer, name: &str, node: &str) -> Result<(), ServerFnError> {
-        let Some(fleet) = self.backend.fleet() else {
-            return Err(refuse("this host has no other nodes", StatusCode::NOT_FOUND));
-        };
+        let fleet = self.backend.fleet();
         if !viewer.admin {
             return Err(refuse("moving a workspace is for admins", StatusCode::FORBIDDEN));
         }
@@ -418,7 +412,7 @@ impl AppState {
         if node == ws.node {
             return refused(&format!("{name} is on {node} already."), StatusCode::UNPROCESSABLE_ENTITY);
         }
-        if let Some(why) = why_not_on(&self.nodes().await.unwrap_or_default(), node, "moves") {
+        if let Some(why) = why_not_on(&self.nodes().await, node, "moves") {
             return refused(&why, StatusCode::UNPROCESSABLE_ENTITY);
         }
         // One move of a workspace at a time, held until its unit is done.

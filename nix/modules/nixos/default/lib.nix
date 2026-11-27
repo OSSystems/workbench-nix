@@ -381,15 +381,13 @@ rec {
     firmware = "${pkgs.OVMF-cloud-hypervisor.fd}/FV/CLOUDHV.fd";
   };
 
-  # A declared workspace's config on its node: as on a host on its own,
-  # without the SSH CAs and the environment files, which the front keeps
-  # and gives at every start. Its secretsDir is the front's, a clean path
-  # the node doesn't read.
+  # A declared workspace's config on its node, without the SSH CAs and
+  # the environment files, which the front keeps and gives at every start.
+  # Its secretsDir is the front's, a clean path the node doesn't read.
   workspaceConfig =
     {
       subnet,
       stateDir,
-      socketGroup,
     }:
     name: ws:
     let
@@ -430,7 +428,6 @@ rec {
       inherit controlPort agentPort;
     }
     // vmPaths
-    // lib.optionalAttrs (socketGroup != "") { inherit socketGroup; }
     // (
       if ws.os == "ubuntu" then
         {
@@ -494,7 +491,6 @@ rec {
     {
       subnet,
       stateDir,
-      socketGroup,
       limits,
     }:
     let
@@ -510,7 +506,7 @@ rec {
     {
       inherit limits;
       inherit (fleet) domain;
-      inherit stateDir subnet socketGroup;
+      inherit stateDir subnet;
       scheme = fleet.publicScheme;
       # Unused on a node: the front keeps the secrets.
       inherit secretsRoot;
@@ -538,8 +534,6 @@ rec {
       };
       mkfsVfat = "${pkgs.dosfstools}/bin/mkfs.vfat";
       mcopy = "${pkgs.mtools}/bin/mcopy";
-      environmentCommand = "";
-      ownerCommand = "";
     }
     // vmPaths;
 

@@ -230,7 +230,6 @@ fn a_node_deletes_what_it_made() {
     let mut t = crate::self_service::tests::template();
     t.state_dir = dir.path().join("state").display().to_string();
     t.secrets_root = dir.path().join("secrets").display().to_string();
-    t.socket_group = String::new();
     let template = dir.path().join("template.json");
     std::fs::write(&template, serde_json::to_vec(&t).unwrap()).unwrap();
     let record = Record {

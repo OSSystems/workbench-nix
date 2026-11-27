@@ -1,6 +1,7 @@
-//! The ops commands on the host: `status`, `start`, `stop`, `restart`,
-//! `open-link`, `console` and `destroy`. Only start, stop, restart and
-//! destroy change a VM; the others talk to it through its sockets.
+//! The ops commands on a node: `status`, `start`, `stop`, `restart`,
+//! `open-link`, `console` and `destroy`, and `move` on the front. Only
+//! start, stop, restart and destroy change a VM; the others talk to it
+//! through its sockets.
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Read, Write};
@@ -8,11 +9,13 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
-use vmkit::hostutil;
 use vmkit::memory::GIB;
 use workbench_model::{Change, Stage, Verb, Workspace};
 
+use workbench_model::self_service::is_reserved;
+
 use crate::config::{self, Config, is_workspace_name};
+use crate::fleet::front::Fleet;
 use crate::state::{self, unit_name};
 
 /// How a command that reported an exit code ends.
@@ -155,22 +158,13 @@ fn or_dash(s: &str) -> String {
     if s.is_empty() { "-".into() } else { s.into() }
 }
 
-/// Where the web UI shares the consoles, when it runs.
-pub const SHARED_CONSOLES: &str = "/run/workbench-web/console.sock";
-
 /// Attaches the terminal to the VM's serial console until Ctrl-] is typed:
-/// the node's shared one on a node, the web UI's when it runs, the serial
-/// socket otherwise.
+/// the one the node shares with the front, or the serial socket while
+/// `workbench-node` doesn't run.
 pub fn console(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     let c = config::load(dirs, name)?;
-    let shared = match shared_console(Path::new(crate::fleet::NODE_CONSOLES), name)? {
-        Some(conn) => Some((conn, " (shared with the front)")),
-        // Until the modules render a fleet: the web UI of a host on its
-        // own shares them.
-        None => shared_console(Path::new(SHARED_CONSOLES), name)?.map(|conn| (conn, " (shared with the web UI)")),
-    };
-    let (conn, shared) = match shared {
-        Some(s) => s,
+    let (conn, shared) = match shared_console(Path::new(crate::fleet::NODE_CONSOLES), name)? {
+        Some(conn) => (conn, " (shared with the front)"),
         None => (UnixStream::connect(c.serial()).with_context(|| format!("serial console of {name}"))?, ""),
     };
     let raw = RawTerminal::new();
@@ -180,8 +174,9 @@ pub fn console(dirs: &[PathBuf], name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Asks the web UI's shared consoles for one: the workspace's name and a
-/// newline, then `OK` or `ERR <why>`. `None` when the UI does not run.
+/// Asks the node's shared consoles for one: the workspace's name and a
+/// newline, then `OK` or `ERR <why>`. `None` when the node's API doesn't
+/// run.
 pub(crate) fn shared_console(socket: &Path, name: &str) -> anyhow::Result<Option<UnixStream>> {
     let Ok(mut conn) = UnixStream::connect(socket) else { return Ok(None) };
     conn.write_all(format!("{name}\n").as_bytes())?;
@@ -195,8 +190,8 @@ pub(crate) fn shared_console(socket: &Path, name: &str) -> anyhow::Result<Option
     let answer = String::from_utf8_lossy(&answer);
     match answer.strip_prefix("ERR ") {
         _ if answer == "OK" => Ok(Some(conn)),
-        Some(why) => bail!("the web UI's console of {name}: {why}"),
-        None => bail!("the web UI's console of {name} answered {answer:?}"),
+        Some(why) => bail!("the shared console of {name}: {why}"),
+        None => bail!("the shared console of {name} answered {answer:?}"),
     }
 }
 
@@ -267,12 +262,7 @@ impl Drop for RawTerminal {
 
 /// `workbench move <ws> <node>` on a front: asks for the move as the web
 /// UI does, runs `workbench-move@<ws>` and says how it went.
-pub async fn request_move(
-    fleet: &crate::fleet::front::Fleet,
-    name: &str,
-    node: &str,
-    out: &mut impl Write,
-) -> anyhow::Result<()> {
+pub async fn request_move(fleet: &Fleet, name: &str, node: &str, out: &mut impl Write) -> anyhow::Result<()> {
     let asked = std::time::SystemTime::now();
     fleet.ask_move(name, node)?;
     let unit = format!("workbench-move@{name}.service");
@@ -290,50 +280,59 @@ pub async fn request_move(
 }
 
 /// Stops a workspace and deletes its disk, after the name is typed again
-/// unless `yes`. It is the only way workspace data is deleted.
+/// unless `yes`. It is the only way workspace data is deleted. One made at
+/// run time is the front's: on the front it goes as the web UI's Destroy
+/// takes it, with its record, secrets and host key; on a node it is
+/// refused.
 pub async fn destroy(
     dirs: &[PathBuf],
     state_root: &Path,
+    front: Option<&Fleet>,
     name: &str,
     yes: bool,
     input: &mut impl BufRead,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     ensure!(is_workspace_name(name), "invalid workspace name {name:?}");
-    let declared = config::load(dirs, name).ok();
-    let state_dir = declared.as_ref().map_or_else(|| state_root.join(name), |c| PathBuf::from(&c.state_dir));
-    ensure!(state_dir.exists(), "workspace {name} has no data in {}", state_dir.display());
-    if !yes {
-        write!(
-            out,
-            "This stops workspace {name} and deletes {}, its disk and everything in it.\nType the workspace name to confirm: ",
-            state_dir.display()
-        )?;
-        out.flush()?;
-        let mut answer = String::new();
-        let _ = input.read_line(&mut answer);
-        ensure!(answer.trim() == name, "not confirmed; nothing deleted");
-    }
-    // One made at run time has more than its disk to take away.
-    if declared.as_ref().is_some_and(|c| c.self_service) {
-        let t = crate::self_service::Template::load(Path::new(crate::self_service::TEMPLATE))?;
-        crate::self_service::destroy(&t, name).await?;
-        writeln!(out, "Deleted {} and everything of {name}.", state_dir.display())?;
+    // `registry`, `closed`, `ssh`… are the state directory's own.
+    ensure!(!is_reserved(name), "{name} is one of the state directory's own names, not a workspace");
+    if let Some(fleet) = front
+        && let Some(r) = fleet.record(name).ok().filter(|r| !r.declared && !r.owner.is_empty())
+    {
+        if r.is_moving() {
+            return Err(crate::fleet::front::moving(name));
+        }
+        let what = format!(
+            "This stops workspace {name} and deletes it: its disk and everything in it on node {}, its record, its secrets and its host key.",
+            r.node
+        );
+        confirm(&what, name, yes, input, out)?;
+        fleet.take_away(name).await?;
+        writeln!(out, "Deleted {name} and everything of it, on node {} and here.", r.node)?;
         return Ok(());
     }
+    let declared = config::load(dirs, name).ok();
+    // One made at run time is the front's: its record would outlive it.
+    ensure!(
+        !declared.as_ref().is_some_and(|c| c.self_service),
+        "{name} was made at run time: destroy it on the front, `sudo workbench destroy {name}`, or in the web UI"
+    );
+    let state_dir = declared.as_ref().map_or_else(|| state_root.join(name), |c| PathBuf::from(&c.state_dir));
+    ensure!(state_dir.exists(), "workspace {name} has no data in {}", state_dir.display());
+    let what =
+        format!("This stops workspace {name} and deletes {}, its disk and everything in it.", state_dir.display());
+    confirm(&what, name, yes, input, out)?;
     let unit = unit_name(name);
-    let stop = tokio::process::Command::new("systemctl").args(["stop", &unit]).output().await?;
-    if !stop.status.success() {
-        bail!("stopping {unit}: {}: {}", stop.status, String::from_utf8_lossy(&stop.stderr).trim());
-    }
+    crate::self_service::run_tool("systemctl", &["stop", &unit]).await.with_context(|| format!("stopping {unit}"))?;
     // An error counts as running: nothing is deleted under a VM.
-    if hostutil::unit_running(&unit).await.unwrap_or(true) {
+    if crate::self_service::unit_running(&unit).await {
         bail!("{unit} is still running or about to start; nothing deleted");
     }
     std::fs::remove_dir_all(&state_dir)?;
-    // Its SSH host key goes with it: a workspace made again with its name
-    // is another machine.
-    if let Some(keys) = declared.as_ref().and_then(Config::host_key_dir) {
+    // Its SSH host key goes with it, here or on the front of the same
+    // machine: a workspace made again with its name is another machine.
+    let keys = declared.as_ref().and_then(Config::host_key_dir).or_else(|| front?.host_key_dir(name));
+    if let Some(keys) = keys {
         match std::fs::remove_dir_all(&keys) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
@@ -352,6 +351,19 @@ pub async fn destroy(
             "{name} is still declared: its next start makes a fresh disk. Remove it from the configuration to keep it gone."
         )?;
     }
+    Ok(())
+}
+
+/// Says what a destroy deletes and has the name typed again, unless `yes`.
+fn confirm(what: &str, name: &str, yes: bool, input: &mut impl BufRead, out: &mut impl Write) -> anyhow::Result<()> {
+    if yes {
+        return Ok(());
+    }
+    write!(out, "{what}\nType the workspace name to confirm: ")?;
+    out.flush()?;
+    let mut answer = String::new();
+    let _ = input.read_line(&mut answer);
+    ensure!(answer.trim() == name, "not confirmed; nothing deleted");
     Ok(())
 }
 
@@ -385,17 +397,125 @@ mod tests {
         let dirs = [nowhere.path().to_owned()];
         let mut out = Vec::new();
         for answer in ["", "alice\n", "bo\n", "yes\n"] {
-            let err = destroy(&dirs, root.path(), "bob", false, &mut answer.as_bytes(), &mut out).await.unwrap_err();
+            let err =
+                destroy(&dirs, root.path(), None, "bob", false, &mut answer.as_bytes(), &mut out).await.unwrap_err();
             assert!(err.to_string().contains("not confirmed"), "answer {answer:?}: {err}");
         }
         assert!(disk.exists(), "disk deleted without confirmation");
         assert!(String::from_utf8_lossy(&out).contains("Type the workspace name"));
         assert!(
-            destroy(&[], root.path(), "../etc", true, &mut &b""[..], &mut out).await.is_err(),
+            destroy(&[], root.path(), None, "../etc", true, &mut &b""[..], &mut out).await.is_err(),
             "destroyed a path outside the state root"
         );
-        let err = destroy(&[], root.path(), "carol", true, &mut &b""[..], &mut out).await.unwrap_err();
+        let err = destroy(&[], root.path(), None, "carol", true, &mut &b""[..], &mut out).await.unwrap_err();
         assert!(err.to_string().contains("no data"), "destroying an unknown workspace: {err}");
+    }
+
+    /// On a node, a workspace made at run time is refused: the front keeps
+    /// its record.
+    #[tokio::test]
+    async fn one_made_at_run_time_is_the_fronts_to_destroy() {
+        let root = tempfile::tempdir().unwrap();
+        let configs = root.path().join("configs");
+        std::fs::create_dir_all(&configs).unwrap();
+        let mut c = crate::config::tests::test_config();
+        c.state_dir = root.path().join("alice-dev").display().to_string();
+        c.self_service = true;
+        std::fs::create_dir_all(&c.state_dir).unwrap();
+        std::fs::write(configs.join("alice-dev.json"), serde_json::to_vec(&c).unwrap()).unwrap();
+        let mut out = Vec::new();
+        let err = destroy(&[configs], root.path(), None, "alice-dev", true, &mut &b""[..], &mut out).await.unwrap_err();
+        assert!(err.to_string().contains("destroy it on the front, `sudo workbench destroy alice-dev`"), "{err}");
+        assert!(Path::new(&c.state_dir).exists(), "nothing deleted");
+    }
+
+    /// On the front, a workspace made at run time goes as the web UI's
+    /// Destroy takes it: on its node, and its record, secrets and host key
+    /// on the front, once its name is typed again; not while it moves.
+    #[tokio::test]
+    async fn on_the_front_one_made_at_run_time_goes_with_its_record() {
+        use workbench_model::fleet::{Move, Phase, Record};
+        let dir = tempfile::tempdir().unwrap();
+        let a = crate::fleet::fake::FakeNode::new("a", dir.path().join("a"), 14);
+        let fleet = crate::fleet::fake::fleet(crate::fleet::tests::front_settings(dir.path()), &[&a]);
+        let r = crate::fleet::registry::tests::record("alice-dev", "a", "10.232.0.128");
+        fleet.registry.put(&r).unwrap();
+        a.has(&r, true, b"disk");
+        let secrets = dir.path().join("secrets/alice-dev");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let nowhere = dir.path().join("nowhere");
+        let mut out = Vec::new();
+        let gone = |a: &crate::fleet::fake::FakeNode| a.ws("alice-dev").is_none();
+
+        let err = destroy(&[], &nowhere, Some(&fleet), "alice-dev", false, &mut &b"alice\n"[..], &mut out).await;
+        assert!(err.unwrap_err().to_string().contains("not confirmed"));
+        assert!(String::from_utf8_lossy(&out).contains("on node a, its record"), "it says what goes");
+        let moving = Move {
+            from: "a".into(),
+            from_ip: "10.232.0.128".into(),
+            to: "b".into(),
+            ip: "10.232.1.128".into(),
+            phase: Phase::Copy,
+            ran: true,
+        };
+        fleet.registry.put(&Record { moving: Some(moving), ..r.clone() }).unwrap();
+        let err = destroy(&[], &nowhere, Some(&fleet), "alice-dev", true, &mut &b""[..], &mut out).await;
+        assert!(err.unwrap_err().to_string().contains("moving"), "refused while it moves");
+        assert!(!gone(&a) && fleet.registry.get("alice-dev").unwrap().is_some(), "nothing deleted");
+
+        fleet.registry.put(&r).unwrap();
+        destroy(&[], &nowhere, Some(&fleet), "alice-dev", false, &mut &b"alice-dev\n"[..], &mut out).await.unwrap();
+        assert!(gone(&a), "its node deleted it");
+        assert!(fleet.registry.get("alice-dev").unwrap().is_none() && !secrets.exists(), "and the front its record");
+    }
+
+    /// The state directory's own names are no workspace's: `destroy
+    /// registry` deletes nothing.
+    #[tokio::test]
+    async fn no_workspace_is_named_as_the_state_directory_s_own() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("registry")).unwrap();
+        let mut out = Vec::new();
+        for name in ["registry", "closed", "ssh", "configs"] {
+            let err = destroy(&[], root.path(), None, name, true, &mut &b""[..], &mut out).await.unwrap_err();
+            assert!(err.to_string().contains("state directory's own names"), "{name}: {err}");
+        }
+        assert!(root.path().join("registry").exists());
+    }
+
+    /// A declared workspace's host key, on the front of the same machine,
+    /// goes with its disk: one made again with its name is another
+    /// machine.
+    #[tokio::test]
+    async fn a_declared_workspace_goes_with_its_host_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = crate::fleet::fake::FakeNode::new("a", dir.path().join("a"), 14);
+        let mut settings = crate::fleet::tests::front_settings(dir.path());
+        let hosts = dir.path().join("hosts");
+        settings.ssh = config::SshCa {
+            keygen: "/bin/ssh-keygen".into(),
+            host_ca: "/ca/host-ca".into(),
+            user_ca: "/ca/user-ca.pub".into(),
+            host_keys: hosts.display().to_string(),
+        };
+        let fleet = crate::fleet::fake::fleet(settings, &[&a]);
+        let configs = dir.path().join("configs");
+        std::fs::create_dir_all(&configs).unwrap();
+        let mut c = crate::config::tests::test_config();
+        c.state_dir = dir.path().join("alice-dev").display().to_string();
+        c.ssh = config::SshCa::default();
+        std::fs::write(configs.join("alice-dev.json"), serde_json::to_vec(&c).unwrap()).unwrap();
+        std::fs::create_dir_all(&c.state_dir).unwrap();
+        std::fs::create_dir_all(hosts.join("alice-dev")).unwrap();
+        // systemctl stops it, and says it no longer runs.
+        crate::self_service::tools::stub(|_, args| {
+            anyhow::ensure!(args.first() != Some(&"is-active"), "inactive");
+            Ok(())
+        });
+        let mut out = Vec::new();
+        destroy(&[configs], dir.path(), Some(&fleet), "alice-dev", true, &mut &b""[..], &mut out).await.unwrap();
+        assert!(!Path::new(&c.state_dir).exists(), "its disk");
+        assert!(!hosts.join("alice-dev").exists(), "its host key");
     }
 
     /// `workbench move` says how this move went, not an earlier one.
@@ -433,7 +553,7 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("console.sock");
-        assert!(shared_console(&socket, "alice").unwrap().is_none(), "no UI, no shared console");
+        assert!(shared_console(&socket, "alice").unwrap().is_none(), "no node's API, no shared console");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             for answer in ["OK\nboot log", "ERR no workspace \"bob\"\n"] {

@@ -63,7 +63,8 @@ enum Command {
     },
     /// Attach to the serial console (Ctrl-] quits)
     Console { workspace: String },
-    /// Stop a workspace and delete its disk
+    /// Stop a workspace and delete its disk; on the front, one made at run
+    /// time, with its record
     Destroy {
         workspace: String,
         /// Do not ask for confirmation
@@ -73,8 +74,8 @@ enum Command {
         #[arg(long, default_value = "/var/lib/workbench")]
         state_root: PathBuf,
     },
-    /// Become the workspace's VM (internal: the unit's ExecStart); on a
-    /// node, with what the front answers
+    /// Become the workspace's VM, with what the front answers (internal:
+    /// the unit's ExecStart)
     Run { workspace: String },
     /// Move a workspace made at run time to another node (on the front)
     Move { workspace: String, node: String },
@@ -97,8 +98,6 @@ enum Command {
         #[command(subcommand)]
         command: FrontCommand,
     },
-    /// Let the web UI use the VM's sockets (internal: the unit's ExecStartPost)
-    ShareSockets { workspace: String },
     /// Power the VM off cleanly (internal: the unit's ExecStop)
     Shutdown {
         workspace: String,
@@ -122,12 +121,9 @@ enum Command {
         #[arg(long = "mem-reserve-min-gib", default_value_t = 2.0)]
         reserve_min_gib: f64,
     },
-    /// Workspaces people make themselves (internal: the web UI's units and
-    /// the boot and reconciliation services)
+    /// Workspaces people make themselves, on the front (internal: the web
+    /// UI's units and the reconciliation timer)
     SelfService {
-        /// The host's template for them
-        #[arg(long, default_value = self_service::TEMPLATE)]
-        template: PathBuf,
         #[command(subcommand)]
         command: SelfServiceCommand,
     },
@@ -152,11 +148,8 @@ enum SelfServiceCommand {
     Memory { workspace: String },
     /// Stop a workspace made at run time and delete it
     Destroy { workspace: String },
-    /// Move a workspace to another node, or pick up its move (on a front)
+    /// Move a workspace to another node, or pick up its move
     Move { workspace: String },
-    /// Put back, at boot, the users and taps of workspaces made at run time,
-    /// and start them
-    Setup,
     /// Stop the workspaces of owners who left
     Reconcile,
 }
@@ -214,11 +207,9 @@ fn run(args: Args) -> anyhow::Result<()> {
     let rt = || tokio::runtime::Builder::new_multi_thread().enable_all().build();
     match args.command {
         // Becomes cloud-hypervisor: no runtime threads left behind.
-        Command::Run { workspace } => match NodeSettings::of_this_machine()? {
-            Some(node) => fleet::run::run(&node, &workspace),
-            // Until the modules render a fleet: a host on its own.
-            None => launch::run(&dirs, &workspace),
-        },
+        Command::Run { workspace } => {
+            fleet::run::run(&NodeSettings::load(std::path::Path::new(NODE_SETTINGS))?, &workspace)
+        }
         Command::Node { settings, command } => {
             let node = NodeSettings::load(&settings)?;
             rt()?.block_on(async {
@@ -246,28 +237,29 @@ fn run(args: Args) -> anyhow::Result<()> {
             })
         }
         Command::Move { workspace, node } => {
-            let fleet =
-                Fleet::of_this_machine()?.ok_or_else(|| anyhow::anyhow!("this machine isn't a fleet's front"))?;
-            rt()?.block_on(cli::request_move(&fleet, &workspace, &node, &mut std::io::stdout().lock()))
+            rt()?.block_on(cli::request_move(&front()?, &workspace, &node, &mut std::io::stdout().lock()))
         }
-        Command::Forget { workspace } => {
-            let fleet =
-                Fleet::of_this_machine()?.ok_or_else(|| anyhow::anyhow!("this machine isn't a fleet's front"))?;
-            rt()?.block_on(fleet.forget(&workspace))
-        }
+        Command::Forget { workspace } => rt()?.block_on(front()?.forget(&workspace)),
         Command::Console { workspace } => cli::console(&dirs, &workspace),
-        Command::ShareSockets { workspace } => {
-            // The sockets come once the disk is made, which the unit's
-            // TimeoutStartSec bounds.
-            rt()?.block_on(launch::share_sockets(&dirs, &workspace, Duration::from_secs(24 * 3600)))
-        }
         Command::Shutdown { workspace, timeout } => {
             rt()?.block_on(launch::shutdown(&dirs, &workspace, Duration::from_secs(timeout)))
         }
         Command::Memory { status_file, behind, reserve_percent, reserve_min_gib } => rt()?
             .block_on(memoryd::run(memoryd::Options { dirs, status_file, behind, reserve_percent, reserve_min_gib })),
         Command::GuestAgent { config } => rt()?.block_on(agent::run(&config)),
-        Command::SelfService { template, command } => self_service_command(&dirs, &template, command),
+        Command::SelfService { command } => {
+            let fleet = front()?;
+            rt()?.block_on(async {
+                match command {
+                    SelfServiceCommand::Create { workspace } => fleet.create(&workspace).await,
+                    SelfServiceCommand::Destroy { workspace } => fleet.destroy(&workspace).await,
+                    SelfServiceCommand::Apps { workspace } => fleet.apps(&workspace).await,
+                    SelfServiceCommand::Memory { workspace } => fleet.memory(&workspace).await,
+                    SelfServiceCommand::Move { workspace } => fleet.move_workspace(&workspace).await,
+                    SelfServiceCommand::Reconcile => fleet.reconcile().await,
+                }
+            })
+        }
         Command::Start { workspace, state } => {
             rt()?.block_on(cli::control(&dirs, &state.path, Verb::Start, &workspace))
         }
@@ -282,6 +274,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Destroy { workspace, yes, state_root } => rt()?.block_on(cli::destroy(
             &dirs,
             &state_root,
+            Fleet::of_this_machine()?.as_ref(),
             &workspace,
             yes,
             &mut std::io::stdin().lock(),
@@ -290,38 +283,19 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 }
 
-/// `workbench self-service`: on a front, through the registry and the
-/// nodes; on a host on its own, as before.
-fn self_service_command(
-    dirs: &[PathBuf],
-    template: &std::path::Path,
-    command: SelfServiceCommand,
-) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    if let Some(fleet) = Fleet::of_this_machine()? {
-        return rt.block_on(async {
-            match command {
-                SelfServiceCommand::Create { workspace } => fleet.create(&workspace).await,
-                SelfServiceCommand::Destroy { workspace } => fleet.destroy(&workspace).await,
-                SelfServiceCommand::Apps { workspace } => fleet.apps(&workspace).await,
-                SelfServiceCommand::Memory { workspace } => fleet.memory(&workspace).await,
-                SelfServiceCommand::Move { workspace } => fleet.move_workspace(&workspace).await,
-                SelfServiceCommand::Setup => fleet.setup().await,
-                SelfServiceCommand::Reconcile => fleet.reconcile().await,
-            }
-        });
+/// This machine's fleet, as its front.
+fn front() -> anyhow::Result<Fleet> {
+    Fleet::of_this_machine()?.ok_or_else(|| anyhow::anyhow!("this machine isn't a fleet's front"))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    /// The VMs' sockets are their users' and root's: no command shares them
+    /// with anyone else.
+    #[test]
+    fn nothing_shares_the_vms_sockets() {
+        assert!(super::Args::command().find_subcommand("share-sockets").is_none());
     }
-    // Until the modules render a fleet: a host on its own.
-    let t = Template::load(template)?;
-    rt.block_on(async {
-        match command {
-            SelfServiceCommand::Create { workspace } => self_service::create(dirs, &t, &workspace).await,
-            SelfServiceCommand::Destroy { workspace } => self_service::destroy(&t, &workspace).await,
-            SelfServiceCommand::Apps { workspace } => self_service::apps(&t, &workspace).await,
-            SelfServiceCommand::Memory { workspace } => self_service::memory(&t, &workspace).await,
-            SelfServiceCommand::Move { .. } => anyhow::bail!("a host on its own has no other node"),
-            SelfServiceCommand::Setup => self_service::setup(&t).await,
-            SelfServiceCommand::Reconcile => self_service::reconcile(&t).await,
-        }
-    })
 }

@@ -1688,70 +1688,8 @@ fn HostPage() -> impl IntoView {
 fn Host(snap: Snapshot, host: HostView) -> impl IntoView {
     let viewer = snap.viewer.clone();
     let snap = Signal::stored(snap);
-    // A front's page is its nodes'; a host on its own's, its memory.
-    let body = if let Some(nodes) = host.nodes {
-        let targets: Vec<Target> = nodes.iter().filter(|n| n.node.takes()).map(Target::of).collect();
-        nodes.into_iter().map(|n| view! { <NodePanel n targets=targets.clone() /> }).collect_view().into_any()
-    } else {
-        let ws_rows = if host.workspaces.is_empty() {
-            view! {
-                <div>
-                    <span></span>
-                    <span class="small">"No workspace is running."</span>
-                </div>
-            }
-            .into_any()
-        } else {
-            host.workspaces
-                .iter()
-                .map(|w| {
-                    view! {
-                        <div role="row">
-                            <span class=format!("dot {}", w.state.dot())></span>
-                            <a class="mono" href=format!("/?w={}", w.name)>{w.name.clone()}</a>
-                            <span>{w.owner.clone()}</span>
-                            <span class="num">{format!("{} GiB", gib(w.memory_bytes))}</span>
-                            <span class="num">{format!("{} GiB", gib(w.boot_memory_bytes))}</span>
-                            <span class="num">{format!("{} GiB", gib(w.max_memory_bytes))}</span>
-                            <span class="num">
-                                {format!("{} GiB", gib(i64::try_from(w.disk_used_bytes).unwrap_or(i64::MAX)))}
-                            </span>
-                        </div>
-                    }
-                })
-                .collect_view()
-                .into_any()
-        };
-        view! {
-            <section class="panel">
-                <header>
-                    <h2>"Memory"</h2>
-                    <span>{format!("{} GiB total", gib(host.total))}</span>
-                    <span class="rt">{format!("{} GiB free", gib(host.free))}</span>
-                </header>
-                <Memory total=host.total reserve=host.reserve free=host.free pools=host.pools />
-            </section>
-            <section class="panel">
-                <header>
-                    <h2>"Workspaces"</h2>
-                    <span>"memory now, at boot and at most"</span>
-                </header>
-                <div class="tbl ws" role="table">
-                    <div class="hd" role="row">
-                        <span></span>
-                        <span>"Workspace"</span>
-                        <span>"Owner"</span>
-                        <span class="num">"Now"</span>
-                        <span class="num">"Boot"</span>
-                        <span class="num">"Most"</span>
-                        <span class="num">"Disk"</span>
-                    </div>
-                    {ws_rows}
-                </div>
-            </section>
-        }
-        .into_any()
-    };
+    let targets: Vec<Target> = host.nodes.iter().filter(|n| n.node.takes()).map(Target::of).collect();
+    let body = host.nodes.into_iter().map(|n| view! { <NodePanel n targets=targets.clone() /> }).collect_view();
     view! {
         <div class="app">
             <Top viewer />
@@ -1772,8 +1710,8 @@ fn Host(snap: Snapshot, host: HostView) -> impl IntoView {
     }
 }
 
-/// A host's or a node's memory: one bar of its total, what each pool holds
-/// and waits for, the reserve and what's free, then a row per pool.
+/// A node's memory: one bar of its total, what each pool holds and waits
+/// for, the reserve and what's free, then a row per pool.
 #[component]
 fn Memory(total: i64, reserve: i64, free: i64, pools: Vec<PoolView>) -> impl IntoView {
     let bar = |i: usize| if i == 0 { "sw1" } else { "sw2" };
@@ -2078,7 +2016,7 @@ fn MoveForm(
     .into_any()
 }
 
-/// A workspace's move page, `/w/<ws>/move`, for admins on a front: the
+/// A workspace's move page, `/w/<ws>/move`, for admins: the
 /// host page's dialog without JavaScript, and where a refused move comes
 /// back to.
 #[component]
@@ -2093,7 +2031,7 @@ fn MovePage() -> impl IntoView {
                 let error = query.with_untracked(|q| q.get("error").unwrap_or_default());
                 match data.await {
                     Ok((snap, host)) => {
-                        let nodes = host.nodes.unwrap_or_default();
+                        let nodes = host.nodes;
                         let found = nodes.iter().flat_map(|n| &n.workspaces).find(|w| w.name == name && w.configured);
                         let Some(ws) = found.cloned() else {
                             return view! { <Forbidden viewer=Some(snap.viewer) /> }.into_any();
@@ -2817,7 +2755,7 @@ fn NewForm(viewer: Viewer, new: NewView, filled: Filled) -> impl IntoView {
             </fieldset>
         }
     });
-    // An admin on a front picks the node, from the one placement takes.
+    // An admin picks the node, from the one placement takes.
     let node = (!new.nodes.is_empty()).then(|| {
         let chosen = if filled.node.is_empty() { new.node.clone() } else { filled.node.clone() };
         let options = new

@@ -25,7 +25,7 @@ pub fn run(settings: &NodeSettings, name: &str) -> anyhow::Result<()> {
     let answer = rt.block_on(front.start(name)).map_err(|e| anyhow::anyhow!("the front: {e}"))?;
     drop(rt);
     let c = config_for(settings, name, &answer)?;
-    launch::boot(&c, Some(&answer.given()))
+    launch::boot(&c, &answer.given())
 }
 
 /// The config a workspace starts with: a declared one's is Nix's, and one

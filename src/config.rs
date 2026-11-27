@@ -99,8 +99,10 @@ pub struct Config {
     pub control_port: i64,
     pub agent_port: i64,
 
-    /// When set, may use the VM's sockets: the web UI's group.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// Read and ignored: a config written when the web UI of a host on its
+    /// own used the VM's sockets has it, until `workbench node setup`
+    /// writes it again.
+    #[serde(skip_serializing)]
     pub socket_group: String,
 
     /// Made at run time by its owner, not declared in Nix.
@@ -274,11 +276,6 @@ impl Config {
             );
         }
         ensure!(self.control_port != self.agent_port, "controlPort and agentPort must differ");
-        ensure!(
-            self.socket_group.is_empty() || is_user_name(&self.socket_group),
-            "invalid socket group {:?}",
-            self.socket_group
-        );
         for (k, v) in &self.environment {
             ensure!(is_env_name(k) && !v.contains(['\n', '\0']), "invalid environment variable {k:?}");
         }
@@ -552,7 +549,6 @@ pub(crate) mod tests {
             ("ubuntu without seed", |c| c.seed = String::new()),
             ("nixos with seed", |c| c.os = "nixos".into()),
             ("same vsock ports", |c| c.agent_port = c.control_port),
-            ("bad socket group", |c| c.socket_group = "wheel users".into()),
             ("app id", |c| c.apps[0].id = "t3-code".into()),
             ("app port 0", |c| c.apps[0].port = Some(0)),
             ("app bundle", |c| c.apps[0].bundle = "x".into()),
@@ -585,7 +581,7 @@ pub(crate) mod tests {
     }
 
     /// A config written before apps: its app and port, and nothing else,
-    /// which the host's self-service setup turns into one with apps.
+    /// which `workbench node setup` turns into one with apps.
     #[test]
     fn configs_from_before_apps() {
         let mut v = serde_json::to_value(test_config()).unwrap();
