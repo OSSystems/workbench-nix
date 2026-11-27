@@ -356,10 +356,19 @@ pkgs.testers.runNixOSTest {
           "alice--nope.${domain}"
           "alice--herdr.${domain}"
         ]
-        ++ lib.concatMap (name: [
-          "${name}.${domain}"
-          "${name}--t3code.${domain}"
-        ]) (lib.attrNames workspaces ++ [ "alice-dev" ]);
+        ++
+          lib.concatMap
+            (name: [
+              "${name}.${domain}"
+              "${name}--t3code.${domain}"
+            ])
+            (
+              lib.attrNames workspaces
+              ++ [
+                "alice-dev"
+                "alice-old"
+              ]
+            );
         networking.interfaces.eth1.ipv4.addresses = lib.mkForce [
           {
             address = clientIP;
@@ -948,5 +957,47 @@ pkgs.testers.runNixOSTest {
         host.fail("test -e /var/lib/workbench/alice-dev")
         host.fail("getent passwd wb-alice-dev")
         host.fail(f"ip link show {tap}")
+
+    with subtest("a workspace made at run time before the fleet comes through the upgrade"):
+        # As a host on its own wrote it, with its secrets, seed and disk,
+        # and no record: what a deploy of this release finds there.
+        name, ip = "alice-old", "10.232.0.200"
+        old = dict(config, name=name, user=f"wb-{name}", url=f"https://{name}.${domain}", ip=ip, uid=60650,
+                   stateDir=f"/var/lib/workbench/{name}", runtimeDir=f"/run/workbench/{name}",
+                   seed=f"/var/lib/workbench/.seeds/{name}.img", tap="wb0ae800c8", mac="02:00:0a:e8:00:c8",
+                   secretsDir=f"/var/lib/workbench-secrets/{name}", socketGroup="workbench",
+                   ssh={"keygen": "${pkgs.openssh}/bin/ssh-keygen", "hostCa": "/var/lib/workbench/ssh/host-ca",
+                        "userCa": "/var/lib/workbench/ssh/user-ca.pub", "hostKeys": "/var/lib/workbench/ssh/hosts"})
+        host.succeed(f"echo {shlex.quote(json.dumps(old))} > /var/lib/workbench/configs/{name}.json")
+        host.succeed(
+            f"install -d -m 0700 /var/lib/workbench-secrets/{name}"
+            f" && echo WORKSPACE_TOKEN=token-of-alice > /var/lib/workbench-secrets/{name}/environment"
+            f" && echo seed > {old['seed']} && echo from-main > /var/lib/workbench/.seeds/{name}.instance"
+            f" && install -d -m 0711 {old['stateDir']}"
+            f" && {old['qemuImg']} convert -f {old['imageFormat']} -O raw {old['image']} {old['stateDir']}/disk.raw"
+        )
+        host.fail(f"test -e /var/lib/workbench/registry/{name}.json")
+        # The deploy: the node's setup puts its user, tap and seed back and
+        # starts it, which the front refuses until its setup has its record.
+        host.succeed("systemctl restart workbench-node-setup.service workbench-front-setup.service")
+        record = record_of(name)
+        assert (record["node"], record["ip"], record["owner"]) == ("host", ip, "alice") and not record.get("declared"), record
+        workspaces[name] = {"ip": ip, "owner": "alice"}
+        host.wait_until_succeeds(f"ssh {ssh_opts} alice@{ip} true", timeout=900)
+        guest(name, "cloud-init status --wait >/dev/null")
+        guest(name, "timeout 600 sh -c 'until systemctl is-active workspace-app-t3code.service; do sleep 5; done'")
+        pid = guest(name, "systemctl show -P MainPID workspace-app-t3code.service").strip()
+        assert "WORKSPACE_TOKEN=token-of-alice" in guest(name, f"sudo cat /proc/{pid}/environ | tr '\\0' '\\n'")
+        mine = json.loads(client.succeed(f"curl -sf {as_user('alice')} https://${domain}/api/workspaces"))
+        assert any(w["name"] == name for w in mine), "listed for its owner"
+        client.wait_until_succeeds(
+            f"curl -s -o /dev/null -w '%{{http_code}}' {as_user('alice')} {url(name)}/.well-known/t3/environment | grep -qx 200",
+            timeout=300,
+        )
+        # The front takes it away, as the UI's Destroy does.
+        host.succeed(f"echo {name} | workbench destroy {name}")
+        host.fail(f"test -e /var/lib/workbench/registry/{name}.json")
+        host.fail(f"test -e /var/lib/workbench/configs/{name}.json")
+        host.fail(f"getent passwd wb-{name}")
   '';
 }
