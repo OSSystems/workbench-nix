@@ -9,7 +9,7 @@ made-up people, `alice` and `bob`, who own workspaces, and `carol`, an
 admin. `nix run .#screenshots` takes them again into `docs/fleet`.
 
 - [A front and its nodes](#a-front-and-its-nodes)
-- [Plugging in a node](#plugging-in-a-node)
+- [Three machines](#three-machines)
 - [What people see](#what-people-see)
 - [Where a new workspace goes](#where-a-new-workspace-goes)
 - [Starting a workspace](#starting-a-workspace)
@@ -59,49 +59,137 @@ flowchart TB
 A host on its own is a front and a node on one machine, which reaches its
 node through Unix sockets, without WireGuard.
 
-## Plugging in a node
+## Three machines
 
-A node is a machine that imports the module and the fleet, and enables
-`node`. To plug in `c`:
+[examples/fleet](../examples/fleet) is a fleet of three machines, each a
+`nixosConfiguration` of its own: the front, and nodes `a` and `b`.
+`checks.fleet` evaluates them, so they stay what the module takes.
 
-1. **Its key.** On `c`, a WireGuard key pair; the private key a file
-   readable by `systemd-network`, such as a sops secret:
-   ```sh
-   wg genkey | tee c.key | wg pubkey   # the public key, for the fleet
-   ```
-2. **The fleet**, which every machine imports alike, declares it: its
-   subnet, the `/24` its workspaces' addresses come from, and its address
-   and public key in the tunnel. Both are unused by any other node.
-   ```nix
-   services.workbench.fleet.nodes.c = {
-     subnet = "10.232.2";
-     wireguard = { address = "10.231.0.12"; publicKey = "…"; };
-   };
-   ```
-3. **The machine** enables `node`, by that name:
-   ```nix
-   services.workbench.node = {
-     enable = true;
-     name = "c";
-     network.externalInterface = "enp6s0";   # the workspaces' NAT
-     wireguard.privateKeyFile = "/run/secrets/wireguard";
-   };
-   ```
-4. **Deploy** the front and every node, as one build. `c` reaches the
-   front's `fleet.front.wireguard.endpoint` on UDP 51820; the front
-   peers with it.
+```text
+examples/fleet/
+├── flake.nix     # nixosConfigurations.front, .a and .b
+├── fleet.nix     # the same on every machine
+├── front.nix     # the front's role
+├── node-a.nix    # node a's
+├── node-b.nix    # node b's
+└── hardware/     # each machine's hardware-configuration.nix: yours
+```
 
-The first node on a machine other than the front's needs the front's own
-tunnel too: a key pair on the front, `front.wireguard.privateKeyFile`, and
-in the fleet `front.wireguard.publicKey` and `endpoint`, an address and
-port nodes reach.
+Every machine is the module, the one fleet, its role and its hardware:
 
-The host page has a section for it once it answers, and new workspaces
-may go there. `wg show wg-workbench` on the front shows its handshake.
+```nix
+# flake.nix
+machine = name: nixpkgs.lib.nixosSystem {
+  system = "x86_64-linux";
+  modules = [
+    workbench.nixosModules.default
+    ./fleet.nix            # the same on every machine
+    ./${name}.nix          # this machine's role
+    ./hardware/${name}.nix
+  ];
+};
+nixosConfigurations = {
+  front = machine "front";
+  a = machine "node-a";
+  b = machine "node-b";
+};
+```
+
+**The fleet** is what all of them must agree on: the domain, the tunnel,
+the nodes and the workspaces. A machine learns of the others only from
+it, so it is one file, imported alike, and deployed to all of them.
+
+```nix
+# fleet.nix, in short
+services.workbench.fleet = {
+  domain = "ws.example.com";
+  front.wireguard = {
+    publicKey = "FRONT_PUBLIC_KEY=";
+    endpoint = "front.example.com:51820";   # where nodes reach the front
+  };
+  nodes = {
+    a = { subnet = "10.232.0"; wireguard = { address = "10.231.0.10"; publicKey = "A_PUBLIC_KEY="; }; };
+    b = { subnet = "10.232.1"; wireguard = { address = "10.231.0.11"; publicKey = "B_PUBLIC_KEY="; }; };
+  };
+  workspaces = {
+    alice = { node = "a"; owner = "alice"; ip = "10.232.0.10"; };
+    bob = { node = "b"; owner = "bob"; ip = "10.232.1.10"; };
+  };
+};
+```
+
+**A role** is what only one machine has. The front has the UI, single
+sign-on, the certificate and self-service; a node, its name, the
+interface its workspaces go out through, and its own private key:
+
+```nix
+# front.nix, in short
+services.workbench.front = {
+  enable = true;
+  virtualHost = { forceSSL = true; useACMEHost = "ws.example.com"; };
+  wireguard.privateKeyFile = "/run/secrets/wireguard";
+  oidc = { … };
+  selfService = { … };
+};
+
+# node-a.nix
+services.workbench.node = {
+  enable = true;
+  name = "a";                                # its name in the fleet's nodes
+  network.externalInterface = "enp6s0";
+  wireguard.privateKeyFile = "/run/secrets/wireguard";
+};
+```
+
+| | `fleet.nix`, every machine | `front.nix` | `node-*.nix` |
+|---|---|---|---|
+| Domain, apps, packages, workspaces and their nodes | ✓ | | |
+| Each node's subnet and tunnel address | ✓ | | |
+| WireGuard | every public key, the front's endpoint | its private key | its private key |
+| Web UI, single sign-on, certificate, self-service | | ✓ | |
+| Its name, the workspaces' NAT interface | | | ✓ |
+
+**Keys.** Each machine has a WireGuard key pair. The private key stays on
+it, a file readable by `systemd-network`, such as a sops secret; the
+public key goes in the fleet:
+
+```sh
+wg genkey | tee wireguard.key | wg pubkey   # the public key, for fleet.nix
+```
+
+**Deploying.** All three from one commit and one `flake.lock`: each
+request between the front and a node carries the package's build, and one
+of another build is refused both ways. A node left behind runs its VMs
+but takes no new workspace, and its starts wait, until it catches up.
+
+```sh
+nixos-rebuild switch --flake .#front --target-host root@front.example.com
+nixos-rebuild switch --flake .#a --target-host root@node-a.example.com
+nixos-rebuild switch --flake .#b --target-host root@node-b.example.com
+```
+
+Each node brings `wg-workbench` up to the front's endpoint and keeps it
+up; the front takes it as a peer by its public key. `alice` starts on `a`
+and `bob` on `b`, each asking the front for its start. On the front,
+`wg show wg-workbench` has a handshake with each node, and the host page
+a section for each:
 
 ![The host page, for an admin: a section per node, with its state, memory, disk and workspaces, Close, and Move… on each workspace made in the UI](fleet/host.png)
 
 A declared workspace has no Move… there: its node is its `node` in Nix.
+
+### Another node
+
+To plug in `c`: a key pair on it; in `fleet.nix`, `nodes.c` with a
+subnet and a tunnel address no other node has; a `node-c.nix` with
+`name = "c"`; and `c = machine "node-c";` in the flake. Then deploy every
+machine: the front peers with it, and the host page shows it once it
+answers. New workspaces may go there from then on; none moves by itself.
+
+The front may be a node too: `nodes.front` in the fleet, and `node` on in
+`front.nix`, with `name = "front"`. It reaches its own node through Unix
+sockets, without WireGuard. A host on its own is that, with no other
+node, and no key at all.
 
 ## What people see
 

@@ -26,7 +26,9 @@ memory pools.
 ## Usage
 
 Every machine imports the module and the same `fleet`; the front enables
-`front`, each node `node`, with its own name.
+`front`, each node `node`, with its own name. [examples/fleet](examples/fleet)
+is a front and two nodes, each a `nixosConfiguration` of its own, which
+[docs/fleet.md](docs/fleet.md#three-machines) walks through.
 
 ```nix
 {
