@@ -1,6 +1,7 @@
 # What the fleet, front and node modules render, by evaluation: a front
 # alone, a node alone, a machine with both roles and other nodes, a host
-# on its own, and each of the fleet's assertions.
+# on its own, examples/fleet's three machines, and each of the fleet's
+# assertions.
 {
   pkgs,
   flake,
@@ -144,6 +145,16 @@ let
     (lib.recursiveUpdate asFront { services.workbench.front.wireguard.privateKeyFile = null; })
     (lib.recursiveUpdate (asNode "a") { services.workbench.node.wireguard.privateKeyFile = null; })
   ];
+  # examples/fleet's three machines, each its own nixosConfiguration there.
+  example =
+    name:
+    eval [
+      ../../examples/fleet/fleet.nix
+      ../../examples/fleet/${name}.nix
+    ];
+  exampleFront = example "front";
+  exampleA = example "node-a";
+  exampleB = example "node-b";
   broken =
     change:
     eval [
@@ -550,6 +561,38 @@ let
       msg = "an option of a host on its own names the one it became";
     }
     {
+      ok =
+        let
+          examples = [
+            exampleFront
+            exampleA
+            exampleB
+          ];
+          peersOf = c: map (p: p.PublicKey) (netdev c).wireguardPeers;
+        in
+        lib.all (c: failed c == [ ]) examples
+        &&
+          builtins.attrNames (json exampleFront "workbench-front.json").nodes == [
+            "a"
+            "b"
+          ]
+        &&
+          lib.sort lib.lessThan (peersOf exampleFront) == [
+            "A_PUBLIC_KEY="
+            "B_PUBLIC_KEY="
+          ]
+        && peersOf exampleA == [ "FRONT_PUBLIC_KEY=" ]
+        && peersOf exampleB == [ "FRONT_PUBLIC_KEY=" ]
+        && exampleFront.systemd.services ? workbench-web
+        && !(exampleFront.systemd.services ? workbench-node)
+        && exampleA.environment.etc ? "workbench/alice.json"
+        && !(exampleA.environment.etc ? "workbench/bob.json")
+        && exampleB.environment.etc ? "workbench/bob.json";
+      msg = "examples/fleet's front and two nodes evaluate, and peer: ${
+        toString (failed exampleFront ++ failed exampleA ++ failed exampleB)
+      }";
+    }
+    {
       ok = refuses "services.workbench.front.stateDir: on a machine with both roles" (broken {
         services.workbench.node.stateDir = "/srv/workbench";
       });
@@ -565,6 +608,9 @@ if failures == [ ] then
         nodeB
         both
         alone
+        exampleFront
+        exampleA
+        exampleB
       ]
     )
   )
