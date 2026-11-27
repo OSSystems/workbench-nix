@@ -11,8 +11,9 @@ workbench runs as a **fleet**: a **front**, which people reach and which
 decides, and **nodes**, which run the workspaces' VMs and keep their
 disks. One machine may be both: a host on its own is a front and a node.
 A node is plugged in by declaring it; a workspace lives on one node until
-an admin moves it. [docs/multi-node.md](docs/multi-node.md) has the whole
-design.
+an admin moves it. [docs/fleet.md](docs/fleet.md) shows it at work, with
+the web UI's screens; [docs/multi-node.md](docs/multi-node.md) has the
+whole design.
 
 The fleet owns everything around the apps: the VM, its disk, network
 isolation, secrets, tools and memory. The apps are what the person opens

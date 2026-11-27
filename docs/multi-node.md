@@ -3,7 +3,8 @@
 The specification of workbench on several machines: a **front**, which
 people reach and which decides, and **nodes**, which run the workspaces'
 VMs. A node is plugged in by declaring it. A workspace lives on one node,
-with its disk, until an admin moves it.
+with its disk, until an admin moves it. [fleet.md](fleet.md) is the guide,
+with the web UI's screens.
 
 A guest sees no difference but its address, which a move changes:
 `workspace.json`, the shares and the agent's contract stay as
