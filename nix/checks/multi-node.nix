@@ -10,6 +10,10 @@
 # Dex, and a client is their computer: they reach an app on `b` and its
 # SSH server through the front, an admin picks, closes and moves nodes in
 # the UI, and a node that doesn't answer leaves its apps answering.
+#
+# A browser on the client takes the UI's screens along the way, into
+# `$out/shots`: the pictures of docs/fleet.md, which `nix run
+# .#screenshots` copies there.
 {
   pkgs,
   flake,
@@ -172,6 +176,106 @@ let
                 viewers = json.loads(data)["viewers"]
     assert b"login:" in out, out[-500:]
     print(json.dumps(viewers))
+  '';
+
+  # The client's browser: one headless Firefox, which signs in as each
+  # person once, through Dex's form, and keeps their cookies, so a screen
+  # is taken in a second or two, while a move is under way too. It takes
+  # requests on a socket, a JSON line each: who, the path, the picture's
+  # name and, maybe, a text to wait for.
+  browserPython = pkgs.python3.withPackages (p: [ p.selenium ]);
+  shotd = pkgs.writeText "shotd.py" ''
+    import json, os, socket, sys, time
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.firefox.service import Service
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    domain, out = sys.argv[1], sys.argv[2]
+    os.makedirs(out, exist_ok=True)
+    options = Options()
+    options.add_argument("-headless")
+    options.binary_location = "${pkgs.firefox}/bin/firefox"
+    # The test's own CA, which Firefox's store doesn't have.
+    options.accept_insecure_certs = True
+    options.set_preference("layout.css.prefers-color-scheme.content-override", 1)
+    options.set_preference("layout.css.devPixelsPerPx", "2")
+    browser = webdriver.Firefox(options=options, service=Service("${pkgs.geckodriver}/bin/geckodriver"))
+    browser.set_window_size(1280, 800)
+    browser.set_page_load_timeout(60)
+    cookies, who = {}, None
+
+    def sign_in(user):
+        global who
+        if who == user:
+            return
+        # A page of the domain that needs no one signed in, to set cookies
+        # on: Dex's, in plain text, which Firefox shows rather than saves.
+        browser.get(f"https://{domain}/dex/healthz")
+        browser.delete_all_cookies()
+        if user in cookies:
+            for c in cookies[user]:
+                browser.add_cookie(c)
+        else:
+            browser.get(f"https://{domain}/")
+            WebDriverWait(browser, 60).until(lambda b: b.find_elements(By.NAME, "login"))
+            browser.find_element(By.NAME, "login").send_keys(user)
+            password = browser.find_element(By.NAME, "password")
+            password.send_keys("password")
+            password.submit()
+            # Dex may still ask to grant the client access, as sso-login.py
+            # finds.
+            approve = "//input[@name='approval'][@value='approve']/ancestor::form"
+            done = lambda b: "/dex/" not in b.current_url
+            WebDriverWait(browser, 60).until(lambda b: done(b) or b.find_elements(By.XPATH, approve))
+            if not done(browser):
+                browser.find_element(By.XPATH, approve).submit()
+                WebDriverWait(browser, 60).until(done)
+            cookies[user] = browser.get_cookies()
+        who = user
+
+    server = socket.socket(socket.AF_UNIX)
+    server.bind("/run/shotd.sock")
+    server.listen()
+    while True:
+        conn, _ = server.accept()
+        with conn:
+            req = json.loads(conn.makefile().readline())
+            print(req, flush=True)
+            try:
+                browser.set_window_size(1280, req["height"])
+                sign_in(req["user"])
+                browser.get(f"https://{domain}{req['path']}")
+                if req["wait"]:
+                    WebDriverWait(browser, 60).until(lambda b: req["wait"] in b.page_source)
+                # The page hydrates; its fonts settle.
+                time.sleep(1.5)
+                # A page that scrolls inside, such as the host page's
+                # nodes, grows the window until all of it shows.
+                for _ in range(4):
+                    over = browser.execute_script(
+                        "return Math.max(0, ...Array.from(document.querySelectorAll('*'), e => e.scrollHeight - e.clientHeight))"
+                    )
+                    if over <= 1:
+                        break
+                    browser.set_window_size(1280, browser.get_window_size()["height"] + over)
+                    time.sleep(0.5)
+                browser.get_full_page_screenshot_as_file(f"{out}/{req['name']}.png")
+                conn.sendall(b"ok\n")
+            except Exception as e:
+                conn.sendall(f"{req['name']}: {e!r} at {browser.current_url}: {browser.title!r}\n".encode())
+  '';
+  shot = pkgs.writeText "shot.py" ''
+    import json, socket, sys
+    user, path, name, wait, height = sys.argv[1:6]
+    s = socket.socket(socket.AF_UNIX)
+    s.connect("/run/shotd.sock")
+    req = {"user": user, "path": path, "name": name, "wait": wait, "height": int(height)}
+    s.sendall((json.dumps(req) + "\n").encode())
+    answer = s.makefile().readline().strip()
+    print(answer)
+    sys.exit(answer != "ok")
   '';
 
   # The host names the client reaches through the front.
@@ -457,10 +561,16 @@ pkgs.testers.runNixOSTest {
       {
         security.pki.certificateFiles = [ "${certs}/ca.crt" ];
         networking.hosts.${nodes.front.networking.primaryIPAddress} = names;
+        # The browser's.
+        virtualisation.memorySize = 3072;
+        fonts.packages = [
+          pkgs.hanken-grotesk
+          pkgs.jetbrains-mono
+        ];
         environment.systemPackages = [
           pkgs.curl
           pkgs.jq
-          pkgs.python3
+          browserPython
           pkgs.openssh
         ];
         users.users.bob.isNormalUser = true;
@@ -654,6 +764,12 @@ pkgs.testers.runNixOSTest {
     def app_of(user, name):
         return client.succeed(f"curl -s -m 10 {as_user(user)} https://{name}--hello.${domain}/")
 
+    # A picture of a screen for docs/fleet.md, as `user` sees it, in a
+    # window 1280 wide and at least `height` high: less for a page whose
+    # few lines it centres.
+    def screen(user, path, name, wait="", height=800):
+        client.succeed(f"python3 ${shot} {user} {shlex.quote(path)} {name} {shlex.quote(wait)} {height}", timeout=180)
+
     def make(user, name, node=""):
         form = (
             f"-d name={name} -d os=ubuntu -d memory_gib=2 -d disk_gib=16 -d apps%5B0%5D=hello "
@@ -674,8 +790,14 @@ pkgs.testers.runNixOSTest {
         client.wait_until_succeeds(f"curl -sf {as_user('bob')} https://bob--hello.${domain}/ | grep -q 'hello from bob'", timeout=120)
         assert "hello from bob" in app_of("carol", "bob"), "an admin reaches it too"
         assert "isn't yours" in app_of("alice", "bob")
+        client.succeed("systemd-run --unit=shotd --setenv=HOME=/root python3 ${shotd} ${domain} /tmp/shots")
+        client.wait_for_file("/run/shotd.sock")
+        screen("alice", "/", "list", wait="alice-dev")
+        screen("carol", "/?w=bob", "panel-admin", wait="bob")
+        screen("carol", "/host", "host", wait="Close b")
 
     with subtest("ssh reaches b's guest through workbench-connect's tunnel"):
+        screen("bob", "/w/bob/connect/shell", "connect", wait="sh -s --", height=720)
         page = client.succeed(f"curl -sf {as_user('bob')} https://${domain}/w/bob/connect/shell")
         found = re.search(r"sh -s -- (wbp-[0-9a-f]{32})", page)
         assert found, page[:3000]
@@ -685,6 +807,7 @@ pkgs.testers.runNixOSTest {
         out = client.succeed("su - bob -c 'ssh -o BatchMode=yes bob.${domain} \"id -un; hostname\"' </dev/null")
         assert out.split() == ["bob", "bob"], out
         guest(b, "bob@10.232.1.10", "sudo journalctl -b | grep -q 'Accepted publickey for bob .* ED25519-CERT'")
+        screen("bob", "/devices", "devices", wait="Your devices", height=520)
 
     with subtest("the console of b's guest comes through the front"):
         sso = client.succeed("awk '$6 == \"_workbench_auth\" { print $7 }' /tmp/sso-bob.jar").strip()
@@ -710,6 +833,7 @@ pkgs.testers.runNixOSTest {
         )
         front.wait_until_succeeds(f"curl -sf -m 5 -H 'Workbench-Version: {build}' http://10.231.0.11:7910/host | jq -e '.memAvailable - .reserve < {target + gib // 4}'", timeout=60)
         client.wait_until_succeeds(f"curl -sf {as_user('carol')} https://${domain}/new | grep -q '<option value=\"a\" selected'", timeout=60)
+        screen("carol", "/new", "new-admin", wait='<option value="b"')
         out = make("carol", "carol-b", node="b")
         b.succeed("systemctl stop hold-memory")
         assert out == "303 https://${domain}/?w=carol-b", out
@@ -736,6 +860,8 @@ pkgs.testers.runNixOSTest {
         assert "node" not in listed("bob")["bob"], "owners see nothing of nodes"
         assert "hello from bob" in app_of("bob", "bob")
         assert "hello from carol-b" in app_of("carol", "carol-b")
+        screen("bob", "/", "unreachable", wait="nreachable")
+        screen("carol", "/host", "host-unreachable", wait="nreachable")
         b.succeed("systemctl start workbench-node.service")
         client.wait_until_succeeds(
             f"curl -sf {as_user('bob')} https://${domain}/api/workspaces | jq -e '.[] | select(.name == \"bob\") | .state == \"running\"'",
@@ -746,6 +872,7 @@ pkgs.testers.runNixOSTest {
         assert post("carol", "/api/node", "-d node=b -d closed=true") == "303 https://${domain}/host"
         host = client.succeed(f"curl -sf {as_user('carol')} https://${domain}/host")
         assert "Reopen b" in host and "Close a" in host, host[:3000]
+        screen("carol", "/host", "host-closed", wait="Reopen b")
         assert post("alice", "/api/node", "-d node=a -d closed=true").startswith("403"), "for admins"
         assert post("carol", "/api/quota", "-d user=carol -d quota=3") == "303 https://${domain}/host"
         out = make("carol", "carol-a")
@@ -766,7 +893,20 @@ pkgs.testers.runNixOSTest {
     with subtest("Move from the UI takes a workspace to the other node"):
         assert post("alice", "/api/move", "-d ws=carol-b -d node=a").startswith("403"), "for admins"
         guest(b, f"carol@{carol_b}", "echo kept > ~/before-move && sync")
-        out = post("carol", "/api/move", "-d ws=carol-b -d node=a", timeout=1500)
+        screen("carol", "/w/carol-b/move", "move", wait="carol-b", height=520)
+        # The form's post, in the background, to see the workspace moving.
+        request = (
+            f"${pkgs.curl}/bin/curl -s -m 1500 -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {as_user('carol')} {ui_form} "
+            f"-d ws=carol-b -d node=a https://${domain}/api/move > /tmp/move.out"
+        )
+        client.succeed(f"systemd-run --unit=ui-move --remain-after-exit sh -c {shlex.quote(request)}")
+        client.wait_until_succeeds(
+            f"curl -sf {as_user('carol')} https://${domain}/api/workspaces | jq -e '.[] | select(.name == \"carol-b\") | .state == \"moving\"'",
+            timeout=300,
+        )
+        screen("carol", "/?w=carol-b", "moving", wait="Moving")
+        client.wait_until_succeeds("test -s /tmp/move.out", timeout=1500)
+        out = client.succeed("cat /tmp/move.out").strip()
         assert out == "303 https://${domain}/host", out
         record = record_of("carol-b")
         assert record["node"] == "a" and record["ip"].startswith("10.232.0.") and not record.get("move"), record
@@ -818,5 +958,8 @@ pkgs.testers.runNixOSTest {
         outcome = create(request)
         assert outcome["ok"], outcome
         assert record_of("carol-dev")["node"] == "a"
+
+    # Into $out/shots.
+    client.copy_from_vm("/tmp/shots")
   '';
 }
